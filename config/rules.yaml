@@ -1,0 +1,47 @@
+# Action Engine — Configuration des règles
+# ==========================================
+# Lie chaque rule_name (dbt) à une ou plusieurs destinations.
+#
+# Ajouter une règle :
+#   1. Créer le SQL dans dbt/models/rules/rule_<name>.sql
+#   2. L'ajouter dans dbt/models/rules/pending_actions.sql
+#   3. Déclarer ici les destinations avec leurs paramètres
+#
+# Ajouter une destination :
+#   1. Créer src/handlers/<destination>.py
+#   2. L'importer dans src/core/runner.py
+
+rules:
+
+  low_review_cleanliness:
+    enabled: true
+    # Cooldown : ne pas re-déclencher si un trigger "open" existe déjà
+    # pour la même (rule_name, property_id)
+    destinations:
+      - type: breezeway_task
+        params:
+          name_template: "Inspection propreté — {home_name}"
+          department: housekeeping
+          priority: high
+
+  # Exemples de règles futures (désactivées)
+  # low_review_communication:
+  #   enabled: false
+  #   destinations:
+  #     - type: breezeway_task
+  #       params:
+  #         name_template: "Amélioration communication — {home_name}"
+  #         department: operations
+  #         priority: normal
+  #     - type: customerio
+  #       params:
+  #         template_id: alert_owner_communication
+
+  # maintenance_overdue:
+  #   enabled: false
+  #   destinations:
+  #     - type: breezeway_task
+  #       params:
+  #         name_template: "Maintenance en retard — {home_name}"
+  #         department: maintenance
+  #         priority: urgent
