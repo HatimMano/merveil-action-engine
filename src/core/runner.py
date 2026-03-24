@@ -61,7 +61,6 @@ class ActionRunner:
             SELECT
                 rule_name,
                 property_id,
-                home_id,
                 context,
                 detected_at
             FROM `{PROJECT_ID}.sync_logs.pending_actions`
@@ -121,12 +120,13 @@ class ActionRunner:
                     handler = self._get_handler(dest_type)
                     result_id = handler.execute(action, params)
 
+                    context_data = json.loads(action.get("context") or "{}")
                     trigger_id = self.logger.open_trigger(
                         rule_name=rule_name,
                         destination=dest_type,
                         property_id=property_id,
-                        home_id=action.get("home_id"),
-                        context=json.loads(action.get("context") or "{}"),
+                        home_id=context_data.get("home_id"),
+                        context=context_data,
                         breezeway_task_id=result_id if dest_type == "breezeway_task" else None,
                     )
                     logger.info(

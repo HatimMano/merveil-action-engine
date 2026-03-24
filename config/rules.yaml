@@ -13,6 +13,18 @@
 
 rules:
 
+  champagne_direct:
+    enabled: true
+    destinations:
+      - type: breezeway_task
+        params:
+          name_template: "Bouteille de champagne — {apartment_name}"
+          department: housekeeping
+          subdepartment: linge_conso_logistique
+          priority: normal
+          assign_economat: true
+          assign_cleaning_team: true
+
   low_review_cleanliness:
     enabled: true
     # Cooldown : ne pas re-déclencher si un trigger "open" existe déjà
