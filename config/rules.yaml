@@ -36,6 +36,13 @@ rules:
           department: housekeeping
           priority: high
 
+  daily_alert_digest:
+    enabled: true
+    destinations:
+      - type: email_digest
+        params:
+          to: "alertes@archides.fr"
+
   # Exemples de règles futures (désactivées)
   # low_review_communication:
   #   enabled: false

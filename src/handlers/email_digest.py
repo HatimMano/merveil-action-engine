@@ -1,0 +1,165 @@
+"""
+Handler : Email Digest quotidien
+=================================
+Envoie un digest des alertes actives (dash_alerts) par email SMTP.
+Destinataire : Google Group alertes@archides.fr
+
+Déduplication assurée en amont par le runner via action_triggers
+(property_id = CURRENT_DATE → 1 envoi max par jour).
+
+Env vars requis (Secret Manager → Cloud Run Job) :
+    SMTP_FROM      : expéditeur  (ex: noreply@archides.fr)
+    SMTP_USER      : login SMTP
+    SMTP_PASSWORD  : mot de passe application Gmail
+    SMTP_TO        : destinataire (défaut: alertes@archides.fr)
+    SMTP_HOST      : (défaut: smtp.gmail.com)
+    SMTP_PORT      : (défaut: 587)
+"""
+
+import logging
+import os
+import smtplib
+from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from google.cloud import bigquery
+
+from src.handlers import SkipAction
+
+logger = logging.getLogger(__name__)
+
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
+
+SEVERITY_EMOJI = {"CRITICAL": "🔴", "WARNING": "🟡", "INFO": "🔵"}
+
+CATEGORY_LABELS = {
+    "Clients":        "Clients à risque",
+    "Paniers":        "Paniers abandonnés",
+    "Satisfaction":   "Satisfaction",
+    "Disponibilites": "Disponibilités",
+    "Revenue":        "Revenus",
+    "Operationnel":   "Opérationnel",
+}
+
+
+class EmailDigestHandler:
+
+    def __init__(self):
+        self.bq          = bigquery.Client(project=PROJECT_ID)
+        self.smtp_from   = os.getenv("SMTP_FROM")
+        self.smtp_to     = os.getenv("SMTP_TO", "alertes@archides.fr")
+        self.smtp_host   = os.getenv("SMTP_HOST", "smtp.gmail.com")
+        self.smtp_port   = int(os.getenv("SMTP_PORT", "587"))
+        self.smtp_user   = os.getenv("SMTP_USER")
+        self.smtp_password = os.getenv("SMTP_PASSWORD")
+
+        if not all([self.smtp_from, self.smtp_user, self.smtp_password]):
+            raise ValueError("SMTP_FROM, SMTP_USER, SMTP_PASSWORD requis")
+
+    def _fetch_alerts(self) -> list[dict]:
+        query = f"""
+            SELECT
+                alert_category, severity, entity_name,
+                alert_message, action_recommended, alert_date
+            FROM `{PROJECT_ID}.dashboard_alerts.dash_alerts`
+            ORDER BY severity_order ASC, alert_date DESC
+        """
+        return [dict(r) for r in self.bq.query(query).result()]
+
+    def _build_html(self, alerts: list[dict], today: str) -> str:
+        by_category: dict[str, list] = {}
+        for a in alerts:
+            by_category.setdefault(a.get("alert_category", "Autre"), []).append(a)
+
+        critical_count = sum(1 for a in alerts if a["severity"] == "CRITICAL")
+        warning_count  = sum(1 for a in alerts if a["severity"] == "WARNING")
+
+        summary_color = "#dc2626" if critical_count > 0 else "#d97706"
+        summary_text  = f"{critical_count} critique(s)" + (
+            f" · {warning_count} warning(s)" if warning_count else ""
+        )
+
+        rows_html = ""
+        for cat, items in by_category.items():
+            label = CATEGORY_LABELS.get(cat, cat)
+            rows_html += (
+                f'<tr><td colspan="3" style="background:#f1f5f9;padding:8px 12px;'
+                f'font-weight:600;font-size:12px;color:#475569;text-transform:uppercase;'
+                f'letter-spacing:.05em">{label}</td></tr>'
+            )
+            for a in items:
+                emoji = SEVERITY_EMOJI.get(a["severity"], "⚪")
+                rows_html += (
+                    f'<tr>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px">'
+                    f'{emoji} {a["alert_message"]}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;'
+                    f'color:#64748b;white-space:nowrap">{a["alert_date"]}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;'
+                    f'color:#64748b">{a.get("action_recommended", "")}</td>'
+                    f'</tr>'
+                )
+
+        return f"""<!DOCTYPE html>
+<html><body style="font-family:system-ui,sans-serif;background:#f8fafc;margin:0;padding:0">
+<div style="max-width:700px;margin:24px auto;background:white;border-radius:12px;
+            overflow:hidden;border:1px solid #e2e8f0">
+  <div style="background:#6366f1;padding:20px 24px">
+    <h1 style="color:white;margin:0;font-size:18px">Merveil — Rapport d'alertes</h1>
+    <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{today}</p>
+  </div>
+  <div style="padding:14px 24px;background:#fef9c3;border-bottom:1px solid #fde68a">
+    <span style="font-weight:600;color:{summary_color};font-size:14px">
+      {len(alerts)} alertes actives — {summary_text}
+    </span>
+  </div>
+  <table style="width:100%;border-collapse:collapse">
+    <thead>
+      <tr style="background:#f8fafc">
+        <th style="padding:8px 12px;text-align:left;font-size:12px;color:#94a3b8;font-weight:500">Alerte</th>
+        <th style="padding:8px 12px;text-align:left;font-size:12px;color:#94a3b8;font-weight:500">Date</th>
+        <th style="padding:8px 12px;text-align:left;font-size:12px;color:#94a3b8;font-weight:500">Action recommandée</th>
+      </tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+  <div style="padding:16px 24px;background:#f8fafc;border-top:1px solid #e2e8f0">
+    <p style="margin:0;font-size:12px;color:#94a3b8">
+      Merveil Data Warehouse ·
+      <a href="https://merveil-dashboards.archides.fr/alerting" style="color:#6366f1">
+        Voir le dashboard alerting
+      </a>
+    </p>
+  </div>
+</div>
+</body></html>"""
+
+    def execute(self, action: dict, params: dict) -> str:
+        alerts = self._fetch_alerts()
+
+        if not alerts:
+            logger.info("Aucune alerte active — digest non envoyé")
+            raise SkipAction("no_alerts")
+
+        today = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+        html  = self._build_html(alerts, today)
+
+        critical_count = sum(1 for a in alerts if a["severity"] == "CRITICAL")
+        subject = (
+            f"[Merveil] {len(alerts)} alertes · {critical_count} critique(s) · {today}"
+        )
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = self.smtp_from
+        msg["To"]      = self.smtp_to
+        msg.attach(MIMEText(html, "html", "utf-8"))
+
+        with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+            server.starttls()
+            server.login(self.smtp_user, self.smtp_password)
+            server.sendmail(self.smtp_from, [self.smtp_to], msg.as_string())
+
+        logger.info(f"Digest envoyé → {self.smtp_to} ({len(alerts)} alertes, {critical_count} critiques)")
+        return f"digest_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"

@@ -22,7 +22,9 @@ import yaml
 from google.cloud import bigquery
 
 from src.core.action_logger import ActionLogger
+from src.handlers import SkipAction
 from src.handlers.breezeway_tasks import BreezewayTasksHandler
+from src.handlers.email_digest import EmailDigestHandler
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,7 @@ PROJECT_ID = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
 
 HANDLER_REGISTRY = {
     "breezeway_task": BreezewayTasksHandler,
+    "email_digest":   EmailDigestHandler,
     # "customerio": CustomerIOHandler,   ← ajouter ici
 }
 
@@ -130,9 +133,13 @@ class ActionRunner:
                         breezeway_task_id=result_id if dest_type == "breezeway_task" else None,
                     )
                     logger.info(
-                        f"[OK] {rule_name} → {dest_type} | task={result_id} | trigger={trigger_id}"
+                        f"[OK] {rule_name} → {dest_type} | result={result_id} | trigger={trigger_id}"
                     )
                     triggered += 1
+
+                except SkipAction as e:
+                    logger.info(f"[SKIP] {rule_name} → {dest_type} : {e}")
+                    skipped += 1
 
                 except Exception as e:
                     logger.error(f"[ERROR] {rule_name} → {dest_type} : {e}")
