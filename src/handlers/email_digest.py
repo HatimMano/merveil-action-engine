@@ -1,35 +1,41 @@
 """
 Handler : Email Digest quotidien
 =================================
-Envoie un digest des alertes actives (dash_alerts) par email SMTP.
-Destinataire : Google Group alertes@archides.fr
+Envoie un digest des alertes actives (dash_alerts) par email via Gmail API.
+Expéditeur : noreply@merveil.fr (impersonné via Domain-Wide Delegation)
+Destinataire : alertes@archides.fr (Google Group)
 
 Déduplication assurée en amont par le runner via action_triggers
 (property_id = CURRENT_DATE → 1 envoi max par jour).
 
-Env vars requis (Secret Manager → Cloud Run Job) :
-    SMTP_FROM      : expéditeur  (ex: noreply@archides.fr)
-    SMTP_USER      : login SMTP
-    SMTP_PASSWORD  : mot de passe application Gmail
-    SMTP_TO        : destinataire (défaut: alertes@archides.fr)
-    SMTP_HOST      : (défaut: smtp.gmail.com)
-    SMTP_PORT      : (défaut: 587)
+Secret Manager requis :
+    alerts-gmail-sa-key : clé JSON du SA alerts-gmail-sender
+                          (Domain-Wide Delegation activée sur gmail.send)
+
+Env vars optionnels :
+    GMAIL_SENDER    : expéditeur impersonné (défaut: noreply@merveil.fr)
+    GMAIL_TO        : destinataire (défaut: alertes@archides.fr)
 """
 
+import base64
+import json
 import logging
 import os
-import smtplib
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-from google.cloud import bigquery
+from google.cloud import bigquery, secretmanager
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 from src.handlers import SkipAction
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
+PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
+GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@merveil.fr")
+GMAIL_TO     = os.getenv("GMAIL_TO",     "alertes@archides.fr")
 
 SEVERITY_EMOJI = {"CRITICAL": "🔴", "WARNING": "🟡", "INFO": "🔵"}
 
@@ -43,19 +49,30 @@ CATEGORY_LABELS = {
 }
 
 
+def _load_gmail_service():
+    """Charge la clé SA depuis Secret Manager et construit le service Gmail."""
+    sm = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{PROJECT_ID}/secrets/alerts-gmail-sa-key/versions/latest"
+    payload = sm.access_secret_version(request={"name": name}).payload.data.decode("utf-8")
+    sa_info = json.loads(payload)
+
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/gmail.send"],
+    ).with_subject(GMAIL_SENDER)
+
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+
+def _encode_message(msg: MIMEMultipart) -> dict:
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    return {"raw": raw}
+
+
 class EmailDigestHandler:
 
     def __init__(self):
-        self.bq          = bigquery.Client(project=PROJECT_ID)
-        self.smtp_from   = os.getenv("SMTP_FROM")
-        self.smtp_to     = os.getenv("SMTP_TO", "alertes@archides.fr")
-        self.smtp_host   = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        self.smtp_port   = int(os.getenv("SMTP_PORT", "587"))
-        self.smtp_user   = os.getenv("SMTP_USER")
-        self.smtp_password = os.getenv("SMTP_PASSWORD")
-
-        if not all([self.smtp_from, self.smtp_user, self.smtp_password]):
-            raise ValueError("SMTP_FROM, SMTP_USER, SMTP_PASSWORD requis")
+        self.bq = bigquery.Client(project=PROJECT_ID)
 
     def _fetch_alerts(self) -> list[dict]:
         query = f"""
@@ -142,24 +159,23 @@ class EmailDigestHandler:
             logger.info("Aucune alerte active — digest non envoyé")
             raise SkipAction("no_alerts")
 
-        today = datetime.now(timezone.utc).strftime("%d/%m/%Y")
-        html  = self._build_html(alerts, today)
-
+        today   = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+        html    = self._build_html(alerts, today)
         critical_count = sum(1 for a in alerts if a["severity"] == "CRITICAL")
-        subject = (
-            f"[Merveil] {len(alerts)} alertes · {critical_count} critique(s) · {today}"
-        )
+
+        subject = f"[Merveil] {len(alerts)} alertes · {critical_count} critique(s) · {today}"
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"]    = self.smtp_from
-        msg["To"]      = self.smtp_to
+        msg["From"]    = GMAIL_SENDER
+        msg["To"]      = GMAIL_TO
         msg.attach(MIMEText(html, "html", "utf-8"))
 
-        with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
-            server.starttls()
-            server.login(self.smtp_user, self.smtp_password)
-            server.sendmail(self.smtp_from, [self.smtp_to], msg.as_string())
+        service = _load_gmail_service()
+        service.users().messages().send(
+            userId="me",
+            body=_encode_message(msg),
+        ).execute()
 
-        logger.info(f"Digest envoyé → {self.smtp_to} ({len(alerts)} alertes, {critical_count} critiques)")
+        logger.info(f"Digest envoyé → {GMAIL_TO} ({len(alerts)} alertes, {critical_count} critiques)")
         return f"digest_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"

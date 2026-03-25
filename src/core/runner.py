@@ -66,7 +66,7 @@ class ActionRunner:
                 property_id,
                 context,
                 detected_at
-            FROM `{PROJECT_ID}.sync_logs.pending_actions`
+            FROM `{PROJECT_ID}.action_engine.pending_actions`
             WHERE detected_at IS NOT NULL
         """
         rows = list(self.bq.query(query).result())

@@ -16,7 +16,7 @@ from google.cloud import bigquery
 logger = logging.getLogger(__name__)
 
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
-TABLE_ID = f"{PROJECT_ID}.sync_logs.action_triggers"
+TABLE_ID = f"{PROJECT_ID}.action_engine.action_triggers"
 
 
 class ActionLogger:
