@@ -14,7 +14,7 @@
 rules:
 
   champagne_direct:
-    enabled: true
+    enabled: false  # TODO: vérifier noms Economat + équipe ménage dans Breezeway avant activation
     destinations:
       - type: breezeway_task
         params:

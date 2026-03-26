@@ -99,7 +99,7 @@ class ActionLogger:
             UPDATE `{TABLE_ID}` t
             SET
                 t.status = 'resolved',
-                t.resolved_at = wt.finished_at
+                t.resolved_at = CAST(wt.finished_at AS TIMESTAMP)
             FROM (
                 SELECT task_id, finished_at
                 FROM `{PROJECT_ID}.raw_breezeway.webhook_tasks`
