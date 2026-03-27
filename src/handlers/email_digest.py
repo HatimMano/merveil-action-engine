@@ -80,6 +80,7 @@ class EmailDigestHandler:
                 alert_category, severity, entity_name,
                 alert_message, action_recommended, alert_date
             FROM `{PROJECT_ID}.dashboard_alerts.dash_alerts`
+            WHERE NOT (alert_type = 'operational' AND entity_name = 'Annulations')
             ORDER BY severity_order ASC, alert_date DESC
         """
         return [dict(r) for r in self.bq.query(query).result()]

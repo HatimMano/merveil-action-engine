@@ -24,7 +24,7 @@ gcloud run jobs deploy "$JOB" \
   --cpu 1 \
   --task-timeout 300 \
   --max-retries 1 \
-  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="hatim@archides.fr" \
+  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="hatim@archides.fr" \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest \
   --service-account "$SA" \
   --project "$PROJECT"
