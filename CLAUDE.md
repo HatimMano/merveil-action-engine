@@ -53,14 +53,14 @@ rules:
 
 ## Email Digest — Architecture Gmail API + DWD
 **Sender**: `noreply@archides.fr` (dedicated Workspace account, never connected as a human)
-**Recipient**: configurable via `GMAIL_TO` (currently `hatim@archides.fr` for testing — change to `alertes@archides.fr` for prod)
+**Recipient**: configurable via `GMAIL_TO` (currently `alerte_ventes@archides.fr` for testing — change to `alertes@archides.fr` for prod)
 **Auth**: Domain-Wide Delegation — the SA `alerts-gmail-sender` impersonates `noreply@archides.fr`
 
 Required secret in Secret Manager: `alerts-gmail-sa-key` (SA JSON key)
 Env vars (defined in `deploy.sh`):
 ```
 GMAIL_SENDER=noreply@archides.fr
-GMAIL_TO=hatim@archides.fr   ← change to alertes@archides.fr for prod
+GMAIL_TO=alerte_ventes@archides.fr   ← change to alertes@archides.fr for prod
 ```
 
 The SA `alerts-gmail-sender@merveil-data-warehouse.iam.gserviceaccount.com` must have access to `alerts-gmail-sa-key` in Secret Manager, and the Cloud Run Job must mount this secret.
