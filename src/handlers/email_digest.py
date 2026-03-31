@@ -74,13 +74,18 @@ class EmailDigestHandler:
     def __init__(self):
         self.bq = bigquery.Client(project=PROJECT_ID)
 
-    def _fetch_alerts(self) -> list[dict]:
+    def _fetch_alerts(self, alert_types: list[str] | None = None) -> list[dict]:
+        if alert_types:
+            types_str   = ", ".join(f"'{t}'" for t in alert_types)
+            type_clause = f"AND alert_type IN ({types_str})"
+        else:
+            type_clause = "AND NOT (alert_type = 'operational' AND entity_name = 'Annulations')"
         query = f"""
             SELECT
                 alert_category, severity, entity_name,
                 alert_message, action_recommended, alert_date
             FROM `{PROJECT_ID}.dashboard_alerts.dash_alerts`
-            WHERE NOT (alert_type = 'operational' AND entity_name = 'Annulations')
+            WHERE 1=1 {type_clause}
             ORDER BY severity_order ASC, alert_date DESC
         """
         return [dict(r) for r in self.bq.query(query).result()]
@@ -153,23 +158,80 @@ class EmailDigestHandler:
 </div>
 </body></html>"""
 
-    def execute(self, action: dict, params: dict) -> str:
-        alerts = self._fetch_alerts()
+    def _build_empty_html(self, label: str) -> str:
+        return f"""<!DOCTYPE html>
+<html><body style="font-family:system-ui,sans-serif;background:#f8fafc;margin:0;padding:0">
+<div style="max-width:700px;margin:24px auto;background:white;border-radius:12px;
+            overflow:hidden;border:1px solid #e2e8f0">
+  <div style="background:#6366f1;padding:20px 24px">
+    <h1 style="color:white;margin:0;font-size:18px">Merveil — Rapport d'alertes</h1>
+    <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{label}</p>
+  </div>
+  <div style="padding:24px;text-align:center;color:#64748b;font-size:14px">
+    ✅ Aucune alerte active — tout est nominal.
+  </div>
+</div>
+</body></html>"""
+
+    def _log_digest(self, action: dict, alerts: list[dict]) -> None:
+        """Insère une ligne par alerte dans digest_log après chaque envoi."""
+        now = datetime.now(timezone.utc)
+        rule_name   = action.get("rule_name", "")
+        property_id = action.get("property_id", "")
 
         if not alerts:
-            logger.info("Aucune alerte active — digest non envoyé")
-            raise SkipAction("no_alerts")
+            rows = [{
+                "sent_at":       now.isoformat(),
+                "rule_name":     rule_name,
+                "property_id":   property_id,
+                "section":       "empty",
+                "alert_type":    None,
+                "severity":      None,
+                "entity_name":   None,
+                "alert_message": None,
+            }]
+        else:
+            rows = [
+                {
+                    "sent_at":       now.isoformat(),
+                    "rule_name":     rule_name,
+                    "property_id":   property_id,
+                    "section":       a.get("alert_category"),
+                    "alert_type":    a.get("alert_type"),
+                    "severity":      a.get("severity"),
+                    "entity_name":   a.get("entity_name"),
+                    "alert_message": a.get("alert_message"),
+                }
+                for a in alerts
+            ]
 
-        today   = datetime.now(timezone.utc).strftime("%d/%m/%Y")
-        html    = self._build_html(alerts, today)
-        critical_count = sum(1 for a in alerts if a["severity"] == "CRITICAL")
+        table_ref = self.bq.dataset("action_engine").table("digest_log")
+        errors = self.bq.insert_rows_json(table_ref, rows)
+        if errors:
+            logger.warning(f"digest_log insert errors : {errors}")
 
-        subject = f"[Merveil] {len(alerts)} alertes · {critical_count} critique(s) · {today}"
+    def execute(self, action: dict, params: dict) -> str:
+        alerts         = self._fetch_alerts(params.get("alert_types"))
+        send_if_empty  = params.get("send_if_empty", False)
+        today          = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+
+        if not alerts:
+            if not send_if_empty:
+                logger.info("Aucune alerte active — digest non envoyé")
+                raise SkipAction("no_alerts")
+            html    = self._build_empty_html(today)
+            subject = f"[Merveil] ✅ Rien à signaler · {today}"
+        else:
+            html           = self._build_html(alerts, today)
+            critical_count = sum(1 for a in alerts if a["severity"] == "CRITICAL")
+            subject        = f"[Merveil] {len(alerts)} alertes · {critical_count} critique(s) · {today}"
 
         msg = MIMEMultipart("alternative")
+        to_addr = params.get("to", GMAIL_TO)
+
         msg["Subject"] = subject
         msg["From"]    = GMAIL_SENDER
-        msg["To"]      = GMAIL_TO
+        msg["To"]      = to_addr
         msg.attach(MIMEText(html, "html", "utf-8"))
 
         service = _load_gmail_service()
@@ -178,5 +240,7 @@ class EmailDigestHandler:
             body=_encode_message(msg),
         ).execute()
 
-        logger.info(f"Digest envoyé → {GMAIL_TO} ({len(alerts)} alertes, {critical_count} critiques)")
+        self._log_digest(action, alerts)
+
+        logger.info(f"Digest envoyé → {to_addr} ({len(alerts)} alertes, {sum(1 for a in alerts if a.get('severity') == 'CRITICAL')} critiques)")
         return f"digest_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
