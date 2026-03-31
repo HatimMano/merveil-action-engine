@@ -1,20 +1,16 @@
-# Action Engine — Configuration des règles
-# ==========================================
-# Lie chaque rule_name (dbt) à une ou plusieurs destinations.
+# Action Engine — Configuration
+# ==============================
 #
-# Ajouter une règle :
-#   1. Créer le SQL dans dbt/models/rules/rule_<name>.sql
-#   2. L'ajouter dans dbt/models/rules/pending_actions.sql
-#   3. Déclarer ici les destinations avec leurs paramètres
+# `rules` : handlers non-digest (Breezeway, etc.)
+#   Chaque rule_name correspond à une entrée dans pending_actions.
 #
-# Ajouter une destination :
-#   1. Créer src/handlers/<destination>.py
-#   2. L'importer dans src/core/runner.py
+# `digest` : config email par fréquence (4h / daily / weekly / monthly)
+#   L'action-engine lit rule_{freq} et envoie 1 mail groupé.
 
 rules:
 
   champagne_direct:
-    enabled: false  # TODO: vérifier noms Economat + équipe ménage dans Breezeway avant activation
+    enabled: false
     destinations:
       - type: breezeway_task
         params:
@@ -27,8 +23,6 @@ rules:
 
   low_review_cleanliness:
     enabled: true
-    # Cooldown : ne pas re-déclencher si un trigger "open" existe déjà
-    # pour la même (rule_name, property_id)
     destinations:
       - type: breezeway_task
         params:
@@ -36,31 +30,15 @@ rules:
           department: housekeeping
           priority: high
 
-  daily_alert_digest:
-    enabled: true
-    destinations:
-      - type: email_digest
-        params:
-          to: "alertes@archides.fr"
+digest:
+  4h:
+    to: "hatim@archides.fr"   # TEST — prod: alertes@archides.fr
+    send_if_empty: true
 
-  # Exemples de règles futures (désactivées)
-  # low_review_communication:
-  #   enabled: false
-  #   destinations:
-  #     - type: breezeway_task
-  #       params:
-  #         name_template: "Amélioration communication — {home_name}"
-  #         department: operations
-  #         priority: normal
-  #     - type: customerio
-  #       params:
-  #         template_id: alert_owner_communication
+  daily:
+    to: "hatim@archides.fr"   # TEST — prod: alertes@archides.fr
+    send_if_empty: false
 
-  # maintenance_overdue:
-  #   enabled: false
-  #   destinations:
-  #     - type: breezeway_task
-  #       params:
-  #         name_template: "Maintenance en retard — {home_name}"
-  #         department: maintenance
-  #         priority: urgent
+  weekly:
+    to: "hatim@archides.fr"   # TEST — prod: alertes@archides.fr
+    send_if_empty: false
