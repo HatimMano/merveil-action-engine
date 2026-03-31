@@ -74,7 +74,7 @@ class EmailDigestHandler:
     def __init__(self):
         self.bq = bigquery.Client(project=PROJECT_ID)
 
-    def _fetch_alerts(self, alert_types: list[str] | None = None) -> list[dict]:
+    def _fetch_alerts(self, rule_name: str, alert_types: list[str] | None = None) -> list[dict]:
         if alert_types:
             types_str   = ", ".join(f"'{t}'" for t in alert_types)
             type_clause = f"AND alert_type IN ({types_str})"
@@ -86,6 +86,16 @@ class EmailDigestHandler:
                 alert_message, action_recommended, alert_date
             FROM `{PROJECT_ID}.dashboard_alerts.dash_alerts`
             WHERE 1=1 {type_clause}
+            AND (alert_type, entity_name) NOT IN (
+                SELECT alert_type, entity_name
+                FROM `{PROJECT_ID}.action_engine.digest_log`
+                WHERE rule_name = '{rule_name}'
+                AND sent_at >= (
+                    SELECT MAX(sent_at)
+                    FROM `{PROJECT_ID}.action_engine.digest_log`
+                    WHERE rule_name = '{rule_name}'
+                )
+            )
             ORDER BY severity_order ASC, alert_date DESC
         """
         return [dict(r) for r in self.bq.query(query).result()]
@@ -211,7 +221,7 @@ class EmailDigestHandler:
             logger.warning(f"digest_log insert errors : {errors}")
 
     def execute(self, action: dict, params: dict) -> str:
-        alerts         = self._fetch_alerts(params.get("alert_types"))
+        alerts         = self._fetch_alerts(action.get("rule_name", ""), params.get("alert_types"))
         send_if_empty  = params.get("send_if_empty", False)
         today          = datetime.now(timezone.utc).strftime("%d/%m/%Y")
 
