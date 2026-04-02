@@ -2,20 +2,37 @@
 
 ## Overview
 Python 3.12 + **Cloud Run Job** (runs once and terminates — not an HTTP server).
-**No scheduler configured** — triggered manually or to be integrated after the dbt scheduler.
-Reads pending actions produced by dbt and executes them against external systems.
+3 Cloud Schedulers configurés (PAUSED — activer pour prod) : 4H, daily 07:00, weekly lundi 08:00.
+Reads pending actions (Breezeway) + rule tables (digest) produced by dbt.
 
 ## Execution Flow
 ```
-dbt run (scheduler merveil-dbt-schedule, 6x/day)
-    ↓
-dbt models/rules/ → BigQuery action_engine.pending_actions
-    ↓
-action-engine (Cloud Run Job) — trigger manually or via scheduler to be created
-    1. Resolve completed triggers (webhook task-completed Breezeway)
-    2. Read pending_actions
-    3. For each action: check no duplicate → route to handler → log in action_triggers
+dbt run (merveil-dbt-schedule : 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC)
+    ↓  [30 min plus tard]
+action-engine (merveil-action-engine-4h : 06:30, 09:30, 12:30, 15:30, 18:30, 21:30 UTC)
+    Phase 1 — Breezeway
+      1. resolve_completed_triggers (Breezeway webhook task-completed)
+      2. Lit pending_actions → crée les tâches Breezeway
+    Phase 2 — Digest (si FREQ défini)
+      1. resolve_digest_triggers(FREQ) — purge les triggers email_digest expirés (TTL)
+      2. Lit rule_{FREQ} depuis BigQuery
+      3. Filtre les nouvelles alertes (non déjà dans action_triggers)
+      4. Envoie 1 digest email (EmailDigestHandler.execute_batch)
+      5. Logue heartbeat + alertes dans action_triggers
 ```
+
+## TTL — Purge automatique des triggers digest
+`resolve_digest_triggers(freq)` s'exécute au début de chaque phase 2.
+Résout tous les triggers `destination='email_digest'` + `status='open'` expirés :
+
+| FREQ | TTL |
+|---|---|
+| `4h` | 4 heures |
+| `daily` | 24 heures |
+| `weekly` | 168 heures |
+| `monthly` | 720 heures |
+
+Sans cette purge, un trigger `open` permanent bloquerait les ré-alertes sur le même `property_id`.
 
 ## BigQuery Datasets
 | Dataset | Tables | Role |
@@ -33,12 +50,54 @@ action-engine (Cloud Run Job) — trigger manually or via scheduler to be create
 rules:
   my_new_rule:
     enabled: true
+    frequency: daily        # 4h | daily | weekly | monthly | (absent = toujours exécuté)
     destinations:
       - type: breezeway_task
         params:
           name_template: "Task — {apartment_name}"
           department: housekeeping
           priority: normal
+      - type: email_digest
+        params:
+          to: "alertes@archides.fr"   # destinataire par règle (override GMAIL_TO)
+```
+
+## Frequency Filtering
+The runner reads `FREQ` env var at startup. If set, only rules with a matching `frequency` are executed (rules without `frequency` always run). If `FREQ` is unset, all enabled rules run.
+
+| FREQ value | Triggered by |
+|---|---|
+| `4h` | Cloud Scheduler every 4 hours |
+| `daily` | Cloud Scheduler daily at 07:00 |
+| `weekly` | Cloud Scheduler every Monday at 08:00 |
+| `monthly` | Cloud Scheduler 1st of month at 08:00 |
+| (not set) | Manual execution — runs all rules |
+
+### Cloud Scheduler setup
+```bash
+# 4H — aligné sur dbt (30 min après chaque run dbt)
+gcloud scheduler jobs create http merveil-action-engine-4h \
+  --schedule="30 6,9,12,15,18,21 * * *" \
+  --uri="https://run.googleapis.com/v2/projects/merveil-data-warehouse/locations/europe-west1/jobs/merveil-action-engine:run" \
+  --message-body='{"overrides":{"containerOverrides":[{"env":[{"name":"FREQ","value":"4h"}]}]}}' \
+  --oauth-service-account-email="action-engine-sa@merveil-data-warehouse.iam.gserviceaccount.com" \
+  --location=europe-west1
+
+# Daily
+gcloud scheduler jobs create http merveil-action-engine-daily \
+  --schedule="0 7 * * *" \
+  --uri="https://run.googleapis.com/v2/projects/merveil-data-warehouse/locations/europe-west1/jobs/merveil-action-engine:run" \
+  --message-body='{"overrides":{"containerOverrides":[{"env":[{"name":"FREQ","value":"daily"}]}]}}' \
+  --oauth-service-account-email="action-engine-sa@merveil-data-warehouse.iam.gserviceaccount.com" \
+  --location=europe-west1
+
+# Weekly (lundi 08:00)
+gcloud scheduler jobs create http merveil-action-engine-weekly \
+  --schedule="0 8 * * 1" \
+  --uri="https://run.googleapis.com/v2/projects/merveil-data-warehouse/locations/europe-west1/jobs/merveil-action-engine:run" \
+  --message-body='{"overrides":{"containerOverrides":[{"env":[{"name":"FREQ","value":"weekly"}]}]}}' \
+  --oauth-service-account-email="action-engine-sa@merveil-data-warehouse.iam.gserviceaccount.com" \
+  --location=europe-west1
 ```
 
 ## Adding a Destination

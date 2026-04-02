@@ -90,6 +90,24 @@ class ActionLogger:
         rows = list(self.client.query(query, job_config=job_config).result())
         return dict(rows[0]) if rows else None
 
+    def resolve_digest_triggers(self, freq: str):
+        """
+        Résout les triggers email_digest expirés selon le TTL de la fréquence.
+        Évite que action_triggers accumule des lignes open bloquant les ré-alertes.
+        TTL : 4h → 4h, daily → 24h, weekly → 168h, monthly → 720h.
+        """
+        ttl = {"4h": 4, "daily": 24, "weekly": 168, "monthly": 720}.get(freq, 24)
+        query = f"""
+            UPDATE `{TABLE_ID}`
+            SET status = 'resolved',
+                resolved_at = CURRENT_TIMESTAMP()
+            WHERE destination = 'email_digest'
+              AND status = 'open'
+              AND triggered_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {ttl} HOUR)
+        """
+        self.client.query(query).result()
+        logger.info(f"Triggers digest résolus (TTL={ttl}h, freq={freq})")
+
     def resolve_completed_triggers(self):
         """
         Ferme les triggers 'open' dont la task Breezeway est complétée.
