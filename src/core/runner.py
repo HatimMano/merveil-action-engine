@@ -129,11 +129,6 @@ class ActionRunner:
         return [dict(r) for r in rows]
 
     def _run_digest(self):
-        try:
-            self.logger.resolve_digest_triggers(FREQ)
-        except Exception as e:
-            logger.warning(f"resolve_digest_triggers a échoué : {e}")
-
         actions = self._load_digest_actions(FREQ)
         if not actions:
             logger.info(f"rule_{FREQ} vide — rien à traiter.")
