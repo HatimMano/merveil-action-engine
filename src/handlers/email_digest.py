@@ -46,6 +46,8 @@ CATEGORY_LABELS = {
     "Disponibilites": "Disponibilités",
     "Revenue":        "Revenus",
     "Operationnel":   "Opérationnel",
+    "Ventes":         "Ventes",
+    "Qualite":        "Qualité",
 }
 
 
