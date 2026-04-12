@@ -2,7 +2,7 @@
 
 ## Overview
 Python 3.12 + **Cloud Run Job** (runs once and terminates — not an HTTP server).
-3 Cloud Schedulers configurés (PAUSED — activer pour prod) : 4H, daily 07:00, weekly lundi 08:00.
+3 Cloud Schedulers : **4H et daily ENABLED** (prod), weekly PAUSED.
 Reads pending actions (Breezeway) + rule tables (digest) produced by dbt.
 
 ## Execution Flow
@@ -153,6 +153,29 @@ gcloud beta run jobs executions logs read <execution-name> --region europe-west1
 bash deploy.sh
 ```
 
+## IAM — Prérequis
+`action-engine-sa` doit avoir les rôles suivants :
+- `roles/bigquery.dataEditor` — lire/écrire action_triggers
+- `roles/bigquery.jobUser` — exécuter les queries BQ
+- `roles/secretmanager.secretAccessor` — lire alerts-gmail-sa-key
+- `roles/run.invoker` — **requis pour que Cloud Scheduler puisse déclencher le job**
+
+```bash
+gcloud projects add-iam-policy-binding merveil-data-warehouse \
+  --member="serviceAccount:action-engine-sa@merveil-data-warehouse.iam.gserviceaccount.com" \
+  --role="roles/run.invoker"
+```
+
+## Triggering manuel (gcloud run jobs execute --update-env-vars est cassé)
+Utiliser l'API REST directement :
+```bash
+curl -s -X POST \
+  "https://run.googleapis.com/v2/projects/merveil-data-warehouse/locations/europe-west1/jobs/merveil-action-engine:run" \
+  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "Content-Type: application/json" \
+  -d '{"overrides":{"containerOverrides":[{"env":[{"name":"FREQ","value":"4h"}]}]}}'
+```
+
 ## Known Errors
 | Error | Cause | Fix |
 |---|---|---|
@@ -162,3 +185,4 @@ bash deploy.sh
 | `KeyError` in a handler | Missing field in `pending_actions` | Check the SQL of the corresponding dbt model |
 | Gmail API 401 | DWD not enabled or wrong Client ID | Check admin.google.com → Domain delegation |
 | UPDATE streaming buffer error | Row too recent in action_triggers | Wait ~90 min |
+| Scheduler PERMISSION_DENIED (code 7) | `action-engine-sa` manque `roles/run.invoker` | Voir section IAM ci-dessus |
