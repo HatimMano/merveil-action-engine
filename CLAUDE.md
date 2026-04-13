@@ -2,6 +2,10 @@
 
 ## Overview
 Python 3.12 + **Cloud Run Job** (runs once and terminates — not an HTTP server).
+**2 Cloud Run Jobs distincts** (1 par fréquence, FREQ hardcodé dans chaque job) :
+- `merveil-action-engine` → FREQ=4h
+- `merveil-action-engine-daily` → FREQ=daily
+
 3 Cloud Schedulers : **4H et daily ENABLED** (prod), weekly PAUSED.
 Reads pending actions (Breezeway) + rule tables (digest) produced by dbt.
 
@@ -74,29 +78,27 @@ The runner reads `FREQ` env var at startup. If set, only rules with a matching `
 | (not set) | Manual execution — runs all rules |
 
 ### Cloud Scheduler setup
+⚠️ Utiliser l'API v1 régionale (pas v2) — seule compatible avec l'auth OAuth du scheduler.
+⚠️ Utiliser `scheduler-invoker@` comme SA OAuth (pas `action-engine-sa@`).
+⚠️ `gcloud run jobs execute --update-env-vars` est cassé (bug gcloud) — FREQ est hardcodé dans chaque job.
+
 ```bash
-# 4H — aligné sur dbt (30 min après chaque run dbt)
+# 4H — pointe sur merveil-action-engine (FREQ=4h dans le job)
 gcloud scheduler jobs create http merveil-action-engine-4h \
   --schedule="30 6,9,12,15,18,21 * * *" \
-  --uri="https://run.googleapis.com/v2/projects/merveil-data-warehouse/locations/europe-west1/jobs/merveil-action-engine:run" \
-  --message-body='{"overrides":{"containerOverrides":[{"env":[{"name":"FREQ","value":"4h"}]}]}}' \
-  --oauth-service-account-email="action-engine-sa@merveil-data-warehouse.iam.gserviceaccount.com" \
+  --uri="https://europe-west1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/merveil-data-warehouse/jobs/merveil-action-engine:run" \
+  --message-body='{}' \
+  --headers="Content-Type=application/json" \
+  --oauth-service-account-email="scheduler-invoker@merveil-data-warehouse.iam.gserviceaccount.com" \
   --location=europe-west1
 
-# Daily
+# Daily — pointe sur merveil-action-engine-daily (FREQ=daily dans le job)
 gcloud scheduler jobs create http merveil-action-engine-daily \
   --schedule="0 7 * * *" \
-  --uri="https://run.googleapis.com/v2/projects/merveil-data-warehouse/locations/europe-west1/jobs/merveil-action-engine:run" \
-  --message-body='{"overrides":{"containerOverrides":[{"env":[{"name":"FREQ","value":"daily"}]}]}}' \
-  --oauth-service-account-email="action-engine-sa@merveil-data-warehouse.iam.gserviceaccount.com" \
-  --location=europe-west1
-
-# Weekly (lundi 08:00)
-gcloud scheduler jobs create http merveil-action-engine-weekly \
-  --schedule="0 8 * * 1" \
-  --uri="https://run.googleapis.com/v2/projects/merveil-data-warehouse/locations/europe-west1/jobs/merveil-action-engine:run" \
-  --message-body='{"overrides":{"containerOverrides":[{"env":[{"name":"FREQ","value":"weekly"}]}]}}' \
-  --oauth-service-account-email="action-engine-sa@merveil-data-warehouse.iam.gserviceaccount.com" \
+  --uri="https://europe-west1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/merveil-data-warehouse/jobs/merveil-action-engine-daily:run" \
+  --message-body='{}' \
+  --headers="Content-Type=application/json" \
+  --oauth-service-account-email="scheduler-invoker@merveil-data-warehouse.iam.gserviceaccount.com" \
   --location=europe-west1
 ```
 
@@ -166,14 +168,21 @@ gcloud projects add-iam-policy-binding merveil-data-warehouse \
   --role="roles/run.invoker"
 ```
 
-## Triggering manuel (gcloud run jobs execute --update-env-vars est cassé)
-Utiliser l'API REST directement :
+## Triggering manuel
 ```bash
+# 4h
 curl -s -X POST \
-  "https://run.googleapis.com/v2/projects/merveil-data-warehouse/locations/europe-west1/jobs/merveil-action-engine:run" \
+  "https://europe-west1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/merveil-data-warehouse/jobs/merveil-action-engine:run" \
   -H "Authorization: Bearer $(gcloud auth print-access-token)" \
   -H "Content-Type: application/json" \
-  -d '{"overrides":{"containerOverrides":[{"env":[{"name":"FREQ","value":"4h"}]}]}}'
+  -d '{}'
+
+# daily
+curl -s -X POST \
+  "https://europe-west1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/merveil-data-warehouse/jobs/merveil-action-engine-daily:run" \
+  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
 
 ## Known Errors
@@ -185,4 +194,4 @@ curl -s -X POST \
 | `KeyError` in a handler | Missing field in `pending_actions` | Check the SQL of the corresponding dbt model |
 | Gmail API 401 | DWD not enabled or wrong Client ID | Check admin.google.com → Domain delegation |
 | UPDATE streaming buffer error | Row too recent in action_triggers | Wait ~90 min |
-| Scheduler PERMISSION_DENIED (code 7) | `action-engine-sa` manque `roles/run.invoker` | Voir section IAM ci-dessus |
+| Scheduler PERMISSION_DENIED (code 7) | SA OAuth du scheduler pas dans la policy du job Cloud Run, ou API v2 utilisée | Utiliser API v1 + `scheduler-invoker@` + `gcloud run jobs add-iam-policy-binding` |
