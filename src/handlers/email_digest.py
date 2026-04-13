@@ -136,13 +136,16 @@ class EmailDigestHandler:
                     f'</tr>'
                 )
 
+        freq = os.getenv("FREQ", "")
+        freq_label = {"4h": "Toutes les 4h", "daily": "Quotidien", "weekly": "Hebdomadaire"}.get(freq, freq)
+
         return f"""<!DOCTYPE html>
 <html><body style="font-family:system-ui,sans-serif;background:#f8fafc;margin:0;padding:0">
 <div style="max-width:700px;margin:24px auto;background:white;border-radius:12px;
             overflow:hidden;border:1px solid #e2e8f0">
   <div style="background:#6366f1;padding:20px 24px">
     <h1 style="color:white;margin:0;font-size:18px">Merveil — Rapport d'alertes</h1>
-    <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{today}</p>
+    <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{today} · {freq_label}</p>
   </div>
   <div style="padding:14px 24px;background:#fef9c3;border-bottom:1px solid #fde68a">
     <span style="font-weight:600;color:{summary_color};font-size:14px">
@@ -160,24 +163,22 @@ class EmailDigestHandler:
     <tbody>{rows_html}</tbody>
   </table>
   <div style="padding:16px 24px;background:#f8fafc;border-top:1px solid #e2e8f0">
-    <p style="margin:0;font-size:12px;color:#94a3b8">
-      Merveil Data Warehouse ·
-      <a href="https://merveil-dashboards.archides.fr/alerting" style="color:#6366f1">
-        Voir le dashboard alerting
-      </a>
-    </p>
+    <p style="margin:0;font-size:12px;color:#94a3b8">Merveil Data Warehouse</p>
   </div>
 </div>
 </body></html>"""
 
     def _build_empty_html(self, label: str) -> str:
+        freq = os.getenv("FREQ", "")
+        freq_label = {"4h": "Toutes les 4h", "daily": "Quotidien", "weekly": "Hebdomadaire"}.get(freq, freq)
+
         return f"""<!DOCTYPE html>
 <html><body style="font-family:system-ui,sans-serif;background:#f8fafc;margin:0;padding:0">
 <div style="max-width:700px;margin:24px auto;background:white;border-radius:12px;
             overflow:hidden;border:1px solid #e2e8f0">
   <div style="background:#6366f1;padding:20px 24px">
     <h1 style="color:white;margin:0;font-size:18px">Merveil — Rapport d'alertes</h1>
-    <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{label}</p>
+    <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{label} · {freq_label}</p>
   </div>
   <div style="padding:24px;text-align:center;color:#64748b;font-size:14px">
     ✅ Aucune alerte active — tout est nominal.
@@ -258,13 +259,16 @@ class EmailDigestHandler:
                     f'</tr>'
                 )
 
+        freq = os.getenv("FREQ", "")
+        freq_label = {"4h": "Toutes les 4h", "daily": "Quotidien", "weekly": "Hebdomadaire"}.get(freq, freq)
+
         return f"""<!DOCTYPE html>
 <html><body style="font-family:system-ui,sans-serif;background:#f8fafc;margin:0;padding:0">
 <div style="max-width:700px;margin:24px auto;background:white;border-radius:12px;
             overflow:hidden;border:1px solid #e2e8f0">
   <div style="background:#6366f1;padding:20px 24px">
     <h1 style="color:white;margin:0;font-size:18px">Merveil — Rapport d'alertes</h1>
-    <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{today}</p>
+    <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{today} · {freq_label}</p>
   </div>
   <div style="padding:14px 24px;background:#fef9c3;border-bottom:1px solid #fde68a">
     <span style="font-weight:600;color:{summary_color};font-size:14px">
@@ -282,12 +286,7 @@ class EmailDigestHandler:
     <tbody>{rows_html}</tbody>
   </table>
   <div style="padding:16px 24px;background:#f8fafc;border-top:1px solid #e2e8f0">
-    <p style="margin:0;font-size:12px;color:#94a3b8">
-      Merveil Data Warehouse ·
-      <a href="https://merveil-dashboards.archides.fr/alerting" style="color:#6366f1">
-        Voir le dashboard alerting
-      </a>
-    </p>
+    <p style="margin:0;font-size:12px;color:#94a3b8">Merveil Data Warehouse</p>
   </div>
 </div>
 </body></html>"""
