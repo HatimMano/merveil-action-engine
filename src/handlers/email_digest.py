@@ -181,7 +181,7 @@ class EmailDigestHandler:
     <p style="color:#e0e7ff;margin:4px 0 0;font-size:13px">{label} · {freq_label}</p>
   </div>
   <div style="padding:24px;text-align:center;color:#64748b;font-size:14px">
-    ✅ Aucune alerte active — tout est nominal.
+    ✅ Aucune alerte active.
   </div>
 </div>
 </body></html>"""
@@ -241,7 +241,7 @@ class EmailDigestHandler:
         for cat, items in by_category.items():
             label = CATEGORY_LABELS.get(cat, cat)
             rows_html += (
-                f'<tr><td colspan="3" style="background:#f1f5f9;padding:8px 12px;'
+                f'<tr><td colspan="2" style="background:#f1f5f9;padding:8px 12px;'
                 f'font-weight:600;font-size:12px;color:#475569;text-transform:uppercase;'
                 f'letter-spacing:.05em">{label}</td></tr>'
             )
@@ -254,8 +254,6 @@ class EmailDigestHandler:
                     f'{emoji} {a.get("alert_message", "")}</td>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;'
                     f'color:#64748b;white-space:nowrap">{date_display}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;'
-                    f'color:#64748b">{a.get("action_recommended", "") or ""}</td>'
                     f'</tr>'
                 )
 
@@ -280,7 +278,6 @@ class EmailDigestHandler:
       <tr style="background:#f8fafc">
         <th style="padding:8px 12px;text-align:left;font-size:12px;color:#94a3b8;font-weight:500">Alerte</th>
         <th style="padding:8px 12px;text-align:left;font-size:12px;color:#94a3b8;font-weight:500">Date</th>
-        <th style="padding:8px 12px;text-align:left;font-size:12px;color:#94a3b8;font-weight:500">Action recommandée</th>
       </tr>
     </thead>
     <tbody>{rows_html}</tbody>
@@ -332,7 +329,8 @@ class EmailDigestHandler:
         """Nouveau flux : reçoit les lignes de rule_{freq} directement, envoie 1 digest."""
         freq          = os.getenv("FREQ", "unknown")
         send_if_empty = params.get("send_if_empty", False)
-        today         = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+        now_utc       = datetime.now(timezone.utc)
+        today         = now_utc.strftime("%d/%m/%Y %H:%M")
         to_addr       = params.get("to", GMAIL_TO)
 
         if not alerts:
