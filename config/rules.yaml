@@ -32,13 +32,13 @@ rules:
 
 digest:
   4h:
-    to: "alerte_ventes@archides.fr"   # TEST — prod: alerte_ventes@archides.fr
+    to: "alerte_ventes@archides.fr, hatim@archides.fr"
     send_if_empty: true
 
   daily:
-    to: "alerte_ventes@archides.fr"   # TEST — prod: alerte_ventes@archides.fr
+    to: "alerte_ventes@archides.fr, hatim@archides.fr"
     send_if_empty: false
 
   weekly:
-    to: "alerte_ventes@archides.fr"   # TEST — prod: alerte_ventes@archides.fr
+    to: "alerte_ventes@archides.fr, hatim@archides.fr"
     send_if_empty: false
