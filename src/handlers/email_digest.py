@@ -33,9 +33,10 @@ from src.handlers import SkipAction
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
-GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@merveil.fr")
-GMAIL_TO     = os.getenv("GMAIL_TO",     "alertes@archides.fr")
+PROJECT_ID      = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
+GMAIL_SENDER    = os.getenv("GMAIL_SENDER", "noreply@merveil.fr")
+GMAIL_TO        = os.getenv("GMAIL_TO",     "alertes@archides.fr")
+TEST_RECIPIENT  = os.getenv("TEST_RECIPIENT")   # si défini, override tous les destinataires
 
 SEVERITY_EMOJI = {"CRITICAL": "🔴", "WARNING": "🟡", "INFO": "🔵"}
 
@@ -331,7 +332,7 @@ class EmailDigestHandler:
         send_if_empty = params.get("send_if_empty", False)
         now_utc       = datetime.now(timezone.utc)
         today         = now_utc.strftime("%d/%m/%Y %H:%M")
-        to_addr       = params.get("to", GMAIL_TO)
+        to_addr       = TEST_RECIPIENT or params.get("to", GMAIL_TO)
 
         if not alerts:
             if not send_if_empty:
