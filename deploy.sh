@@ -2,13 +2,6 @@
 # deploy.sh — Build & déploie merveil-action-engine sur Cloud Run Jobs
 # Deux jobs : merveil-action-engine (FREQ=4h) + merveil-action-engine-daily (FREQ=daily)
 # Usage: ./deploy.sh
-#
-# Mode test  → emails envoyés uniquement à hatim@archides.fr
-#              TEST_RECIPIENT="hatim@archides.fr" (défini ci-dessous)
-# Mode prod  → emails envoyés à tous les destinataires de rules.yaml
-#              Commenter ou vider TEST_RECIPIENT
-
-TEST_RECIPIENT="hatim@archides.fr"   # ← vider ("") pour passer en prod
 
 set -e
 
@@ -33,23 +26,15 @@ COMMON_ARGS="--image $IMAGE \
   --service-account $SA \
   --project $PROJECT"
 
-TEST_ENV=""
-if [ -n "$TEST_RECIPIENT" ]; then
-  TEST_ENV=",TEST_RECIPIENT=$TEST_RECIPIENT"
-  echo "⚠️  Mode TEST — emails envoyés uniquement à $TEST_RECIPIENT"
-else
-  echo "🚀 Mode PROD — emails envoyés aux destinataires de rules.yaml"
-fi
-
 echo "🚀 Déploiement du job 4h..."
 gcloud run jobs deploy merveil-action-engine \
   $COMMON_ARGS \
-  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="alerte_ventes@archides.fr",FREQ="4h"${TEST_ENV}
+  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="alerte_ventes@archides.fr",FREQ="4h"
 
 echo "🚀 Déploiement du job daily..."
 gcloud run jobs deploy merveil-action-engine-daily \
   $COMMON_ARGS \
-  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="alerte_ventes@archides.fr",FREQ="daily"${TEST_ENV}
+  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="alerte_ventes@archides.fr",FREQ="daily"
 
 echo ""
 echo "✅ Jobs déployés : merveil-action-engine (4h) + merveil-action-engine-daily"
