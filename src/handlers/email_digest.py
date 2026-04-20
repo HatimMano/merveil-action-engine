@@ -22,6 +22,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -330,8 +331,8 @@ class EmailDigestHandler:
         """Nouveau flux : reçoit les lignes de rule_{freq} directement, envoie 1 digest."""
         freq          = os.getenv("FREQ", "unknown")
         send_if_empty = params.get("send_if_empty", False)
-        now_utc       = datetime.now(timezone.utc)
-        today         = now_utc.strftime("%d/%m/%Y %H:%M")
+        now_paris     = datetime.now(ZoneInfo("Europe/Paris"))
+        today         = now_paris.strftime("%d/%m/%Y %H:%M")
         to_addr       = TEST_RECIPIENT or params.get("to", GMAIL_TO)
 
         if not alerts:
