@@ -300,7 +300,7 @@ class EmailDigestHandler:
   <div style="padding:16px 24px;background:#f8fafc;border-top:1px solid #e2e8f0">
     <p style="margin:0;font-size:12px;color:#94a3b8">
       Merveil Data Warehouse ·
-      <a href="https://merveil-dashboards.archides.fr" style="color:#6366f1;text-decoration:none">
+      <a href="https://direction.archides.fr" style="color:#6366f1;text-decoration:none">
         Dashboard complet
       </a>
     </p>
