@@ -250,12 +250,24 @@ class EmailDigestHandler:
             for a in items:
                 emoji = SEVERITY_EMOJI.get(a.get("severity", ""), "⚪")
                 date_display = str(a.get("alert_date", ""))
+                action      = a.get("action_recommended", "") or ""
+                # Si action_recommended est une URL → bouton cliquable "Voir →"
+                if action.startswith("http"):
+                    action_cell = (
+                        f'<a href="{action}" style="display:inline-block;'
+                        f'background:#6366f1;color:white;padding:4px 10px;'
+                        f'border-radius:6px;text-decoration:none;font-size:11px;font-weight:500">'
+                        f'Voir →</a>'
+                    )
+                else:
+                    action_cell = f'<span style="color:#64748b;font-size:12px">{action}</span>'
                 rows_html += (
                     f'<tr>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px">'
                     f'{emoji} {a.get("alert_message", "")}</td>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;'
                     f'color:#64748b;white-space:nowrap">{date_display}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right">{action_cell}</td>'
                     f'</tr>'
                 )
 
@@ -264,7 +276,7 @@ class EmailDigestHandler:
 
         return f"""<!DOCTYPE html>
 <html><body style="font-family:system-ui,sans-serif;background:#f8fafc;margin:0;padding:0">
-<div style="max-width:700px;margin:24px auto;background:white;border-radius:12px;
+<div style="max-width:760px;margin:24px auto;background:white;border-radius:12px;
             overflow:hidden;border:1px solid #e2e8f0">
   <div style="background:#6366f1;padding:20px 24px">
     <h1 style="color:white;margin:0;font-size:18px">Merveil — Rapport d'alertes</h1>
@@ -280,12 +292,18 @@ class EmailDigestHandler:
       <tr style="background:#f8fafc">
         <th style="padding:8px 12px;text-align:left;font-size:12px;color:#94a3b8;font-weight:500">Alerte</th>
         <th style="padding:8px 12px;text-align:left;font-size:12px;color:#94a3b8;font-weight:500">Date</th>
+        <th style="padding:8px 12px;text-align:right;font-size:12px;color:#94a3b8;font-weight:500">Action</th>
       </tr>
     </thead>
     <tbody>{rows_html}</tbody>
   </table>
   <div style="padding:16px 24px;background:#f8fafc;border-top:1px solid #e2e8f0">
-    <p style="margin:0;font-size:12px;color:#94a3b8">Merveil Data Warehouse</p>
+    <p style="margin:0;font-size:12px;color:#94a3b8">
+      Merveil Data Warehouse ·
+      <a href="https://merveil-dashboards.archides.fr" style="color:#6366f1;text-decoration:none">
+        Dashboard complet
+      </a>
+    </p>
   </div>
 </div>
 </body></html>"""
