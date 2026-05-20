@@ -138,8 +138,8 @@ def _render_grouped_block(alerts: list[dict], spec: dict) -> str:
         button = (
             f'<div style="text-align:right;margin-top:8px">'
             f'<a href="{url}" style="display:inline-block;background:#6366f1;color:white;'
-            f'padding:6px 14px;border-radius:6px;text-decoration:none;font-size:12px;'
-            f'font-weight:500">Voir le détail →</a></div>'
+            f'padding:4px 10px;border-radius:6px;text-decoration:none;font-size:11px;'
+            f'font-weight:500">Voir →</a></div>'
         )
 
     return (
