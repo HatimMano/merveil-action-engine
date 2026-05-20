@@ -52,6 +52,103 @@ CATEGORY_LABELS = {
     "Qualite":        "Qualité",
 }
 
+# Types d'alertes qui touchent plusieurs apparts/résas et qu'on regroupe en 1
+# case agrégée dans le mail (au lieu de N cases individuelles).
+# Min 3 occurrences pour déclencher le regroupement, sinon affichage standard.
+GROUPABLE = {
+    "superhost_risk": {
+        "title": "Apparts en risque qualité",
+        # tri : nb_reviews desc (signal solide) puis note asc (pires d'abord)
+        "sort": lambda a: (-float(a.get("secondary_value") or 0), float(a.get("metric_value") or 5.0)),
+    },
+    "revenue_anomaly": {
+        "title": "Apparts à 0 € de CA ce mois",
+        # tri : CA P-1 desc (plus grosse chute en premier)
+        "sort": lambda a: -float(a.get("secondary_value") or 0),
+    },
+    "last_minute": {
+        "title": "Résas last-minute",
+        "sort": lambda a: str(a.get("alert_date") or ""),
+    },
+    "cancellation_vip": {
+        "title": "Annulations VIP (Gold / Silver)",
+        "sort": lambda a: str(a.get("alert_date") or ""),
+    },
+    "cancellation_large_apt": {
+        "title": "Annulations grands appartements",
+        "sort": lambda a: str(a.get("alert_date") or ""),
+    },
+    "abandoned_cart": {
+        "title": "Paniers abandonnés ≥ 1 500 €",
+        "sort": lambda a: -float(a.get("metric_value") or 0),
+    },
+}
+GROUP_MIN_COUNT = 3  # à partir de 3 alertes du même type, on regroupe
+
+
+def _render_grouped_block(alerts: list[dict], spec: dict) -> str:
+    """Rend une case agrégée pour un type d'alerte multi-apparts.
+
+    Affiche : titre + count + sous-blocs Critical/Warning (apparts triés) + bouton lien.
+    """
+    sorted_alerts = sorted(alerts, key=spec["sort"])
+    crit = [a for a in sorted_alerts if a.get("severity") == "CRITICAL"]
+    warn = [a for a in sorted_alerts if a.get("severity") == "WARNING"]
+    info = [a for a in sorted_alerts if a.get("severity") not in ("CRITICAL", "WARNING")]
+    url = (alerts[0].get("action_recommended") or "").strip()
+
+    def items_html(group: list[dict]) -> str:
+        # Chaque appart : message court de dash_alerts (déjà compact)
+        chips = "".join(
+            f'<span style="display:inline-block;background:#f8fafc;border:1px solid #e2e8f0;'
+            f'border-radius:4px;padding:2px 8px;margin:2px 4px 2px 0;font-size:11px;'
+            f'color:#475569;font-family:ui-monospace,monospace">'
+            f'{a.get("alert_message", "")}</span>'
+            for a in group
+        )
+        return f'<div style="margin:4px 0 8px">{chips}</div>'
+
+    sev_label = []
+    if crit:
+        sev_label.append(f'<strong style="color:#dc2626">🔴 {len(crit)} critical</strong>')
+    if warn:
+        sev_label.append(f'<strong style="color:#d97706">🟡 {len(warn)} warning</strong>')
+    if info:
+        sev_label.append(f'<strong style="color:#475569">🔵 {len(info)}</strong>')
+
+    header = (
+        f'<div style="font-size:13px;font-weight:600;color:#1e293b;margin-bottom:6px">'
+        f'{spec["title"]} — {len(alerts)} concernés '
+        f'<span style="font-weight:normal;color:#64748b;font-size:11px">'
+        f'({" · ".join(sev_label)})</span></div>'
+    )
+
+    body = ""
+    if crit:
+        body += '<div style="font-size:11px;color:#dc2626;font-weight:600;margin-top:6px">🔴 Critical</div>'
+        body += items_html(crit)
+    if warn:
+        body += '<div style="font-size:11px;color:#d97706;font-weight:600;margin-top:6px">🟡 Warning</div>'
+        body += items_html(warn)
+    if info:
+        body += items_html(info)
+
+    button = ""
+    if url.startswith("http"):
+        button = (
+            f'<div style="text-align:right;margin-top:8px">'
+            f'<a href="{url}" style="display:inline-block;background:#6366f1;color:white;'
+            f'padding:6px 14px;border-radius:6px;text-decoration:none;font-size:12px;'
+            f'font-weight:500">Voir le détail →</a></div>'
+        )
+
+    return (
+        f'<tr><td colspan="3" style="padding:12px 16px;border-bottom:1px solid #f1f5f9;'
+        f'background:#fefce8/30">'
+        f'{header}{body}{button}'
+        f'</td></tr>'
+    )
+
 
 def _load_gmail_service():
     """Charge la clé SA depuis Secret Manager et construit le service Gmail."""
@@ -243,33 +340,46 @@ class EmailDigestHandler:
         for cat, items in by_category.items():
             label = CATEGORY_LABELS.get(cat, cat)
             rows_html += (
-                f'<tr><td colspan="2" style="background:#f1f5f9;padding:8px 12px;'
+                f'<tr><td colspan="3" style="background:#f1f5f9;padding:8px 12px;'
                 f'font-weight:600;font-size:12px;color:#475569;text-transform:uppercase;'
                 f'letter-spacing:.05em">{label}</td></tr>'
             )
+
+            # Regroupement par alert_type pour identifier les groupes multi-apparts
+            by_type: dict[str, list] = {}
             for a in items:
-                emoji = SEVERITY_EMOJI.get(a.get("severity", ""), "⚪")
-                date_display = str(a.get("alert_date", ""))
-                action      = a.get("action_recommended", "") or ""
-                # Si action_recommended est une URL → bouton cliquable "Voir →"
-                if action.startswith("http"):
-                    action_cell = (
-                        f'<a href="{action}" style="display:inline-block;'
-                        f'background:#6366f1;color:white;padding:4px 10px;'
-                        f'border-radius:6px;text-decoration:none;font-size:11px;font-weight:500">'
-                        f'Voir →</a>'
+                by_type.setdefault(a.get("alert_type", ""), []).append(a)
+
+            for atype, group in by_type.items():
+                spec = GROUPABLE.get(atype)
+                if spec and len(group) >= GROUP_MIN_COUNT:
+                    # Case agrégée : 1 ligne avec liste compacte
+                    rows_html += _render_grouped_block(group, spec)
+                    continue
+
+                # Sinon : N lignes individuelles (comportement standard)
+                for a in group:
+                    emoji = SEVERITY_EMOJI.get(a.get("severity", ""), "⚪")
+                    date_display = str(a.get("alert_date", ""))
+                    action      = a.get("action_recommended", "") or ""
+                    if action.startswith("http"):
+                        action_cell = (
+                            f'<a href="{action}" style="display:inline-block;'
+                            f'background:#6366f1;color:white;padding:4px 10px;'
+                            f'border-radius:6px;text-decoration:none;font-size:11px;font-weight:500">'
+                            f'Voir →</a>'
+                        )
+                    else:
+                        action_cell = f'<span style="color:#64748b;font-size:12px">{action}</span>'
+                    rows_html += (
+                        f'<tr>'
+                        f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px">'
+                        f'{emoji} {a.get("alert_message", "")}</td>'
+                        f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;'
+                        f'color:#64748b;white-space:nowrap">{date_display}</td>'
+                        f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right">{action_cell}</td>'
+                        f'</tr>'
                     )
-                else:
-                    action_cell = f'<span style="color:#64748b;font-size:12px">{action}</span>'
-                rows_html += (
-                    f'<tr>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px">'
-                    f'{emoji} {a.get("alert_message", "")}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;'
-                    f'color:#64748b;white-space:nowrap">{date_display}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right">{action_cell}</td>'
-                    f'</tr>'
-                )
 
         freq = os.getenv("FREQ", "")
         freq_label = {"4h": "Toutes les 4h", "daily": "Quotidien", "weekly": "Hebdomadaire"}.get(freq, freq)
