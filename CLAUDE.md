@@ -124,9 +124,37 @@ GMAIL_SENDER=noreply@archides.fr
 GMAIL_TO=alerte_ventes@archides.fr   ← fallback si rules.yaml ne définit pas `to`
 ```
 
-Pour forcer l'envoi en test sur une adresse unique, définir `TEST_RECIPIENT=<email>` dans `deploy.sh` (vide = prod).
+Pour forcer l'envoi en test sur une adresse unique : `gcloud run jobs update merveil-action-engine-daily --update-env-vars=TEST_RECIPIENT=<email>` (et `--remove-env-vars=TEST_RECIPIENT` pour repasser en prod). NE PAS utiliser `--set-env-vars` qui remplace toutes les vars (FREQ saute).
 
 The SA `alerts-gmail-sender@merveil-data-warehouse.iam.gserviceaccount.com` must have access to `alerts-gmail-sa-key` in Secret Manager, and the Cloud Run Job must mount this secret.
+
+### Template HTML (`src/handlers/email_digest.py::_build_html_from_rows`)
+
+**Structure** :
+- Header indigo · summary bar (`X alertes — N critique(s) · M warning(s)`)
+- Table 3 colonnes (Alerte / Date / Action) groupée par `alert_category` (sections gris clair)
+- Pour chaque alerte : emoji severity + `alert_message` + date + bouton "Voir →" (si `action_recommended.startswith("http")`) ou texte gris sinon
+
+**Détection URL** : `action_recommended.startswith("http")` → bouton cliquable indigo. Sinon texte. Tous les `action_recommended` dans `dash_alerts.sql` sont désormais des URLs dashboard direct (cf. dbt CLAUDE.md "Alerting — refonte dashboard liens + multi-apparts").
+
+### Regroupement multi-apparts
+
+Pour les types qui touchent N apparts/résas simultanément (`superhost_risk` 29/jour, `revenue_anomaly`, `last_minute`, `cancellation_vip`, `cancellation_large_apt`, `abandoned_cart`) — si **≥ 3 occurrences** du même type dans une même catégorie, on regroupe en **1 case agrégée** au lieu de N lignes :
+
+- Titre + count + breakdown severity (`🔴 6 critical · 🟡 23 warning`)
+- Sous-blocs Critical puis Warning avec chips compacts (1 chip = `alert_message` complet)
+- Bouton "Voir →" unique cliquable (URL = `action_recommended` du 1er élément)
+
+**Tri intelligent (constante `GROUPABLE` en haut de email_digest.py)** :
+- `superhost_risk` : `secondary_value` desc (= `nb_reviews_3m`, signal solide) puis `metric_value` asc (pires notes en haut)
+- `revenue_anomaly` : `secondary_value` desc (= CA P-1, plus grosse chute en premier)
+- Autres : par `alert_date`
+
+**Pour ajouter un nouveau type groupable** : ajouter une entrée dans `GROUPABLE` avec `title` + lambda `sort`. Le seuil `GROUP_MIN_COUNT=3` est global.
+
+### ⚠️ NULL CONCAT côté dbt
+
+BigQuery `CONCAT(a, b, NULL, c)` retourne **NULL** dès qu'un seul argument est NULL → mail affiche "None". Si tu vois "None" dans la section d'une catégorie, le bug est côté `dash_alerts.sql` — wrapper tous les args potentiellement NULL en `COALESCE(col, '?')`. Cas connu corrigé 2026-05-20 : `cancellation_vip` avec `customer_name = NULL`.
 
 ## Deduplication
 `rule_daily_alert_digest` emits `property_id = CURRENT_DATE` → max 1 email per day.
