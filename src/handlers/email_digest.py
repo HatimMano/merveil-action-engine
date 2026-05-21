@@ -456,9 +456,16 @@ class EmailDigestHandler:
             logger.warning(f"digest_log insert errors : {errors}")
 
     def execute_batch(self, alerts: list[dict], params: dict) -> str:
-        """Nouveau flux : reçoit les lignes de rule_{freq} directement, envoie 1 digest."""
+        """Nouveau flux : reçoit les lignes de rule_{freq} directement, envoie 1 digest.
+
+        Params optionnels :
+          - to (str)             : destinataires (override GMAIL_TO)
+          - send_if_empty (bool) : si True, envoie "rien à signaler" quand vide
+          - subject_prefix (str) : préfixe du sujet (défaut '[Merveil]', utilisé par TriggerDispatcher pour distinguer 4H/Daily)
+        """
         freq          = os.getenv("FREQ", "unknown")
         send_if_empty = params.get("send_if_empty", False)
+        subject_pref  = params.get("subject_prefix", "[Merveil]")
         now_paris     = datetime.now(ZoneInfo("Europe/Paris"))
         today         = now_paris.strftime("%d/%m/%Y %H:%M")
         to_addr       = TEST_RECIPIENT or params.get("to", GMAIL_TO)
@@ -467,11 +474,11 @@ class EmailDigestHandler:
             if not send_if_empty:
                 raise SkipAction("no_alerts")
             html    = self._build_empty_html(today)
-            subject = f"[Merveil] ✅ Rien à signaler · {today}"
+            subject = f"{subject_pref} ✅ Rien à signaler · {today}"
         else:
             html           = self._build_html_from_rows(alerts, today)
             critical_count = sum(1 for a in alerts if a.get("severity") == "CRITICAL")
-            subject        = f"[Merveil] {len(alerts)} alertes · {critical_count} critique(s) · {today}"
+            subject        = f"{subject_pref} {len(alerts)} alertes · {critical_count} critique(s) · {today}"
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject

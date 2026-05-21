@@ -1,0 +1,180 @@
+# ============================================================================
+# routing.yaml — Mapping trigger → actions
+# ============================================================================
+#
+# Décision : cf. decisions.md 2026-05-21 — Refacto trigger/action/routing.
+#
+# Pour chaque trigger_name produit par dbt (table action_engine.triggers),
+# liste les actions à exécuter quand une occurrence non encore traitée est détectée.
+#
+# Une action est typée :
+#   - type: email_digest    — accumulée dans 1 mail par bucket (4h / daily / weekly)
+#   - type: asana_task      — création de tâche Asana
+#   - type: breezeway_task  — création de tâche Breezeway
+#
+# Idempotence : par (trigger_name, property_id, action_type) dans dispatched_actions.
+# Si une action est déjà 'open' (= pas resolved), elle n'est pas redispatchée.
+#
+# Backlog : externaliser ce fichier vers DWH Feed Sheets (table BQ alimentée
+# depuis Sheets) pour édition par Mickael sans commit. Voir Archides/CLAUDE.md.
+# ============================================================================
+
+# Recipients par défaut par bucket. Surchargeable per-trigger via params.recipients.
+digest_buckets:
+  4h:
+    send_if_empty: true
+    subject_prefix: "[Merveil 4H]"
+    default_recipients:
+      - alerte_ventes@archides.fr
+      - hatim@archides.fr
+  daily:
+    send_if_empty: false
+    subject_prefix: "[Merveil Daily]"
+    default_recipients:
+      - alerte_ventes@archides.fr
+      - hatim@archides.fr
+
+# ============================================================================
+# Triggers
+# ============================================================================
+
+triggers:
+
+  # ── Alertes urgentes 4h (= ancien rule_4h.sql) ────────────────────────────
+  cancellation_vip:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: 4h
+
+  satisfaction_low_review:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: 4h
+
+  last_minute_checkin:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: 4h
+
+  double_booking:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: 4h
+
+  checkin_no_apartment:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: 4h
+
+  # ── Alertes daily (= ancien rule_daily.sql) ────────────────────────────────
+  abandoned_cart:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  revenue_anomaly_adr:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  revenue_anomaly_adr_per_room:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  revenue_apt_zero:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  low_occupation:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  high_cancellations_daily:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  cancellation_large_apt:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  superhost_risk:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  dispo_daily_summary:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  gap_pricing_summary:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  # ── Triggers nécessitant des actions ciblées ──────────────────────────────
+  champagne_direct:
+    enabled: false   # legacy disabled
+    actions:
+      - type: breezeway_task
+        params:
+          name_template: "Bouteille de champagne — {apartment_name}"
+          department: housekeeping
+          subdepartment: linge_conso_logistique
+          priority: normal
+          assign_economat: true
+          assign_cleaning_team: true
+
+  low_review_cleanliness:
+    enabled: true    # ancien rule, à activer
+    actions:
+      - type: breezeway_task
+        params:
+          name_template: "Inspection propreté — {apartment_name}"
+          department: housekeeping
+          priority: high
+
+  # ── POC Asana — nouveau trigger ─────────────────────────────────────────────
+  inspection_overdue:
+    enabled: false   # désactivé tant que ASANA_PAT pas en Secret Manager prod
+    actions:
+      - type: asana_task
+        params:
+          workspace_id: "1199370302253551"   # MERVEIL
+          project_id: "1214996499081074"     # Projet "Test"
+          name_template: "Inspection en retard — {apartment_code} ({days_since_inspection}j)"
+          notes_template: |
+            Apart : {apartment_name}
+            Dernière inspection : {last_inspection_date}
+            Jours depuis : {days_since_inspection}j (seuil = 90j)
+
+            Lien dashboard : https://direction.archides.fr/qualite?tab=operationnel
+          due_offset_days: 3
+          # assignee_email: "hassana@archides.fr"   # à confirmer
+
+  # ── Désactivés ────────────────────────────────────────────────────────────
+  client_risk:
+    enabled: false   # legacy disabled (clients_at_risk hors UNION dash_alerts)
+    actions:
+      - type: email_digest
+        bucket: daily
