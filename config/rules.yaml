@@ -30,6 +30,25 @@ rules:
           department: housekeeping
           priority: high
 
+  # ── POC Asana (désactivé tant que ASANA_PAT pas en Secret Manager) ─────────
+  # Idempotence : source_key encodé dans les notes (free tier — pas de custom fields)
+  inspection_overdue:
+    enabled: false
+    destinations:
+      - type: asana_task
+        params:
+          workspace_id: "1199370302253551"    # MERVEIL workspace
+          project_id:   "1214996499081074"    # Projet "Test" (à changer pour le projet ops réel)
+          name_template: "Inspection en retard — {apartment_code} ({days_since_inspection}j)"
+          notes_template: |
+            Apart : {apartment_name}
+            Dernière inspection : {last_inspection_date}
+            Jours depuis : {days_since_inspection}j (seuil = 90j)
+
+            Lien dashboard : https://direction.archides.fr/qualite?tab=operationnel
+          due_offset_days: 3
+          # assignee_email: "hassana@archides.fr"   # à confirmer avec Mickael
+
 digest:
   4h:
     to: "alerte_ventes@archides.fr, hatim@archides.fr"

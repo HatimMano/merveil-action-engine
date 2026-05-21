@@ -22,6 +22,7 @@ from google.cloud import bigquery
 
 from src.core.action_logger import ActionLogger
 from src.handlers import SkipAction
+from src.handlers.asana_task import AsanaTaskHandler
 from src.handlers.breezeway_tasks import BreezewayTasksHandler
 from src.handlers.email_digest import EmailDigestHandler
 
@@ -33,6 +34,7 @@ FREQ       = os.getenv("FREQ")  # 4h | daily | weekly | monthly | None
 HANDLER_REGISTRY = {
     "breezeway_task": BreezewayTasksHandler,
     "email_digest":   EmailDigestHandler,
+    "asana_task":     AsanaTaskHandler,
 }
 
 

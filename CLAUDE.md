@@ -111,6 +111,32 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 |---|---|---|
 | `breezeway_task` | `BreezewayTasksHandler` | Creates Breezeway tasks (cleaning, inspection, logistics) |
 | `email_digest` | `EmailDigestHandler` | Sends the daily alert digest via Gmail API (DWD) |
+| `asana_task` | `AsanaTaskHandler` | **POC** — Creates Asana tasks (idempotence via `source_key:` in notes — workaround Asana free tier qui n'a pas de custom fields) |
+
+### Asana — POC (mai 2026)
+**État** : handler en place, rule `inspection_overdue` configurée `enabled: false` dans `rules.yaml`. Workspace MERVEIL `1199370302253551`, projet Test `1214996499081074`.
+
+**Idempotence sans custom fields (Asana free tier)** : le `source_key = "{rule_name}:{property_id}"` est encodé dans les notes au format `source_key: rule:property`. Avant POST, le handler liste les tâches ouvertes du projet (1 GET caché par run) et skip si match. Cache mémoire par projet pour ne pas refaire 50 GET dans un même run.
+
+**Test local** (sans déployer) :
+```bash
+cd merveil-action-engine
+ASANA_PAT=<token> python -m utils.test_asana
+```
+Vérifie : (1) création de tâche, (2) idempotence (run 2 = SKIP), (3) listing.
+
+**Pour activer en prod** :
+1. Créer secret : `gcloud secrets create asana-pat --replication-policy=automatic` puis `echo -n "<PAT>" | gcloud secrets versions add asana-pat --data-file=-`
+2. Grant accès au SA action-engine sur le secret
+3. Monter dans `deploy.sh` : `--update-secrets=ASANA_PAT=asana-pat:latest`
+4. Créer la SQL dbt `rule_inspection_overdue.sql` (insertion dans `action_engine.pending_actions`)
+5. Mettre `enabled: true` dans `rules.yaml` + `assignee_email` correct
+6. Redéployer
+
+**Limites free tier à connaître** :
+- Pas de custom fields → idempotence par parsing notes (fragile si quelqu'un édite les notes à la main et casse la ligne `source_key:`)
+- Pas de webhooks "rules" Asana → si on veut une boucle de fermeture (Asana → DWH), faut polling périodique
+- Asana Rules engine non disponible → toute automatisation côté DWH
 
 ## Email Digest — Architecture Gmail API + DWD
 **Sender**: `noreply@archides.fr` (dedicated Workspace account, never connected as a human)
