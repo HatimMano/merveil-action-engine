@@ -277,6 +277,9 @@ class TriggerDispatcher:
     @staticmethod
     def _trigger_to_legacy_alert(trigger: dict, _params: dict) -> dict:
         """Convertit un trigger en format compatible avec EmailDigestHandler legacy."""
+        detected_at = trigger.get("detected_at")
+        # alert_date = juste la date (le mail digest legacy attendait une DATE, pas un TIMESTAMP)
+        alert_date = detected_at.date() if hasattr(detected_at, "date") else detected_at
         return {
             "alert_type": trigger["trigger_name"],
             "property_id": trigger["property_id"],
@@ -285,8 +288,8 @@ class TriggerDispatcher:
             "alert_message": trigger.get("message"),
             "action_recommended": trigger.get("action_url"),
             "alert_category": trigger.get("category"),
-            "alert_date": trigger.get("detected_at"),
-            "detected_at": trigger.get("detected_at"),
+            "alert_date": alert_date,
+            "detected_at": detected_at,
         }
 
     # ── Helpers persistance ─────────────────────────────────────────────────
