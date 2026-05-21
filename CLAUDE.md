@@ -104,7 +104,7 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 
 ## ⭐ Refonte Trigger / Action / Routing (2026-05-21)
 
-**Statut** : code déployé, prod sur le nouveau dispatcher depuis 2026-05-21. Legacy `ActionRunner` conservé en fallback via feature flag (cf. decisions.md du 2026-05-21).
+**Statut** : terminé. Code déployé, prod sur le nouveau dispatcher depuis 2026-05-21. Legacy `ActionRunner` + `rules.yaml` + `action_logger.py` **supprimés** le 2026-05-21 (Phase E). Tables BQ legacy (`action_engine.rule_*`, `pending_actions`, `action_triggers`) conservées en archive — non actualisées par dbt — à droper manuellement plus tard si besoin.
 
 **Concepts** :
 - `trigger` (dbt → `action_engine.triggers`) : 1 ligne = 1 occurrence métier détectée. Schema unifié `(trigger_name, entity_type, entity_id, property_id, severity, category, message, action_url, context, detected_at, expires_at)`. 1 fichier `models/triggers/trigger_<name>.sql` par condition.
@@ -119,10 +119,7 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 4. Pour chaque trigger × routing.actions : skip si déjà open, sinon (a) buffer pour email_digest, (b) handler.execute pour asana/breezeway
 5. Flush 1 mail par bucket avec les triggers bufferisés
 
-**Feature flag** `USE_NEW_DISPATCHER` (env var sur Cloud Run Job) :
-- `false` (legacy) → `ActionRunner` lit `pending_actions` + `rule_4h`/`rule_daily`
-- `true` (actif depuis 2026-05-21) → `TriggerDispatcher` lit `action_engine.triggers` + `routing.yaml`
-- Rollback rapide : `gcloud run jobs update merveil-action-engine --update-env-vars=USE_NEW_DISPATCHER=false` (idem `-daily`)
+**Feature flag** `USE_NEW_DISPATCHER` (env var) : **dead code** depuis Phase E. La var reste set à `true` sur les Cloud Run Jobs mais main.py ne la lit plus. Rollback rapide impossible désormais — git revert + redeploy si régression.
 
 **Inventaire triggers** (cf. `dbt/models/triggers/`) — 18 actifs :
 | trigger_name | bucket / action | enabled | volume actuel |
@@ -154,8 +151,9 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 4. `bash redeploy.sh` (dbt) + `bash deploy.sh` (action-engine) si routing.yaml modifié
 
 **Backlog** :
-- Phase E (nettoyage) : suppression `rule_4h`/`rule_daily`/`pending_actions`/anciens `rule_<X>.sql` + `ActionRunner` legacy après 2 semaines de stabilité (≈ 2026-06-04)
 - Externalisation `routing.yaml` → DWH Feed Sheets (cf. Archides/CLAUDE.md backlog)
+- Retirer la var d'env `USE_NEW_DISPATCHER` des Cloud Run Jobs (déjà inutile)
+- Drop manuel des tables BQ `action_engine.rule_*` + `pending_actions` + `action_triggers` quand l'archive ne sert plus
 
 ## Adding a Destination (handler)
 1. Create `src/handlers/<destination>.py` with `class XxxHandler` and method `execute(action, params) -> str`
