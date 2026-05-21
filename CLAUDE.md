@@ -102,9 +102,64 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
   --location=europe-west1
 ```
 
-## Adding a Destination
+## ⭐ Refonte Trigger / Action / Routing (2026-05-21)
+
+**Statut** : code déployé, prod sur le nouveau dispatcher depuis 2026-05-21. Legacy `ActionRunner` conservé en fallback via feature flag (cf. decisions.md du 2026-05-21).
+
+**Concepts** :
+- `trigger` (dbt → `action_engine.triggers`) : 1 ligne = 1 occurrence métier détectée. Schema unifié `(trigger_name, entity_type, entity_id, property_id, severity, category, message, action_url, context, detected_at, expires_at)`. 1 fichier `models/triggers/trigger_<name>.sql` par condition.
+- `action` (Python handler) : réaction typée (asana_task, breezeway_task, email_digest). Un trigger peut déclencher N actions.
+- `routing` (`config/routing.yaml`) : mapping `trigger_name → [actions]`. Déclaratif.
+- `dispatched_actions` (BQ table append-only) : log par (trigger, property_id, action_type, status). Cooldown via `status='open'`.
+
+**Flux exécution** (`src/core/dispatcher.py::TriggerDispatcher.run`) :
+1. Résoudre les Breezeway tasks completed (webhook) → `dispatched_actions` status=resolved
+2. Résoudre les digests expirés (TTL 4h/24h/168h selon bucket) → resolved
+3. Charger triggers + dispatched_actions ouverts (1 query chacun)
+4. Pour chaque trigger × routing.actions : skip si déjà open, sinon (a) buffer pour email_digest, (b) handler.execute pour asana/breezeway
+5. Flush 1 mail par bucket avec les triggers bufferisés
+
+**Feature flag** `USE_NEW_DISPATCHER` (env var sur Cloud Run Job) :
+- `false` (legacy) → `ActionRunner` lit `pending_actions` + `rule_4h`/`rule_daily`
+- `true` (actif depuis 2026-05-21) → `TriggerDispatcher` lit `action_engine.triggers` + `routing.yaml`
+- Rollback rapide : `gcloud run jobs update merveil-action-engine --update-env-vars=USE_NEW_DISPATCHER=false` (idem `-daily`)
+
+**Inventaire triggers** (cf. `dbt/models/triggers/`) — 18 actifs :
+| trigger_name | bucket / action | enabled | volume actuel |
+|---|---|---|---|
+| cancellation_vip | email_digest@4h | ✅ | ~37 |
+| satisfaction_low_review | email_digest@4h | ✅ | ~3 |
+| last_minute_checkin | email_digest@4h | ✅ | ~3 |
+| double_booking | email_digest@4h | ✅ | 0 |
+| checkin_no_apartment | email_digest@4h | ✅ | 0 |
+| abandoned_cart | email_digest@daily | ✅ | 0 |
+| revenue_anomaly_adr | email_digest@daily | ✅ | 0 |
+| revenue_anomaly_adr_per_room | email_digest@daily | ✅ | 0 |
+| revenue_apt_zero | email_digest@daily | ✅ | 0 |
+| low_occupation | email_digest@daily | ✅ | 0 |
+| high_cancellations_daily | email_digest@daily | ✅ | 0 |
+| cancellation_large_apt | email_digest@daily | ✅ | ~10 |
+| superhost_risk | email_digest@daily | ✅ | ~25 |
+| dispo_daily_summary | email_digest@daily | ✅ | ~2 |
+| gap_pricing_summary | email_digest@daily | ✅ | ~3 |
+| champagne_direct | breezeway_task | ❌ disabled | ~5 |
+| low_review_cleanliness | breezeway_task | ✅ (placeholder) | 0 |
+| client_risk | email_digest@daily | ❌ disabled | ~18 |
+| inspection_overdue | asana_task | ❌ disabled (POC) | ~41 |
+
+**Ajouter un trigger** :
+1. Créer `dbt/models/triggers/trigger_<name>.sql` (schema unifié, 1 ligne par occurrence)
+2. Ajouter `UNION ALL SELECT * FROM {{ ref('trigger_<name>') }}` dans `dbt/models/triggers/triggers.sql`
+3. Ajouter mapping dans `config/routing.yaml` (1 entrée sous `triggers:`)
+4. `bash redeploy.sh` (dbt) + `bash deploy.sh` (action-engine) si routing.yaml modifié
+
+**Backlog** :
+- Phase E (nettoyage) : suppression `rule_4h`/`rule_daily`/`pending_actions`/anciens `rule_<X>.sql` + `ActionRunner` legacy après 2 semaines de stabilité (≈ 2026-06-04)
+- Externalisation `routing.yaml` → DWH Feed Sheets (cf. Archides/CLAUDE.md backlog)
+
+## Adding a Destination (handler)
 1. Create `src/handlers/<destination>.py` with `class XxxHandler` and method `execute(action, params) -> str`
-2. Add one line in `HANDLER_REGISTRY` in `src/core/runner.py`
+2. Add one line in `HANDLER_REGISTRY` in `src/core/dispatcher.py` (et `src/core/runner.py` pour le legacy si nécessaire)
 
 ## Existing Handlers
 | Handler | Type | Description |
