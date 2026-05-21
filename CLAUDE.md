@@ -119,7 +119,7 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 4. Pour chaque trigger × routing.actions : skip si déjà open, sinon (a) buffer pour email_digest, (b) handler.execute pour asana/breezeway
 5. Flush 1 mail par bucket avec les triggers bufferisés
 
-**Feature flag** `USE_NEW_DISPATCHER` (env var) : **dead code** depuis Phase E. La var reste set à `true` sur les Cloud Run Jobs mais main.py ne la lit plus. Rollback rapide impossible désormais — git revert + redeploy si régression.
+**Feature flag** `USE_NEW_DISPATCHER` : supprimé en Phase E. Le `deploy.sh` ne le set plus dans les env vars Cloud Run (utilise `--set-env-vars` qui réinitialise). Rollback rapide impossible désormais — git revert + redeploy si régression.
 
 **Inventaire triggers** (cf. `dbt/models/triggers/`) — 18 actifs :
 | trigger_name | bucket / action | enabled | volume actuel |
@@ -152,7 +152,6 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 
 **Backlog** :
 - Externalisation `routing.yaml` → DWH Feed Sheets (cf. Archides/CLAUDE.md backlog)
-- Retirer la var d'env `USE_NEW_DISPATCHER` des Cloud Run Jobs (déjà inutile)
 - Drop manuel des tables BQ `action_engine.rule_*` + `pending_actions` + `action_triggers` quand l'archive ne sert plus
 
 ## Adding a Destination (handler)
