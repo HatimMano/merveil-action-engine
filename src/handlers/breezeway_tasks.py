@@ -98,7 +98,7 @@ class BreezewayTasksHandler:
             action: ligne de pending_actions
                     {rule_name, property_id, context, detected_at}
                     context doit contenir : home_id, apartment_code, checkin_date, ...
-            params: paramètres depuis rules.yaml
+            params: paramètres depuis routing.yaml
                     {name_template, department, subdepartment, priority,
                      assign_economat, assign_cleaning_team}
 

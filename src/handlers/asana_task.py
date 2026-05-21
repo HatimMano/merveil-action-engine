@@ -29,7 +29,7 @@ class AsanaTaskHandler:
 
     Auth : Personal Access Token via env var ASANA_PAT (Secret Manager).
 
-    Params attendus depuis rules.yaml :
+    Params attendus depuis routing.yaml :
         project_id (str)        — gid du projet Asana cible (obligatoire)
         workspace_id (str)      — gid du workspace (obligatoire)
         name_template (str)     — template format() avec champs du context
@@ -137,7 +137,7 @@ class AsanaTaskHandler:
         project_id = params.get("project_id")
         workspace_id = params.get("workspace_id")
         if not project_id or not workspace_id:
-            raise ValueError("project_id et workspace_id requis dans params (rules.yaml)")
+            raise ValueError("project_id et workspace_id requis dans params (routing.yaml)")
 
         # Idempotence
         source_key = f"{rule_name}:{property_id}"
