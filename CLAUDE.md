@@ -2,12 +2,16 @@
 
 ## Overview
 Python 3.12 + **Cloud Run Job** (runs once and terminates — not an HTTP server).
-**2 Cloud Run Jobs distincts** (1 par fréquence, FREQ hardcodé dans chaque job) :
-- `merveil-action-engine` → FREQ=4h
-- `merveil-action-engine-daily` → FREQ=daily
+**3 Cloud Run Jobs distincts** (1 par fréquence, FREQ hardcodé dans chaque job) :
+- `merveil-action-engine` → FREQ=4h (dispatcher trigger/action)
+- `merveil-action-engine-daily` → FREQ=daily (dispatcher trigger/action)
+- `merveil-action-engine-cancellations-brief` → FREQ=cancellations_brief (standalone, court-circuite le dispatcher pour envoyer un rapport mail annulations 24h à 11h Paris ; cf. `src/handlers/cancellations_brief.py`)
 
-3 Cloud Schedulers : **4H et daily ENABLED** (prod), weekly PAUSED.
+4 Cloud Schedulers : **4H, daily et 11h cancellations ENABLED** (prod), weekly PAUSED.
 Reads pending actions (Breezeway) + rule tables (digest) produced by dbt.
+
+### Mode `cancellations_brief` (2026-05-23)
+Mail récap quotidien envoyé à 11h Paris à `alerte_ventes@archides.fr` (override via env `CANCELLATIONS_TO`). Ne passe **pas** par le dispatcher trigger/action — c'est un rapport, pas un événement déclencheur. Query directe sur `dashboard_ops.dash_ops_cancellations_recent` filtré sur `cancelled_at >= NOW() - 24h`. HTML minimaliste (KPIs + table compacte) avec bouton `Voir le détail dans le dashboard →` qui pointe vers `https://direction.archides.fr/ops-front?tab=cancellations&preset=24h`. Reuse infra Gmail API (secret `alerts-gmail-sa-key` + Domain-Wide Delegation existante).
 
 ## Execution Flow
 ```
