@@ -20,12 +20,19 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-FREQ = os.getenv("FREQ")  # 4h | daily | weekly | None
+FREQ = os.getenv("FREQ")  # 4h | daily | weekly | cancellations_brief | None
 
 
 if __name__ == "__main__":
     try:
-        TriggerDispatcher().run(freq=FREQ)
+        if FREQ == "cancellations_brief":
+            # Mode standalone : brief annulations 11h Paris pour l'équipe RC.
+            # Pas de passage par le dispatcher trigger/action — c'est un rapport
+            # quotidien, pas un événement déclencheur d'actions.
+            from src.handlers.cancellations_brief import run as run_cancellations_brief
+            run_cancellations_brief()
+        else:
+            TriggerDispatcher().run(freq=FREQ)
         sys.exit(0)
     except Exception as e:
         logging.critical(f"Action engine a planté : {e}", exc_info=True)

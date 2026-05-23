@@ -36,5 +36,10 @@ gcloud run jobs deploy merveil-action-engine-daily \
   $COMMON_ARGS \
   --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="alerte_ventes@archides.fr",FREQ="daily"
 
+echo "🚀 Déploiement du job cancellations-brief (11h Paris)..."
+gcloud run jobs deploy merveil-action-engine-cancellations-brief \
+  $COMMON_ARGS \
+  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",CANCELLATIONS_TO="alerte_ventes@archides.fr",FREQ="cancellations_brief"
+
 echo ""
-echo "✅ Jobs déployés : merveil-action-engine (4h) + merveil-action-engine-daily"
+echo "✅ Jobs déployés : merveil-action-engine (4h) + merveil-action-engine-daily + merveil-action-engine-cancellations-brief (11h)"
