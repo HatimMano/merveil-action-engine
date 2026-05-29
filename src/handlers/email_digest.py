@@ -191,11 +191,7 @@ class EmailDigestHandler:
                 SELECT alert_type, entity_name
                 FROM `{PROJECT_ID}.action_engine.digest_log`
                 WHERE rule_name = '{rule_name}'
-                AND sent_at >= (
-                    SELECT MAX(sent_at)
-                    FROM `{PROJECT_ID}.action_engine.digest_log`
-                    WHERE rule_name = '{rule_name}'
-                )
+                AND sent_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
             )
             ORDER BY severity_order ASC, alert_date DESC
         """
