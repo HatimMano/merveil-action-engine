@@ -40,36 +40,40 @@ digest_buckets:
 
 triggers:
 
-  # ── Alertes urgentes 4h (= ancien rule_4h.sql) ────────────────────────────
+  # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
+  # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
+  # 6 fois/jour → 1 mail/jour). Le scheduler merveil-action-engine-4h est
+  # pausé en conséquence. Les annulations VIP restent doublonnées par le mail
+  # RC 11h (cancellations-brief) — pas de perte d'info.
   cancellation_vip:
     enabled: true
     actions:
       - type: email_digest
-        bucket: 4h
+        bucket: daily
 
   satisfaction_low_review:
     enabled: true
     actions:
       - type: email_digest
-        bucket: 4h
+        bucket: daily
 
   last_minute_checkin:
     enabled: true
     actions:
       - type: email_digest
-        bucket: 4h
+        bucket: daily
 
   double_booking:
     enabled: true
     actions:
       - type: email_digest
-        bucket: 4h
+        bucket: daily
 
   checkin_no_apartment:
     enabled: true
     actions:
       - type: email_digest
-        bucket: 4h
+        bucket: daily
 
   # ── Alertes daily (= ancien rule_daily.sql) ────────────────────────────────
   abandoned_cart:
