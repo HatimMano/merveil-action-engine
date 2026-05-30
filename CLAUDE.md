@@ -3,12 +3,16 @@
 ## Overview
 Python 3.12 + **Cloud Run Job** (runs once and terminates — not an HTTP server).
 **3 Cloud Run Jobs distincts** (1 par fréquence, FREQ hardcodé dans chaque job) :
-- `merveil-action-engine` → FREQ=4h (dispatcher trigger/action)
-- `merveil-action-engine-daily` → FREQ=daily (dispatcher trigger/action)
+- `merveil-action-engine` → FREQ=4h (dispatcher trigger/action) — **scheduler PAUSED depuis 2026-05-30**
+- `merveil-action-engine-daily` → FREQ=daily (dispatcher trigger/action) — englobe maintenant tous les triggers
 - `merveil-action-engine-cancellations-brief` → FREQ=cancellations_brief (standalone, court-circuite le dispatcher pour envoyer un rapport mail annulations 24h à 11h Paris ; cf. `src/handlers/cancellations_brief.py`)
 
-4 Cloud Schedulers : **4H, daily et 11h cancellations ENABLED** (prod), weekly PAUSED.
+4 Cloud Schedulers : **daily + 11h cancellations ENABLED** (prod), 4H + weekly PAUSED.
 Reads pending actions (Breezeway) + rule tables (digest) produced by dbt.
+
+### Bascule 4h → daily (2026-05-30)
+TTL du bucket 4h = 4h = fréquence du job → dédup neutralisée → ~60 alertes renvoyées à chaque cycle.
+Fix : les 5 triggers anciennement bucket `4h` (cancellation_vip, satisfaction_low_review, last_minute_checkin, double_booking, checkin_no_apartment) ont été basculés en `bucket: daily` dans `config/routing.yaml`. Le scheduler `merveil-action-engine-4h` a été pausé. Pas de perte d'info : annulations VIP restent dans le mail RC 11h `cancellations-brief`.
 
 ### Mode `cancellations_brief` (2026-05-23)
 Mail récap quotidien envoyé à 11h Paris à `alerte_ventes@archides.fr` (override via env `CANCELLATIONS_TO`). Ne passe **pas** par le dispatcher trigger/action — c'est un rapport, pas un événement déclencheur. Query directe sur `dashboard_ops.dash_ops_cancellations_recent` filtré sur `cancelled_at >= NOW() - 24h`. HTML minimaliste (KPIs + table compacte) avec bouton `Voir le détail dans le dashboard →` qui pointe vers `https://direction.archides.fr/ops-front?tab=cancellations&preset=24h`. Reuse infra Gmail API (secret `alerts-gmail-sa-key` + Domain-Wide Delegation existante).
