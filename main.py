@@ -20,7 +20,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-FREQ = os.getenv("FREQ")  # 4h | daily | weekly | cancellations_brief | None
+FREQ = os.getenv("FREQ")  # 4h | daily | weekly | cancellations_brief | iseo_orchestrator | None
 
 
 if __name__ == "__main__":
@@ -31,6 +31,12 @@ if __name__ == "__main__":
             # quotidien, pas un événement déclencheur d'actions.
             from src.handlers.cancellations_brief import run as run_cancellations_brief
             run_cancellations_brief()
+        elif FREQ == "iseo_orchestrator":
+            # Mode standalone : recreate PINs côté Sofia à J-7 du CI (pipeline V3).
+            # Lit iseo_raw.merveil_pin_cache + raw_duve.checkin_events, POST Sofia.
+            # Indépendant du dispatcher trigger/action.
+            from src.handlers.iseo_orchestrator import run as run_iseo_orchestrator
+            run_iseo_orchestrator()
         else:
             TriggerDispatcher().run(freq=FREQ)
         sys.exit(0)
