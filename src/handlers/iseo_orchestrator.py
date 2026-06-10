@@ -24,15 +24,17 @@ auto pour l'instant — c'est le code envoyé au guest par Duve au pre-checkin d
 Trigger : Cloud Run Job `merveil-action-engine-iseo` lancé par scheduler quotidien.
 """
 
-import hashlib
 import logging
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from google.cloud import bigquery
+
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +68,6 @@ LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "7"))
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "16:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "11:00")
 
-PARIS_TZ_OFFSET_HOURS = 1  # CET; switche à 2 (CEST) entre derniers dimanches mars/oct
-# Pour simplifier, on calcule l'offset dynamiquement au moment du POST :
-# datetime aware avec zoneinfo Europe/Paris
 
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
@@ -181,21 +180,37 @@ def _resa_to_archive() -> list[dict]:
     return [dict(r.items()) for r in _bq().query(q).result()]
 
 
-def _update_cache_recreated(duve_resa_id: str, error: Optional[str] = None) -> None:
+def _mark_recreate_success(duve_resa_id: str) -> None:
+    """Recreate Sofia OK → set recreated_at + clear last_error. Idempotent."""
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
     SET recreated_at = CURRENT_TIMESTAMP(),
-        last_error   = @err
+        last_error   = NULL
     WHERE duve_reservation_id = @id AND archived_at IS NULL
     """
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
-        bigquery.ScalarQueryParameter("err", "STRING", error),
     ])
     _bq().query(q, job_config=cfg).result()
 
 
-def _update_cache_archived(duve_resa_id: str, error: Optional[str] = None) -> None:
+def _mark_recreate_error(duve_resa_id: str, error: str) -> None:
+    """Recreate Sofia FAIL → write last_error mais NE TOUCHE PAS recreated_at.
+    Au prochain run, la query `WHERE recreated_at IS NULL` re-sélectionne la résa → auto-retry.
+    """
+    q = f"""
+    UPDATE `{PIN_CACHE_TABLE}`
+    SET last_error = @err
+    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    """
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
+        bigquery.ScalarQueryParameter("err", "STRING", error[:500]),
+    ])
+    _bq().query(q, job_config=cfg).result()
+
+
+def _mark_archived(duve_resa_id: str, error: Optional[str] = None) -> None:
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
     SET archived_at = CURRENT_TIMESTAMP(),
@@ -209,35 +224,17 @@ def _update_cache_archived(duve_resa_id: str, error: Optional[str] = None) -> No
     _bq().query(q, job_config=cfg).result()
 
 
-# ── Window calc (Paris timezone) ──────────────────────────────────────────────
-
-def _paris_offset_hours(date_str: str) -> int:
-    """Retourne +1 (hiver) ou +2 (été). Approximation : dernier dimanche mars→octobre."""
-    try:
-        d = datetime.fromisoformat(date_str)
-        y = d.year
-        # Dernier dimanche mars
-        march = datetime(y, 3, 31)
-        dst_start = march - timedelta(days=(march.weekday() + 1) % 7)
-        # Dernier dimanche octobre
-        oct31 = datetime(y, 10, 31)
-        dst_end = oct31 - timedelta(days=(oct31.weekday() + 1) % 7)
-        return 2 if dst_start <= d < dst_end else 1
-    except Exception:
-        return 1
-
+# ── Window calc (Paris timezone via zoneinfo) ─────────────────────────────────
 
 def _build_window_ms(checkin_date: str, checkout_date: str,
                      ci_hour: Optional[str], co_hour: Optional[str]) -> tuple[int, int]:
     """Construit dateInterval ms epoch UTC depuis dates DATE + heures Paris HH:MM."""
-    ci_h = (ci_hour or DEFAULT_CI_HOUR)[:5]   # HH:MM
-    co_h = (co_hour or DEFAULT_CO_HOUR)[:5]
-    ci_offset = _paris_offset_hours(checkin_date)
-    co_offset = _paris_offset_hours(checkout_date)
-    ci_str = f"{checkin_date}T{ci_h}:00+0{ci_offset}:00"
-    co_str = f"{checkout_date}T{co_h}:00+0{co_offset}:00"
-    ci_dt = datetime.fromisoformat(ci_str)
-    co_dt = datetime.fromisoformat(co_str)
+    ci_h, ci_m = ((ci_hour or DEFAULT_CI_HOUR)[:5].split(":") + ["00"])[:2]
+    co_h, co_m = ((co_hour or DEFAULT_CO_HOUR)[:5].split(":") + ["00"])[:2]
+    ci_y, ci_mo, ci_d = (int(x) for x in checkin_date.split("-"))
+    co_y, co_mo, co_d = (int(x) for x in checkout_date.split("-"))
+    ci_dt = datetime(ci_y, ci_mo, ci_d, int(ci_h), int(ci_m), tzinfo=PARIS_TZ)
+    co_dt = datetime(co_y, co_mo, co_d, int(co_h), int(co_m), tzinfo=PARIS_TZ)
     return int(ci_dt.timestamp() * 1000), int(co_dt.timestamp() * 1000)
 
 
@@ -362,7 +359,7 @@ def run() -> None:
         if success:
             try:
                 if not ISEO_SHADOW_MODE:
-                    _update_cache_recreated(row["duve_reservation_id"])
+                    _mark_recreate_success(row["duve_reservation_id"])
                 else:
                     logger.info(f"🌗 cache.recreated_at update skipped (shadow)")
             except Exception as e:
@@ -370,7 +367,7 @@ def run() -> None:
             ok += 1
         else:
             try:
-                _update_cache_recreated(row["duve_reservation_id"], error=err[:500])
+                _mark_recreate_error(row["duve_reservation_id"], err)
             except Exception:
                 pass
             logger.warning(f"⚠️ recreate failed for {row['duve_reservation_id']}: {err}")
@@ -383,9 +380,10 @@ def run() -> None:
     for row in to_archive:
         success, err = _archive_pin(row)
         if success:
+            # En shadow mode, on archive aussi côté BQ pour éviter l'accumulation
+            # de rows expirées (le DELETE Sofia reste skipped via _archive_pin).
             try:
-                if not ISEO_SHADOW_MODE:
-                    _update_cache_archived(row["duve_reservation_id"])
+                _mark_archived(row["duve_reservation_id"])
                 archived += 1
             except Exception as e:
                 logger.warning(f"⚠️ archive update failed for {row['duve_reservation_id']}: {e}")
