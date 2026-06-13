@@ -36,6 +36,11 @@ gcloud run jobs deploy merveil-action-engine-daily \
   $COMMON_ARGS \
   --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="alerte_ventes@archides.fr",FREQ="daily"
 
+echo "🚀 Déploiement du job 2h (alertes serrures ISEO)..."
+gcloud run jobs deploy merveil-action-engine-2h \
+  $COMMON_ARGS \
+  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="alerte_ventes@archides.fr",FREQ="2h"
+
 echo "🚀 Déploiement du job cancellations-brief (11h Paris)..."
 gcloud run jobs deploy merveil-action-engine-cancellations-brief \
   $COMMON_ARGS \
@@ -58,4 +63,4 @@ gcloud run jobs deploy merveil-action-engine-iseo \
   --set-env-vars "^@^GCP_PROJECT_ID=$PROJECT@FREQ=iseo_orchestrator@ISEO_SHADOW_MODE=true@ISEO_ALLOWED_PROPERTY_IDS=c12a7244-f97b-4633-b6a7-b16f0079821c,70edbca0-6abb-4bae-bd89-b16f0079821c,f025ccb1-635c-4c0b-b388-b23600f8ffb3,e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,aa37778e-7257-40ad-9b5c-b16f0079821c"
 
 echo ""
-echo "✅ Jobs déployés : 4h + daily + cancellations-brief (11h) + iseo (J-7)"
+echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-7)"

@@ -38,6 +38,7 @@ DISPATCHED_TABLE = f"{PROJECT_ID}.action_engine.dispatched_actions"
 
 # TTL par bucket pour les actions email_digest (en heures)
 DIGEST_TTL_HOURS = {
+    "2h": 4,   # serrures : run toutes les 2h, re-alerte max toutes les 4h (dédup)
     "4h": 4,
     "daily": 24,
     "weekly": 168,

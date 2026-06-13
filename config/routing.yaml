@@ -21,6 +21,14 @@
 
 # Recipients par défaut par bucket. Surchargeable per-trigger via params.recipients.
 digest_buckets:
+  2h:
+    # Serrures — sécurité accès guest. Job merveil-action-engine-2h toutes les 2h.
+    # TODO recipients : passer sur l'alias ops-front quand connu.
+    send_if_empty: false
+    subject_prefix: "[Merveil Serrures]"
+    default_recipients:
+      - alerte_ventes@archides.fr
+      - hatim@archides.fr
   4h:
     send_if_empty: true
     subject_prefix: "[Merveil 4H]"
@@ -177,28 +185,20 @@ triggers:
           # assignee_email: "hassana@archides.fr"   # à confirmer
 
   # ── ISEO / serrures — sécurité accès guest ────────────────────────────────
-  # Guest en place / arrivée imminente sans code Sofia actif (incident Crystal
-  # Balcom 2026-06-10). CRITICAL si in-house. Cadence = daily (zéro infra). Pour
-  # une latence ≤2-3h (sécurité accès) : créer un scheduler dédié 2h au cutover.
-  # TODO recipients : remplacer par l'alias ops-front quand connu.
+  # Guest en place / arrivée imminente sans code Sofia tracké (incident Crystal
+  # Balcom 2026-06-10). CRITICAL si in-house sans ouverture ≤48h. Bucket 2h →
+  # job merveil-action-engine-2h (latence ≤2h). Destinataires = digest_buckets.2h.
   iseo_pin_missing:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
-        params:
-          recipients:
-            - alerte_ventes@archides.fr
-            - hatim@archides.fr
+        bucket: 2h
 
   iseo_etl_stale:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
-        params:
-          recipients:
-            - hatim@archides.fr
+        bucket: 2h
 
   # ── Désactivés ────────────────────────────────────────────────────────────
   client_risk:

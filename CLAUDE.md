@@ -7,6 +7,7 @@ Python 3.12 + **Cloud Run Job** (runs once and terminates — not an HTTP server
 - `merveil-action-engine-daily` → FREQ=daily (dispatcher trigger/action) — englobe maintenant tous les triggers
 - `merveil-action-engine-cancellations-brief` → FREQ=cancellations_brief (standalone, court-circuite le dispatcher pour envoyer un rapport mail annulations 24h à 11h Paris ; cf. `src/handlers/cancellations_brief.py`)
 - `merveil-action-engine-iseo` → FREQ=iseo_orchestrator (standalone, pipeline V3 ISEO — recreate PINs Sofia à J-7 du CI avec MÊME deviceId capturé au pre-checkin done par webhook-gateway ; cf. `src/handlers/iseo_orchestrator.py`). Scheduler `merveil-action-engine-iseo-daily` 7h30 Europe/Paris.
+- `merveil-action-engine-2h` → FREQ=2h (dispatcher, bucket `2h`) — **alertes serrures ISEO** (`iseo_pin_missing`, `iseo_etl_stale`). Scheduler toutes les 2h. Bucket `2h` TTL 4h (dédup). Destinataires : `digest_buckets.2h.default_recipients` dans `routing.yaml` (⚠ le flush n'utilise PAS `params.recipients` per-trigger). Cf. ADR 2026-06-13.
 
 5 Cloud Schedulers : **daily 7h + iseo 7h30 + 11h cancellations ENABLED** (prod), 4H + weekly PAUSED.
 Reads pending actions (Breezeway) + rule tables (digest) produced by dbt.
