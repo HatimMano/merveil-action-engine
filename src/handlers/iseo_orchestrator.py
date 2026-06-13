@@ -49,6 +49,12 @@ RAW_DUVE_CHECKIN_TABLE = os.environ.get(
     "RAW_DUVE_CHECKIN_TABLE",
     "merveil-data-warehouse.raw_duve.checkin_events",
 )
+# Source de vérité Mews pour dates + statut annulation. Le webhook Duve est figé
+# au pre-checkin done (cf. incident Crystal Balcom) ; Mews est pollé toutes les 2h.
+MEWS_FCT_TABLE = os.environ.get(
+    "MEWS_FCT_TABLE",
+    "merveil-data-warehouse.marts.fct_reservations",
+)
 
 ISEO_BASE_URL = os.environ.get("ISEO_BASE_URL", "https://api-archides.jago.cloud")
 ISEO_USERNAME = (os.environ.get("ISEO_MANAGER_USERNAME") or "").strip()
@@ -125,9 +131,17 @@ def _bq() -> bigquery.Client:
 
 
 def _resa_to_recreate() -> list[dict]:
-    """Lit les rows à recréer côté Sofia : cache non-archivée, non-recréée, CI dans LOOKAHEAD_DAYS,
-    et résa pas annulée (cross-check fct_reservations via duve_reservation_id n'est pas
-    facile sans mapping mews — pour l'instant on confie à la cache + raw_duve)."""
+    """Rows à recréer côté Sofia : cache non-archivée, non-recréée, CI dans LOOKAHEAD_DAYS,
+    et résa NON annulée (cross-check Mews via le mapping Duve↔Mews).
+
+    Mapping Duve↔Mews (le payload Duve embarque les ids Mews) :
+      - guestProfiles[isPrimary].externalId  = Mews customer_id
+      - resource.externalPropertyId          = Mews resource_id (= property_id stocké)
+    → on résout la résa Mews et on rafraîchit dates + statut depuis fct_reservations
+    (SoT, pollé 2h), plutôt que de se fier au webhook Duve figé. Les heures de window
+    utilisent les heures de POLITIQUE appart (earliest/latest), stables, et non
+    l'heure estimée du form (volatile → risque de lockout à l'arrivée).
+    """
     q = f"""
     WITH cache AS (
       SELECT *
@@ -142,40 +156,109 @@ def _resa_to_recreate() -> list[dict]:
     duve_latest AS (
       SELECT
         reservation_id AS duve_reservation_id,
-        DATE(SAFE_CAST(checkin_date  AS TIMESTAMP)) AS checkin_date_live,
-        DATE(SAFE_CAST(checkout_date AS TIMESTAMP)) AS checkout_date_live,
-        COALESCE(earliest_checkin_hour, JSON_VALUE(_raw_payload, '$.resource.earliestCheckInTime')) AS earliest_checkin_hour,
-        COALESCE(latest_checkout_hour,  JSON_VALUE(_raw_payload, '$.resource.latestCheckOutTime'))  AS latest_checkout_hour,
-        COALESCE(estimated_checkin_time, JSON_VALUE(_raw_payload, '$.resource.estimatedCheckInTime'))  AS estimated_ci_time,
-        COALESCE(estimated_checkout_time, JSON_VALUE(_raw_payload, '$.resource.estimatedCheckOutTime')) AS estimated_co_time,
-        property_id,
+        property_id    AS duve_property_id,   -- = Mews resource_id
+        (SELECT JSON_VALUE(g, '$.externalId')
+           FROM UNNEST(JSON_QUERY_ARRAY(_raw_payload, '$.resource.guestProfiles')) g
+           WHERE JSON_VALUE(g, '$.isPrimary') = 'true'
+           LIMIT 1)                          AS mews_customer_id,
         received_at
       FROM `{RAW_DUVE_CHECKIN_TABLE}`
       QUALIFY ROW_NUMBER() OVER (PARTITION BY reservation_id ORDER BY received_at DESC) = 1
+    ),
+    mews AS (
+      SELECT
+        customer_id, resource_id,
+        reservation_id      AS mews_reservation_id,
+        reservation_number  AS mews_reservation_number,
+        is_cancelled,
+        checkin_date        AS mews_checkin_date,
+        checkout_date       AS mews_checkout_date,
+        earliest_checkin_hour,
+        latest_checkout_hour
+      FROM `{MEWS_FCT_TABLE}`
+    ),
+    joined AS (
+      SELECT
+        c.* EXCEPT (cached_at, recreated_at, archived_at, last_error, shadow_mode, row_hash),
+        d.duve_property_id,
+        m.mews_reservation_id,
+        m.mews_reservation_number,
+        m.is_cancelled,
+        m.mews_checkin_date,
+        m.mews_checkout_date,
+        m.earliest_checkin_hour,
+        m.latest_checkout_hour
+      FROM cache c
+      LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
+      LEFT JOIN mews m
+        ON m.customer_id = d.mews_customer_id
+       AND m.resource_id = d.duve_property_id
+      -- Si le guest a plusieurs séjours dans le même appart, prendre la résa Mews
+      -- dont le CI est le plus proche du CI capturé en cache.
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY c.duve_reservation_id
+        ORDER BY ABS(DATE_DIFF(m.mews_checkin_date, c.checkin_date, DAY)) ASC NULLS LAST
+      ) = 1
     )
-    SELECT
-      c.* EXCEPT (cached_at, recreated_at, archived_at, last_error, shadow_mode, row_hash),
-      d.checkin_date_live,
-      d.checkout_date_live,
-      d.estimated_ci_time,
-      d.estimated_co_time,
-      d.earliest_checkin_hour,
-      d.latest_checkout_hour,
-      d.property_id AS duve_property_id_live
-    FROM cache c
-    LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
-    ORDER BY c.checkin_date
+    SELECT * FROM joined
+    WHERE COALESCE(is_cancelled, FALSE) = FALSE   -- annulées gérées par l'archive
+    ORDER BY mews_checkin_date, checkin_date
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
 
 def _resa_to_archive() -> list[dict]:
-    """Rows à archiver : checkout passé. DELETE Sofia + set archived_at."""
+    """Rows à archiver : checkout passé OU résa annulée (cross-check Mews).
+    DELETE Sofia (skip en shadow) + set archived_at.
+
+    L'annulation est le trou symétrique de l'incident Crystal : une résa annulée
+    en cours de window gardait un code fonctionnel car on n'archivait que sur CO passé.
+    On résout la résa Mews via le mapping Duve↔Mews et on révoque si is_cancelled.
+    """
     q = f"""
-    SELECT duve_reservation_id, pin_value, iseo_lock_tag_id, iseo_guest_tag_id
-    FROM `{PIN_CACHE_TABLE}`
-    WHERE archived_at IS NULL
-      AND checkout_date < CURRENT_DATE()
+    WITH cache AS (
+      SELECT duve_reservation_id, pin_value, iseo_lock_tag_id, iseo_guest_tag_id,
+             checkin_date, checkout_date
+      FROM `{PIN_CACHE_TABLE}`
+      WHERE archived_at IS NULL
+    ),
+    duve_latest AS (
+      SELECT
+        reservation_id AS duve_reservation_id,
+        property_id    AS duve_property_id,
+        (SELECT JSON_VALUE(g, '$.externalId')
+           FROM UNNEST(JSON_QUERY_ARRAY(_raw_payload, '$.resource.guestProfiles')) g
+           WHERE JSON_VALUE(g, '$.isPrimary') = 'true'
+           LIMIT 1)                          AS mews_customer_id,
+        received_at
+      FROM `{RAW_DUVE_CHECKIN_TABLE}`
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY reservation_id ORDER BY received_at DESC) = 1
+    ),
+    mews AS (
+      SELECT customer_id, resource_id, is_cancelled, checkin_date AS mews_checkin_date
+      FROM `{MEWS_FCT_TABLE}`
+    ),
+    joined AS (
+      SELECT
+        c.duve_reservation_id, c.pin_value, c.iseo_lock_tag_id, c.iseo_guest_tag_id,
+        c.checkout_date,
+        COALESCE(m.is_cancelled, FALSE) AS is_cancelled
+      FROM cache c
+      LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
+      LEFT JOIN mews m
+        ON m.customer_id = d.mews_customer_id
+       AND m.resource_id = d.duve_property_id
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY c.duve_reservation_id
+        ORDER BY ABS(DATE_DIFF(m.mews_checkin_date, c.checkin_date, DAY)) ASC NULLS LAST
+      ) = 1
+    )
+    SELECT
+      duve_reservation_id, pin_value, iseo_lock_tag_id, iseo_guest_tag_id,
+      CASE WHEN is_cancelled THEN 'cancelled' ELSE 'checkout_passed' END AS archive_reason
+    FROM joined
+    WHERE checkout_date < CURRENT_DATE()
+       OR is_cancelled
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
@@ -245,22 +328,25 @@ def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
     duve_resa_id = row["duve_reservation_id"]
 
     # Whitelist
-    apt_pid = (row.get("duve_property_id_live") or "").lower()
+    apt_pid = (row.get("duve_property_id") or "").lower()
     if ALLOWED_PROPERTY_IDS and apt_pid not in ALLOWED_PROPERTY_IDS:
         logger.info(f"⏭️ {duve_resa_id} hors whitelist property={apt_pid} → skip")
         return False, "skipped: whitelist"
 
-    # Window calculation (prefer live values from raw_duve, fallback cache)
-    ci_date = row.get("checkin_date_live") or row.get("checkin_date")
-    co_date = row.get("checkout_date_live") or row.get("checkout_date")
+    # Dates : Mews (SoT, rafraîchi 2h) d'abord, fallback cache.
+    ci_date = row.get("mews_checkin_date") or row.get("checkin_date")
+    co_date = row.get("mews_checkout_date") or row.get("checkout_date")
     if ci_date is None or co_date is None:
         return False, "missing CI/CO date"
     ci_date_str = ci_date.isoformat() if hasattr(ci_date, "isoformat") else str(ci_date)
     co_date_str = co_date.isoformat() if hasattr(co_date, "isoformat") else str(co_date)
 
-    # Préférence ordre : estimated > earliest/latest > default
-    ci_hour = row.get("estimated_ci_time") or row.get("earliest_checkin_hour") or DEFAULT_CI_HOUR
-    co_hour = row.get("estimated_co_time") or row.get("latest_checkout_hour") or DEFAULT_CO_HOUR
+    # Bornes d'heures : heures de POLITIQUE appart (earliest/latest), stables.
+    # On n'utilise PAS l'heure estimée du form (volatile) : un guest qui avance son
+    # arrivée serait sinon bloqué dehors (cf. analyse incident Crystal — estimé 21h30
+    # vs arrivée ~14h = 7h de lockout). Mieux vaut une borne large qu'un lockout.
+    ci_hour = row.get("earliest_checkin_hour") or DEFAULT_CI_HOUR
+    co_hour = row.get("latest_checkout_hour") or DEFAULT_CO_HOUR
 
     try:
         ci_ms, co_ms = _build_window_ms(ci_date_str, co_date_str, ci_hour, co_hour)
@@ -375,7 +461,7 @@ def run() -> None:
 
     # ── 2. Archive (checkout passé) ─────────────────────────────────────────
     to_archive = _resa_to_archive()
-    logger.info(f"🗑️ {len(to_archive)} résa(s) à archiver (CO passé)")
+    logger.info(f"🗑️ {len(to_archive)} résa(s) à archiver (CO passé ou annulée)")
     archived = 0
     for row in to_archive:
         success, err = _archive_pin(row)

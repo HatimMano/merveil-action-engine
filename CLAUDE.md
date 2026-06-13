@@ -26,7 +26,9 @@ Le mode lit `iseo_raw.merveil_pin_cache` (alimentée par `webhook-gateway/src/co
 - POST Sofia `/api/v2/standardDevices` avec MÊME `deviceId` (= pin_value capturé), extId `MERVEIL_RESA - <duve_id>`. Réutilise `iseo_user_id` + `iseo_guest_tag_id` + `iseo_lock_tag_id` de la cache.
 - UPDATE cache `recreated_at = NOW()`. Sur erreur Sofia → `last_error` + flag visible dans dashboard.
 
-Cycle archive : `WHERE checkout_date < today AND archived_at IS NULL` → DELETE Sofia + flag `archived_at`.
+Cycle archive : `WHERE (checkout_date < today OR résa annulée) AND archived_at IS NULL` → DELETE Sofia + flag `archived_at`.
+
+**Mapping Duve↔Mews + refresh Mews (2026-06-13)** — l'orchestrateur ne se fie plus au webhook Duve figé. Le payload Duve embarque les ids Mews : `guestProfiles[isPrimary].externalId = customer_id`, `externalPropertyId (= property_id) = resource_id`. `_resa_to_recreate` et `_resa_to_archive` JOIN `marts.fct_reservations` (env `MEWS_FCT_TABLE`) sur `customer_id + resource_id` (résa Mews dont le CI est le plus proche du CI cache) pour : (1) **refresh dates** (Mews SoT, pollé 2h) ; (2) **skip les annulées** au recreate + **les archiver** (DELETE Sofia, skip shadow) — comble le trou « résa annulée en cours de window garde un code » ; (3) **bornes window = heures de politique appart** (`earliest_checkin_hour`/`latest_checkout_hour`) et non l'heure estimée du form (volatile → lockout à l'arrivée, cf. incident Crystal Balcom). Cf. ADR `Archides/docs/decisions.md` 2026-06-13.
 
 **Mode shadow** (`ISEO_SHADOW_MODE=true`) : log "would POST" sans appeler Sofia. Activé au boot pour validation 1 semaine avant cutover.
 

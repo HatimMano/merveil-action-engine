@@ -176,6 +176,30 @@ triggers:
           due_offset_days: 3
           # assignee_email: "hassana@archides.fr"   # à confirmer
 
+  # ── ISEO / serrures — sécurité accès guest ────────────────────────────────
+  # Guest en place / arrivée imminente sans code Sofia actif (incident Crystal
+  # Balcom 2026-06-10). CRITICAL si in-house. Cadence = daily (zéro infra). Pour
+  # une latence ≤2-3h (sécurité accès) : créer un scheduler dédié 2h au cutover.
+  # TODO recipients : remplacer par l'alias ops-front quand connu.
+  iseo_pin_missing:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+        params:
+          recipients:
+            - alerte_ventes@archides.fr
+            - hatim@archides.fr
+
+  iseo_etl_stale:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+        params:
+          recipients:
+            - hatim@archides.fr
+
   # ── Désactivés ────────────────────────────────────────────────────────────
   client_risk:
     enabled: false   # legacy disabled (clients_at_risk hors UNION dash_alerts)
