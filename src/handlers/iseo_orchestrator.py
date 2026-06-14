@@ -293,6 +293,29 @@ def _mark_recreate_error(duve_resa_id: str, error: str) -> None:
     _bq().query(q, job_config=cfg).result()
 
 
+def _mark_would(duve_resa_id: str, window_from_ms: Optional[int] = None,
+                window_to_ms: Optional[int] = None, skip_reason: Optional[str] = None) -> None:
+    """Persiste la décision DRY-RUN (observabilité shadow) : ce que l'orchestrateur
+    RECRÉERAIT (window calculée) ou pourquoi il SKIP. Permet de valider la logique
+    de recreate depuis le dashboard avant le cutover, sans toucher Sofia.
+    `would_recreate_at` est set seulement si pas de skip."""
+    q = f"""
+    UPDATE `{PIN_CACHE_TABLE}`
+    SET would_window_from = TIMESTAMP_MILLIS(@from_ms),
+        would_window_to   = TIMESTAMP_MILLIS(@to_ms),
+        would_skip_reason = @skip,
+        would_recreate_at = CASE WHEN @skip IS NULL THEN CURRENT_TIMESTAMP() ELSE NULL END
+    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    """
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
+        bigquery.ScalarQueryParameter("from_ms", "INT64", window_from_ms),
+        bigquery.ScalarQueryParameter("to_ms", "INT64", window_to_ms),
+        bigquery.ScalarQueryParameter("skip", "STRING", skip_reason),
+    ])
+    _bq().query(q, job_config=cfg).result()
+
+
 def _mark_archived(duve_resa_id: str, error: Optional[str] = None) -> None:
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
@@ -331,12 +354,14 @@ def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
     apt_pid = (row.get("duve_property_id") or "").lower()
     if ALLOWED_PROPERTY_IDS and apt_pid not in ALLOWED_PROPERTY_IDS:
         logger.info(f"⏭️ {duve_resa_id} hors whitelist property={apt_pid} → skip")
+        _mark_would(duve_resa_id, skip_reason="hors whitelist")
         return False, "skipped: whitelist"
 
     # Dates : Mews (SoT, rafraîchi 2h) d'abord, fallback cache.
     ci_date = row.get("mews_checkin_date") or row.get("checkin_date")
     co_date = row.get("mews_checkout_date") or row.get("checkout_date")
     if ci_date is None or co_date is None:
+        _mark_would(duve_resa_id, skip_reason="dates CI/CO manquantes")
         return False, "missing CI/CO date"
     ci_date_str = ci_date.isoformat() if hasattr(ci_date, "isoformat") else str(ci_date)
     co_date_str = co_date.isoformat() if hasattr(co_date, "isoformat") else str(co_date)
@@ -351,10 +376,12 @@ def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
     try:
         ci_ms, co_ms = _build_window_ms(ci_date_str, co_date_str, ci_hour, co_hour)
     except Exception as e:
+        _mark_would(duve_resa_id, skip_reason=f"window calc: {e}"[:200])
         return False, f"window calc failed: {e}"
 
     # ⚠ Sofia rejette les windows trop dans le passé (dont window.to < now)
     if co_ms < int(time.time() * 1000):
+        _mark_would(duve_resa_id, skip_reason="checkout déjà passé")
         return False, f"checkout already passed: {co_date_str} {co_hour}"
 
     ext_id = f"MERVEIL_RESA - {duve_resa_id}"
@@ -385,6 +412,9 @@ def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
         f"window={datetime.fromtimestamp(ci_ms/1000, timezone.utc).isoformat()} → "
         f"{datetime.fromtimestamp(co_ms/1000, timezone.utc).isoformat()}"
     )
+
+    # Persiste la window dry-run (observabilité shadow ET prod) avant tout POST.
+    _mark_would(duve_resa_id, window_from_ms=ci_ms, window_to_ms=co_ms)
 
     if ISEO_SHADOW_MODE:
         logger.info(f"🌗 SHADOW MODE: POST Sofia skipped for {duve_resa_id}")
