@@ -9,7 +9,7 @@ Ops Front > 6.5 Annulations. Le mail = trigger pour ouvrir l'app.
 
 Source : dashboard_ops.dash_ops_cancellations_recent
 Filtre : cancelled_at >= NOW() - 24h
-Destinataires : alerte_ventes@archides.fr (override via env CANCELLATIONS_TO)
+Destinataires : alerte_ventes@archides.fr, emilia@archides.fr (override via env CANCELLATIONS_TO)
 Lien dashboard : https://direction.archides.fr/ops-front?tab=cancellations&preset=24h
 """
 
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ID      = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
 GMAIL_SENDER    = os.getenv("GMAIL_SENDER", "noreply@merveil.fr")
-GMAIL_TO        = os.getenv("CANCELLATIONS_TO", "alerte_ventes@archides.fr")
+GMAIL_TO        = os.getenv("CANCELLATIONS_TO", "alerte_ventes@archides.fr, emilia@archides.fr")
 TEST_RECIPIENT  = os.getenv("TEST_RECIPIENT")  # override pour tests
 DASHBOARD_URL   = "https://direction.archides.fr/ops-front?tab=cancellations&preset=24h"
 
