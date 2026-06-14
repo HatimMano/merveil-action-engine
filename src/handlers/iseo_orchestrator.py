@@ -151,7 +151,11 @@ def _resa_to_recreate() -> list[dict]:
         AND pin_value IS NOT NULL
         AND iseo_guest_tag_id IS NOT NULL
         AND iseo_lock_tag_id IS NOT NULL
-        AND checkin_date BETWEEN CURRENT_DATE() AND DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
+        -- CI dans ≤7j OU déjà commencé (in-house), tant que pas encore checkout.
+        -- (l'ancien BETWEEN today..+7 excluait les résa dont le CI est passé mais
+        --  encore en cours → guest potentiellement sans code au cutover).
+        AND checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
+        AND checkout_date >= CURRENT_DATE()
     ),
     duve_latest AS (
       SELECT
