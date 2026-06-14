@@ -42,9 +42,11 @@ gcloud run jobs deploy merveil-action-engine-2h \
   --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",GMAIL_TO="alerte_ventes@archides.fr",FREQ="2h"
 
 echo "🚀 Déploiement du job cancellations-brief (11h Paris)..."
+# CANCELLATIONS_TO = 2 destinataires (virgule) → délimiteur ^;^ pour que gcloud
+# ne splitte pas sur la virgule. Pas ^@^ (les valeurs contiennent des @ d'emails).
 gcloud run jobs deploy merveil-action-engine-cancellations-brief \
   $COMMON_ARGS \
-  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",CANCELLATIONS_TO="alerte_ventes@archides.fr",FREQ="cancellations_brief"
+  --set-env-vars "^;^GCP_PROJECT_ID=$PROJECT;GMAIL_SENDER=noreply@archides.fr;CANCELLATIONS_TO=alerte_ventes@archides.fr,emilia@archides.fr;FREQ=cancellations_brief"
 
 echo "🚀 Déploiement du job iseo-orchestrator (recreate PINs Sofia à J-7)..."
 # Notes :
