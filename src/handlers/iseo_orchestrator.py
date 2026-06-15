@@ -55,6 +55,10 @@ MEWS_FCT_TABLE = os.environ.get(
     "MEWS_FCT_TABLE",
     "merveil-data-warehouse.marts.fct_reservations",
 )
+MEWS_PAYMENTS_TABLE = os.environ.get(
+    "MEWS_PAYMENTS_TABLE",
+    "merveil-data-warehouse.staging.stg_mews__payments",
+)
 
 ISEO_BASE_URL = os.environ.get("ISEO_BASE_URL", "https://api-archides.jago.cloud")
 ISEO_USERNAME = (os.environ.get("ISEO_MANAGER_USERNAME") or "").strip()
@@ -181,6 +185,15 @@ def _resa_to_recreate() -> list[dict]:
         latest_checkout_hour
       FROM `{MEWS_FCT_TABLE}`
     ),
+    -- Paiement par résa Mews (donnée stabilisée à J-7). Impayé = ∃ Failed ET ∄ Charged.
+    payments AS (
+      SELECT reservation_id,
+             COUNTIF(state = 'Charged') AS n_charged,
+             COUNTIF(state = 'Failed')  AS n_failed
+      FROM `{MEWS_PAYMENTS_TABLE}`
+      WHERE reservation_id IS NOT NULL
+      GROUP BY reservation_id
+    ),
     joined AS (
       SELECT
         c.* EXCEPT (cached_at, recreated_at, archived_at, last_error, row_hash),
@@ -191,12 +204,14 @@ def _resa_to_recreate() -> list[dict]:
         m.mews_checkin_date,
         m.mews_checkout_date,
         m.earliest_checkin_hour,
-        m.latest_checkout_hour
+        m.latest_checkout_hour,
+        (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid
       FROM cache c
       LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
       LEFT JOIN mews m
         ON m.customer_id = d.mews_customer_id
        AND m.resource_id = d.duve_property_id
+      LEFT JOIN payments pay ON pay.reservation_id = m.mews_reservation_id
       -- Si le guest a plusieurs séjours dans le même appart, prendre la résa Mews
       -- dont le CI est le plus proche du CI capturé en cache.
       QUALIFY ROW_NUMBER() OVER (
@@ -342,22 +357,25 @@ def _hm_to_min(h: Optional[str]) -> Optional[int]:
         return None
 
 
+# Bornes absolues : jamais ouvrir avant 7h, jamais fermer après 23h59.
+WINDOW_FLOOR_CI = "07:00"
+WINDOW_CEIL_CO = "23:59"
+
+
 def _earliest_hour(policy: Optional[str], default: str) -> str:
-    """La plus tôt entre la politique appart et le défaut (= ouvrir au plus tôt)."""
+    """La plus tôt entre la politique appart et le défaut, plancher 07h."""
     p = _hm_to_min(policy)
     d = _hm_to_min(default)
-    if p is None:
-        return default
-    return policy[:5] if p <= d else default
+    chosen = default if p is None else (policy[:5] if p <= d else default)
+    return WINDOW_FLOOR_CI if _hm_to_min(chosen) < _hm_to_min(WINDOW_FLOOR_CI) else chosen
 
 
 def _latest_hour(policy: Optional[str], default: str) -> str:
-    """La plus tard entre la politique appart et le défaut (= fermer au plus tard)."""
+    """La plus tard entre la politique appart et le défaut, plafond 23h59."""
     p = _hm_to_min(policy)
     d = _hm_to_min(default)
-    if p is None:
-        return default
-    return policy[:5] if p >= d else default
+    chosen = default if p is None else (policy[:5] if p >= d else default)
+    return WINDOW_CEIL_CO if _hm_to_min(chosen) > _hm_to_min(WINDOW_CEIL_CO) else chosen
 
 
 # ── Window calc (Paris timezone via zoneinfo) ─────────────────────────────────
@@ -386,6 +404,14 @@ def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
         logger.info(f"⏭️ {duve_resa_id} hors whitelist property={apt_pid} → skip")
         _mark_would(duve_resa_id, skip_reason="hors whitelist")
         return False, "skipped: whitelist"
+
+    # Payment-gate : pas de recreate tant que le paiement n'est pas validé (∃ Failed ET
+    # ∄ Charged). Le code reste supprimé = pas d'accès pour un impayé. Re-évalué à chaque
+    # run → recreate dès que le paiement passe. Donnée BQ stabilisée (≤2h, OK à J-7).
+    if row.get("payment_unpaid"):
+        logger.info(f"⛔ {duve_resa_id} paiement non validé → pas de recreate")
+        _mark_would(duve_resa_id, skip_reason="paiement non validé")
+        return False, "payment not validated"
 
     # Dates : Mews (SoT, rafraîchi 2h) d'abord, fallback cache.
     ci_date = row.get("mews_checkin_date") or row.get("checkin_date")
