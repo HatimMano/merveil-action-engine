@@ -72,7 +72,7 @@ LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "7"))
 
 # Fallback heures si Duve ne pousse pas les estimated_checkin_time / etc.
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "16:00")
-DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "11:00")
+DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "12:00")
 
 
 
