@@ -334,6 +334,32 @@ def _mark_archived(duve_resa_id: str, error: Optional[str] = None) -> None:
     _bq().query(q, job_config=cfg).result()
 
 
+def _hm_to_min(h: Optional[str]) -> Optional[int]:
+    try:
+        hh, mm = h[:5].split(":")
+        return int(hh) * 60 + int(mm)
+    except Exception:
+        return None
+
+
+def _earliest_hour(policy: Optional[str], default: str) -> str:
+    """La plus tôt entre la politique appart et le défaut (= ouvrir au plus tôt)."""
+    p = _hm_to_min(policy)
+    d = _hm_to_min(default)
+    if p is None:
+        return default
+    return policy[:5] if p <= d else default
+
+
+def _latest_hour(policy: Optional[str], default: str) -> str:
+    """La plus tard entre la politique appart et le défaut (= fermer au plus tard)."""
+    p = _hm_to_min(policy)
+    d = _hm_to_min(default)
+    if p is None:
+        return default
+    return policy[:5] if p >= d else default
+
+
 # ── Window calc (Paris timezone via zoneinfo) ─────────────────────────────────
 
 def _build_window_ms(checkin_date: str, checkout_date: str,
@@ -370,12 +396,13 @@ def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
     ci_date_str = ci_date.isoformat() if hasattr(ci_date, "isoformat") else str(ci_date)
     co_date_str = co_date.isoformat() if hasattr(co_date, "isoformat") else str(co_date)
 
-    # Bornes d'heures : heures de POLITIQUE appart (earliest/latest), stables.
-    # On n'utilise PAS l'heure estimée du form (volatile) : un guest qui avance son
-    # arrivée serait sinon bloqué dehors (cf. analyse incident Crystal — estimé 21h30
-    # vs arrivée ~14h = 7h de lockout). Mieux vaut une borne large qu'un lockout.
-    ci_hour = row.get("earliest_checkin_hour") or DEFAULT_CI_HOUR
-    co_hour = row.get("latest_checkout_hour") or DEFAULT_CO_HOUR
+    # Bornes d'heures : window la plus LARGE entre la politique appart et le standard
+    # (CI 16h / CO 12h). CI = le plus tôt, CO = le plus tard → jamais plus étroit que
+    # le standard, jamais de lockout. On n'utilise PAS l'heure estimée du form (volatile,
+    # cf. incident Crystal). NB : la donnée résa porte souvent CO 11h, mais le standard
+    # réel est 12h → on prend 12h pour ne pas couper l'accès avant le départ.
+    ci_hour = _earliest_hour(row.get("earliest_checkin_hour"), DEFAULT_CI_HOUR)
+    co_hour = _latest_hour(row.get("latest_checkout_hour"), DEFAULT_CO_HOUR)
 
     try:
         ci_ms, co_ms = _build_window_ms(ci_date_str, co_date_str, ci_hour, co_hour)
