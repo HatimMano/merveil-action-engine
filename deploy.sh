@@ -62,7 +62,7 @@ gcloud run jobs deploy merveil-action-engine-iseo \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest,ISEO_MANAGER_USERNAME=iseo-manager-username:latest,ISEO_MANAGER_PASSWORD=iseo-manager-password:latest \
   --service-account $SA \
   --project $PROJECT \
-  --set-env-vars "^@^GCP_PROJECT_ID=$PROJECT@FREQ=iseo_orchestrator@ISEO_SHADOW_MODE=true@ISEO_ALLOWED_PROPERTY_IDS=c12a7244-f97b-4633-b6a7-b16f0079821c,70edbca0-6abb-4bae-bd89-b16f0079821c,f025ccb1-635c-4c0b-b388-b23600f8ffb3,e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,aa37778e-7257-40ad-9b5c-b16f0079821c"
+  --set-env-vars "^@^GCP_PROJECT_ID=$PROJECT@FREQ=iseo_orchestrator@ISEO_SHADOW_MODE=false@ISEO_ALLOWED_PROPERTY_IDS=c12a7244-f97b-4633-b6a7-b16f0079821c,1068206f-58c2-4ff8-8d71-b16f0079821c,22785cb3-555b-4020-92d6-b16f0079821c,ef51211e-3550-456a-9410-b16f0079821c,aa37778e-7257-40ad-9b5c-b16f0079821c,70edbca0-6abb-4bae-bd89-b16f0079821c,e8474d43-8f8f-4b87-9e20-b16f0079821c,ed0d0ccd-d5a0-4cbf-9f6f-b1d20103b89f,847cac7d-4030-4c3d-84fa-b1d201078a1f,3cc98d6e-294c-43df-848b-b16f0079821c,fb06038d-3d4a-4910-b7f7-b16f0079821c,f88ab4e0-16ed-4f5c-965f-b16f0079821c,db56b3ca-1462-46ec-aaee-b16f0079821c"
 
 echo ""
 echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-7)"

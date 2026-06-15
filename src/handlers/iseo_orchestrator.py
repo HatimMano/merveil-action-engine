@@ -183,7 +183,7 @@ def _resa_to_recreate() -> list[dict]:
     ),
     joined AS (
       SELECT
-        c.* EXCEPT (cached_at, recreated_at, archived_at, last_error, shadow_mode, row_hash),
+        c.* EXCEPT (cached_at, recreated_at, archived_at, last_error, row_hash),
         d.duve_property_id,
         m.mews_reservation_id,
         m.mews_reservation_number,
@@ -222,7 +222,7 @@ def _resa_to_archive() -> list[dict]:
     q = f"""
     WITH cache AS (
       SELECT duve_reservation_id, pin_value, iseo_lock_tag_id, iseo_guest_tag_id,
-             checkin_date, checkout_date
+             checkin_date, checkout_date, shadow_mode
       FROM `{PIN_CACHE_TABLE}`
       WHERE archived_at IS NULL
     ),
@@ -245,7 +245,7 @@ def _resa_to_archive() -> list[dict]:
     joined AS (
       SELECT
         c.duve_reservation_id, c.pin_value, c.iseo_lock_tag_id, c.iseo_guest_tag_id,
-        c.checkout_date,
+        c.checkout_date, c.shadow_mode,
         COALESCE(m.is_cancelled, FALSE) AS is_cancelled
       FROM cache c
       LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
@@ -258,7 +258,7 @@ def _resa_to_archive() -> list[dict]:
       ) = 1
     )
     SELECT
-      duve_reservation_id, pin_value, iseo_lock_tag_id, iseo_guest_tag_id,
+      duve_reservation_id, pin_value, iseo_lock_tag_id, iseo_guest_tag_id, shadow_mode,
       CASE WHEN is_cancelled THEN 'cancelled' ELSE 'checkout_passed' END AS archive_reason
     FROM joined
     WHERE checkout_date < CURRENT_DATE()
@@ -420,8 +420,11 @@ def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
     # Persiste la window dry-run (observabilité shadow ET prod) avant tout POST.
     _mark_would(duve_resa_id, window_from_ms=ci_ms, window_to_ms=co_ms)
 
-    if ISEO_SHADOW_MODE:
-        logger.info(f"🌗 SHADOW MODE: POST Sofia skipped for {duve_resa_id}")
+    # Shadow effectif PAR RÉSA : kill-switch global OU la capture était en shadow
+    # (= le PIN Duve n'a pas été supprimé → recréer ferait doublon). Seules les résa
+    # captées en prod (shadow_mode=false) déclenchent un vrai POST.
+    if ISEO_SHADOW_MODE or bool(row.get("shadow_mode")):
+        logger.info(f"🌗 SHADOW (résa {duve_resa_id}): POST Sofia skipped")
         return True, None
 
     r = _sofia("POST", "/api/v2/standardDevices", json_body=payload)
@@ -441,8 +444,10 @@ def _archive_pin(row: dict) -> tuple[bool, Optional[str]]:
     duve_resa_id = row["duve_reservation_id"]
     ext_id = f"MERVEIL_RESA - {duve_resa_id}"
 
-    if ISEO_SHADOW_MODE:
-        logger.info(f"🌗 SHADOW MODE: DELETE Sofia skipped (archive {duve_resa_id})")
+    # Per-résa : on ne DELETE Sofia que pour les résa captées en prod (shadow_mode=false).
+    # Les résa shadow n'ont jamais eu de MERVEIL_RESA créé → rien à supprimer.
+    if ISEO_SHADOW_MODE or bool(row.get("shadow_mode")):
+        logger.info(f"🌗 SHADOW (résa {duve_resa_id}): DELETE Sofia skipped (archive)")
         return True, None
 
     # GET pour obtenir id
@@ -478,10 +483,10 @@ def run() -> None:
         success, err = _recreate_pin(row)
         if success:
             try:
-                if not ISEO_SHADOW_MODE:
+                if not (ISEO_SHADOW_MODE or bool(row.get("shadow_mode"))):
                     _mark_recreate_success(row["duve_reservation_id"])
                 else:
-                    logger.info(f"🌗 cache.recreated_at update skipped (shadow)")
+                    logger.info(f"🌗 cache.recreated_at update skipped (shadow résa)")
             except Exception as e:
                 logger.warning(f"⚠️ cache update failed for {row['duve_reservation_id']}: {e}")
             ok += 1
