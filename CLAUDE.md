@@ -16,6 +16,14 @@ Reads pending actions (Breezeway) + rule tables (digest) produced by dbt.
 TTL du bucket 4h = 4h = fréquence du job → dédup neutralisée → ~60 alertes renvoyées à chaque cycle.
 Fix : les 5 triggers anciennement bucket `4h` (cancellation_vip, satisfaction_low_review, last_minute_checkin, double_booking, checkin_no_apartment) ont été basculés en `bucket: daily` dans `config/routing.yaml`. Le scheduler `merveil-action-engine-4h` a été pausé. Pas de perte d'info : annulations VIP restent dans le mail RC 11h `cancellations-brief`.
 
+### Fix explosion alertes daily — borne 24h sur `_load_triggers` (2026-06-17)
+`action_engine.triggers` est append-only (dedup par jour). Le dispatcher faisait
+`SELECT * FROM triggers` sans borne → rechargeait tout l'historique ; les triggers
+anciens, dont le `dispatched_action` avait dépassé son TTL, étaient renvoyés à chaque
+run (~1000 alertes). Fix : `_load_triggers` filtre `detected_at >= now - 24h`. Un trigger
+persistant génère une ligne fraîche par jour donc reste capté ; borne ≤ TTL daily (24h)
+→ pas de double envoi inter-jour. Uniforme pour tous les buckets (daily, 2h serrures, manuel).
+
 ### Mode `cancellations_brief` (2026-05-23)
 Mail récap quotidien envoyé à 11h Paris à `alerte_ventes@archides.fr` + `emilia@archides.fr` (override via env `CANCELLATIONS_TO`). Ne passe **pas** par le dispatcher trigger/action — c'est un rapport, pas un événement déclencheur. Query directe sur `dashboard_ops.dash_ops_cancellations_recent` filtré sur `cancelled_at >= NOW() - 24h`. HTML minimaliste (KPIs + table compacte) avec bouton `Voir le détail dans le dashboard →` qui pointe vers `https://direction.archides.fr/ops-front?tab=cancellations&preset=24h`. Reuse infra Gmail API (secret `alerts-gmail-sa-key` + Domain-Wide Delegation existante).
 

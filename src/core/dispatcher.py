@@ -124,10 +124,25 @@ class TriggerDispatcher:
     # ── Étape 2 : Charger triggers + dispatched_actions ouvertes ────────────
 
     def _load_triggers(self) -> list[dict]:
-        """Charge tous les triggers actifs (table dbt action_engine.triggers)."""
-        query = f"SELECT * FROM `{TRIGGERS_TABLE}` ORDER BY detected_at"
+        """Charge les triggers détectés dans les dernières 24h.
+
+        ⚠ `action_engine.triggers` est incrémental (append-only, dedup par
+        trigger_id = HASH(name+property+DATE(detected_at))) → la table accumule
+        TOUT l'historique. Sans borne temporelle, chaque run rechargeait des
+        milliers de triggers anciens dont le dispatched_action avait expiré (TTL),
+        donc renvoyés en masse à chaque digest (~1000 alertes/run).
+
+        Fenêtre 24h : un trigger persistant produit une ligne fraîche par jour
+        (dedup à la journée), donc reste capté ; la borne ≤ TTL daily (24h) évite
+        de renvoyer deux fois la même occurrence d'un jour à l'autre.
+        """
+        query = f"""
+            SELECT * FROM `{TRIGGERS_TABLE}`
+            WHERE detected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+            ORDER BY detected_at
+        """
         rows = list(self.bq.query(query).result())
-        logger.info(f"{len(rows)} trigger(s) chargé(s) depuis action_engine.triggers")
+        logger.info(f"{len(rows)} trigger(s) chargé(s) (24h) depuis action_engine.triggers")
         return [dict(r) for r in rows]
 
     def _load_open_dispatches(self) -> set[tuple[str, str, str]]:
