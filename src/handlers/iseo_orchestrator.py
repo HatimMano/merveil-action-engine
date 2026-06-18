@@ -622,10 +622,23 @@ def _recreate_pin(row: dict, force_replace: bool = False) -> tuple[bool, Optiona
         new_pin = r.json()
         logger.info(f"✅ Recreated PIN id={new_pin.get('id')} for {duve_resa_id}")
         return True, None
-    # Si "already present" : c'est un retry, on accepte
+    # "already present" est AMBIGU :
+    #  (a) notre propre MERVEIL_RESA existe déjà → vrai retry idempotent (OK) ;
+    #  (b) la VALEUR du code (deviceId) est déjà prise par un AUTRE credential
+    #      (autre appart / DUVE_PIN concurrent) → collision réelle : notre serrure
+    #      n'a PAS le code, le guest est locked out. Le marquer "succès" poserait
+    #      recreated_at et ne retenterait jamais (bug). On lève l'ambiguïté en
+    #      vérifiant que NOTRE extId existe avec NOTRE deviceId.
     if "already present" in r.text.lower():
-        logger.info(f"ℹ️ PIN déjà présent côté Sofia pour {duve_resa_id} (retry idempotent)")
-        return True, None
+        g = _sofia("GET", f"/api/v2/standardDevices/extId/{ext_id}")
+        if g.status_code == 200 and str(g.json().get("deviceId")) == str(row["pin_value"]):
+            logger.info(f"ℹ️ PIN MERVEIL_RESA déjà présent pour {duve_resa_id} (retry idempotent)")
+            return True, None
+        logger.error(
+            f"⛔ {duve_resa_id}: collision code deviceId={row['pin_value']} déjà utilisé par "
+            f"un autre credential (notre extId GET HTTP {g.status_code}) — guest sans code."
+        )
+        return False, f"code collision: deviceId {row['pin_value']} already used by another credential"
     return False, f"HTTP {r.status_code}: {r.text[:300]}"
 
 
