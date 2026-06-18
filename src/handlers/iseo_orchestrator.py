@@ -11,6 +11,11 @@ pre-checkin done Duve), pour chaque résa active dont CI dans 7j :
     [CI + estimated_ci_time Paris, CO + estimated_co_time Paris]
   - UPDATE cache.recreated_at
 
+Passe repost (backlog #3) : pour les rows déjà recréées dont le MERVEIL_RESA a disparu
+(PHANTOM) ou dérivé (DRIFT) côté Sofia, re-POST avec delete-before-post. Couvre le cas
+« PIN supprimé après recreate » (incident natif) que le filtre `recreated_at IS NULL` du
+recreate laissait sans correction.
+
 Logique d'archivage : pour les rows where checkout_date < today, DELETE Sofia + flag
 archived_at. Permet de nettoyer après le séjour.
 
@@ -58,6 +63,11 @@ MEWS_FCT_TABLE = os.environ.get(
 MEWS_PAYMENTS_TABLE = os.environ.get(
     "MEWS_PAYMENTS_TABLE",
     "merveil-data-warehouse.staging.stg_mews__payments",
+)
+# Snapshot Sofia (raw) pour la passe repost : re-détecter les PINs disparus/dérivés.
+RAW_SOFIA_SNAPSHOT_TABLE = os.environ.get(
+    "RAW_SOFIA_SNAPSHOT_TABLE",
+    "merveil-data-warehouse.iseo_raw.raw_standard_devices_snapshot",
 )
 
 ISEO_BASE_URL = os.environ.get("ISEO_BASE_URL", "https://api-archides.jago.cloud")
@@ -222,6 +232,116 @@ def _resa_to_recreate() -> list[dict]:
     SELECT * FROM joined
     WHERE COALESCE(is_cancelled, FALSE) = FALSE   -- annulées gérées par l'archive
     ORDER BY mews_checkin_date, checkin_date
+    """
+    return [dict(r.items()) for r in _bq().query(q).result()]
+
+
+def _resa_to_repost() -> list[dict]:
+    """Rows à RE-poster : déjà recréées une fois (`recreated_at IS NOT NULL`) mais dont
+    le PIN MERVEIL_RESA a **disparu** côté Sofia (PHANTOM) ou dont la **window a dérivé**
+    (DRIFT, CI/CO Mews modifiés après recreate). Sans cette passe, l'orchestrateur ignore
+    ces rows (filtre `recreated_at IS NULL` du recreate) → un PIN supprimé/dérivé n'est
+    jamais corrigé → guest sans code (cf. backlog #3, prouvé par l'incident natif 15-16/06).
+
+    Détection via le dernier snapshot Sofia (raw, rafraîchi par l'ETL ≤2h — l'orchestrateur
+    tourne à :45, snapshot ≤45 min). Même cross-check Mews que le recreate (skip annulées,
+    refresh dates/heures de politique). Shadow exclu (une row shadow n'a jamais eu de
+    MERVEIL_RESA réel → pas de repost). Le re-POST réutilise `_recreate_pin(force_replace=True)`
+    qui supprime le PIN périmé avant de recréer (corrige le DRIFT, idempotent sur PHANTOM).
+    """
+    q = f"""
+    WITH cache AS (
+      SELECT *
+      FROM `{PIN_CACHE_TABLE}`
+      WHERE archived_at IS NULL
+        AND recreated_at IS NOT NULL          -- déjà recréé au moins une fois
+        AND NOT shadow_mode                    -- shadow = jamais de MERVEIL_RESA réel
+        AND pin_value IS NOT NULL
+        AND iseo_guest_tag_id IS NOT NULL
+        AND iseo_lock_tag_id IS NOT NULL
+        AND checkout_date >= CURRENT_DATE()
+    ),
+    duve_latest AS (
+      SELECT
+        reservation_id AS duve_reservation_id,
+        property_id    AS duve_property_id,
+        (SELECT JSON_VALUE(g, '$.externalId')
+           FROM UNNEST(JSON_QUERY_ARRAY(_raw_payload, '$.resource.guestProfiles')) g
+           WHERE JSON_VALUE(g, '$.isPrimary') = 'true'
+           LIMIT 1)                          AS mews_customer_id,
+        received_at
+      FROM `{RAW_DUVE_CHECKIN_TABLE}`
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY reservation_id ORDER BY received_at DESC) = 1
+    ),
+    mews AS (
+      SELECT
+        customer_id, resource_id,
+        reservation_id      AS mews_reservation_id,
+        reservation_number  AS mews_reservation_number,
+        is_cancelled,
+        checkin_date        AS mews_checkin_date,
+        checkout_date       AS mews_checkout_date,
+        earliest_checkin_hour,
+        latest_checkout_hour
+      FROM `{MEWS_FCT_TABLE}`
+    ),
+    payments AS (
+      SELECT reservation_id,
+             COUNTIF(state = 'Charged') AS n_charged,
+             COUNTIF(state = 'Failed')  AS n_failed
+      FROM `{MEWS_PAYMENTS_TABLE}`
+      WHERE reservation_id IS NOT NULL
+      GROUP BY reservation_id
+    ),
+    -- État Sofia courant : MERVEIL_RESA actifs (CO futur) du dernier snapshot.
+    sofia_latest_snap AS (
+      SELECT MAX(snapshot_at) AS snap_at FROM `{RAW_SOFIA_SNAPSHOT_TABLE}`
+    ),
+    sofia_active_merveil AS (
+      SELECT
+        REGEXP_EXTRACT(d.ext_id, r'^MERVEIL_RESA - ([a-f0-9]+)$') AS duve_reservation_id,
+        MAX(DATE(d.rule_date_from_iso)) AS sofia_ci_date,
+        MAX(DATE(d.rule_date_to_iso))   AS sofia_co_date
+      FROM `{RAW_SOFIA_SNAPSHOT_TABLE}` d
+      JOIN sofia_latest_snap s ON d.snapshot_at = s.snap_at
+      WHERE d.deleted = FALSE
+        AND d.ext_id LIKE 'MERVEIL_RESA - %'
+        AND d.rule_date_to_iso > CURRENT_TIMESTAMP()
+      GROUP BY duve_reservation_id
+    ),
+    joined AS (
+      SELECT
+        c.* EXCEPT (cached_at, recreated_at, archived_at, last_error, row_hash),
+        d.duve_property_id,
+        m.is_cancelled,
+        m.mews_checkin_date,
+        m.mews_checkout_date,
+        m.earliest_checkin_hour,
+        m.latest_checkout_hour,
+        (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid,
+        sof.duve_reservation_id AS sofia_present,
+        sof.sofia_ci_date,
+        sof.sofia_co_date
+      FROM cache c
+      LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
+      LEFT JOIN mews m
+        ON m.customer_id = d.mews_customer_id
+       AND m.resource_id = d.duve_property_id
+      LEFT JOIN payments pay ON pay.reservation_id = m.mews_reservation_id
+      LEFT JOIN sofia_active_merveil sof ON sof.duve_reservation_id = c.duve_reservation_id
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY c.duve_reservation_id
+        ORDER BY ABS(DATE_DIFF(m.mews_checkin_date, c.checkin_date, DAY)) ASC NULLS LAST
+      ) = 1
+    )
+    SELECT * FROM joined
+    WHERE COALESCE(is_cancelled, FALSE) = FALSE         -- annulées gérées par l'archive
+      AND (
+        sofia_present IS NULL                            -- PHANTOM : plus de PIN Sofia
+        OR sofia_ci_date != COALESCE(mews_checkin_date, checkin_date)   -- DRIFT CI
+        OR sofia_co_date != COALESCE(mews_checkout_date, checkout_date) -- DRIFT CO
+      )
+    ORDER BY checkin_date
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
@@ -394,8 +514,15 @@ def _build_window_ms(checkin_date: str, checkout_date: str,
 
 # ── Main recreate logic ───────────────────────────────────────────────────────
 
-def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
-    """POST nouveau PIN côté Sofia avec MÊME deviceId + window calculée."""
+def _recreate_pin(row: dict, force_replace: bool = False) -> tuple[bool, Optional[str]]:
+    """POST nouveau PIN côté Sofia avec MÊME deviceId + window calculée.
+
+    force_replace=True (passe repost) : supprime le MERVEIL_RESA existant avant de
+    re-poster. Indispensable pour le cas DRIFT (le PIN existe avec une window périmée →
+    un POST simple renverrait 'already present' sans corriger). Sur PHANTOM (PIN absent)
+    le delete est un no-op (404). Le delete n'a lieu qu'après TOUS les skip-checks
+    (whitelist/paiement/dates/shadow) → jamais de suppression sans recréation derrière.
+    """
     duve_resa_id = row["duve_reservation_id"]
 
     # Whitelist
@@ -480,6 +607,16 @@ def _recreate_pin(row: dict) -> tuple[bool, Optional[str]]:
         logger.info(f"🌗 SHADOW (résa {duve_resa_id}): POST Sofia skipped")
         return True, None
 
+    # Repost : supprimer le MERVEIL_RESA périmé avant de recréer (no-op si déjà absent).
+    if force_replace:
+        g = _sofia("GET", f"/api/v2/standardDevices/extId/{ext_id}")
+        if g.status_code == 200:
+            old_id = g.json().get("id")
+            rdel = _sofia("DELETE", f"/api/v2/standardDevices/{old_id}")
+            logger.info(f"♻️ repost {duve_resa_id}: deleted stale PIN id={old_id} (HTTP {rdel.status_code})")
+        elif g.status_code != 404:
+            logger.warning(f"⚠️ repost {duve_resa_id}: GET avant delete HTTP {g.status_code} — POST quand même")
+
     r = _sofia("POST", "/api/v2/standardDevices", json_body=payload)
     if r.status_code in (200, 201):
         new_pin = r.json()
@@ -551,7 +688,29 @@ def run() -> None:
             logger.warning(f"⚠️ recreate failed for {row['duve_reservation_id']}: {err}")
             fail += 1
 
-    # ── 2. Archive (checkout passé) ─────────────────────────────────────────
+    # ── 2. Repost (PIN disparu/dérivé côté Sofia malgré recreated_at) ───────
+    # Cf. backlog #3 : un PIN supprimé/dérivé après recreate n'était jamais corrigé.
+    to_repost = _resa_to_repost()
+    logger.info(f"♻️ {len(to_repost)} résa(s) à re-poster (PIN absent ou window dérivée)")
+    repost_ok = repost_fail = 0
+    for row in to_repost:
+        success, err = _recreate_pin(row, force_replace=True)
+        if success:
+            try:
+                if not (ISEO_SHADOW_MODE or bool(row.get("shadow_mode"))):
+                    _mark_recreate_success(row["duve_reservation_id"])
+            except Exception as e:
+                logger.warning(f"⚠️ cache update (repost) failed for {row['duve_reservation_id']}: {e}")
+            repost_ok += 1
+        else:
+            try:
+                _mark_recreate_error(row["duve_reservation_id"], err)
+            except Exception:
+                pass
+            logger.warning(f"⚠️ repost failed for {row['duve_reservation_id']}: {err}")
+            repost_fail += 1
+
+    # ── 3. Archive (checkout passé) ─────────────────────────────────────────
     to_archive = _resa_to_archive()
     logger.info(f"🗑️ {len(to_archive)} résa(s) à archiver (CO passé ou annulée)")
     archived = 0
@@ -569,5 +728,8 @@ def run() -> None:
             logger.warning(f"⚠️ archive failed for {row['duve_reservation_id']}: {err}")
 
     logger.info("=" * 70)
-    logger.info(f"DONE — recreate ok={ok} fail={fail} | archived={archived}")
+    logger.info(
+        f"DONE — recreate ok={ok} fail={fail} | "
+        f"repost ok={repost_ok} fail={repost_fail} | archived={archived}"
+    )
     logger.info("=" * 70)
