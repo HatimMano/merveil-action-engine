@@ -174,21 +174,22 @@ _LOCKS_CTE = f"""
              CAST(JSON_VALUE(t, '$.id') AS INT64) AS lock_tag_id
       FROM `{SMART_LOCKS_TABLE}` l, UNNEST(JSON_QUERY_ARRAY(l.tags)) AS t
       WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
-        AND l.is_present_in_latest_snapshot
     ),
     guest_tags AS (
       SELECT lock_tag_id, guest_tag_id FROM (
-        SELECT
-          CAST(REGEXP_EXTRACT(rule_lock_tags_ids,  r'(\\d+)') AS INT64) AS lock_tag_id,
-          CAST(REGEXP_EXTRACT(rule_guest_tags_ids, r'(\\d+)') AS INT64) AS guest_tag_id,
-          ROW_NUMBER() OVER (
-            PARTITION BY CAST(REGEXP_EXTRACT(rule_lock_tags_ids, r'(\\d+)') AS INT64)
-            ORDER BY COUNT(*) DESC) AS rn
-        FROM `{STD_DEVICES_TABLE}`
-        WHERE is_present_in_latest_snapshot
-          AND rule_lock_tags_ids IS NOT NULL AND rule_lock_tags_ids != '[]'
-          AND rule_guest_tags_ids IS NOT NULL AND rule_guest_tags_ids != '[]'
-        GROUP BY 1, 2
+        SELECT lock_tag_id, guest_tag_id,
+               ROW_NUMBER() OVER (PARTITION BY lock_tag_id ORDER BY n DESC) AS rn
+        FROM (
+          SELECT
+            CAST(REGEXP_EXTRACT(rule_lock_tags_ids,  r'(\\d+)') AS INT64) AS lock_tag_id,
+            CAST(REGEXP_EXTRACT(rule_guest_tags_ids, r'(\\d+)') AS INT64) AS guest_tag_id,
+            COUNT(*) AS n
+          FROM `{STD_DEVICES_TABLE}`
+          WHERE is_present_in_latest_snapshot
+            AND rule_lock_tags_ids IS NOT NULL AND rule_lock_tags_ids != '[]'
+            AND rule_guest_tags_ids IS NOT NULL AND rule_guest_tags_ids != '[]'
+          GROUP BY 1, 2
+        )
       ) WHERE rn = 1
     )"""
 
