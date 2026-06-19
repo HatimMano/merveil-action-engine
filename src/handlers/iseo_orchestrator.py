@@ -1,36 +1,41 @@
 """
-ISEO PIN Orchestrator — recreate PINs côté Sofia à J-7 du CI (pipeline V3).
+ISEO PIN Orchestrator — pipeline V3 100% DWH (intégration native Duve↔Sofia COUPÉE).
 
-Cf. project_iseo_integration_2026 section Architecture V3.
+Cf. [[project_iseo_integration_2026]] + to_do "MAJ 20/06 — pipeline complet validé".
 
-Lit `iseo_raw.merveil_pin_cache` (alimentée par webhook-gateway/iseo_pin_cacher au
-pre-checkin done Duve), pour chaque résa active dont CI dans 7j :
-  - JOIN raw_duve.checkin_events pour récupérer estimated_checkin_time / estimated_checkout_time
-    et la dernière valeur d'apartment_code (en cas de modif)
-  - POST Sofia /standardDevices avec MÊME deviceId (= pin_value capturé) + window
-    [CI + estimated_ci_time Paris, CO + estimated_co_time Paris]
-  - UPDATE cache.recreated_at
+Depuis le 20/06 le natif Duve↔Sofia est désactivé dans les 2 sens. Le DWH est
+seul maître du cycle PIN. Pour chaque résa Mews non annulée, payée, dont le CI est
+dans les LOOKAHEAD_DAYS prochains jours (et pas encore provisionnée) :
 
-Passe repost (backlog #3) : pour les rows déjà recréées dont le MERVEIL_RESA a disparu
-(PHANTOM) ou dérivé (DRIFT) côté Sofia, re-POST avec delete-before-post. Couvre le cas
-« PIN supprimé après recreate » (incident natif) que le filtre `recreated_at IS NULL` du
-recreate laissait sans correction.
+  A. génère un code PIN 4 chiffres (unique account-wide, retry sur collision)
+  B. POST Sofia /standardDevices (credentialRule sur le guest tag + lock tag de
+     l'appart — RÉUTILISÉS, pas de création user/tag par résa)
+  C. POST Sofia /invitations (smartLockIds=[lock_id]) → code → lien remote-open
+     `https://archides.jago.cloud/remoteOpen?code=<code>`
+  D. POST intégration Duve (champ custom) : primaryCode = code clavier +
+     ISEO ACCESS LINK = lien remote-open. (Aucun message déclenché — les messages
+     auto Duve lisent le champ. Lien gated sur la window, OK pendant le séjour.)
+  E. INSERT état dans iseo_raw.merveil_pin_cache.
 
-Logique d'archivage : pour les rows where checkout_date < today, DELETE Sofia + flag
-archived_at. Permet de nettoyer après le séjour.
+Archive (CO passé OU résa annulée) : DELETE Sofia device + DELETE invitation +
+flag archived_at. Pas de user à supprimer (on réutilise le user d'appart partagé).
+
+Résolution des ids appart (par JOIN BQ, pas de seed) :
+  - duve property_id (GUID) == Mews resource_id == nom du lock tag Sofia
+  - lock_id + lock_tag_id ← stg_iseo__smart_locks (par nom de tag = property_id)
+  - guest_tag_id ← guest tag le plus fréquent des PINs existants de cet appart
+    (stg_iseo__standard_devices.rule_guest_tags_ids)
 
 Modes :
-  - ISEO_SHADOW_MODE=true → log "would POST" mais pas d'appel Sofia
-  - ISEO_ALLOWED_PROPERTY_IDS (csv) → whitelist (sécurise le rollout par appart)
+  - ISEO_SHADOW_MODE=true → log "would provision" sans appel Sofia/Duve
+  - ISEO_ALLOWED_PROPERTY_IDS (csv de GUID) → whitelist rollout par appart
 
-⚠ Le pin_value en cache reste valide tant que la résa est active. Pas de rotation
-auto pour l'instant — c'est le code envoyé au guest par Duve au pre-checkin done.
-
-Trigger : Cloud Run Job `merveil-action-engine-iseo` lancé par scheduler quotidien.
+Trigger : Cloud Run Job `merveil-action-engine-iseo` (scheduler 2h à :45).
 """
 
 import logging
 import os
+import random
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -40,39 +45,37 @@ import requests
 from google.cloud import bigquery
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
-
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "merveil-data-warehouse")
 PIN_CACHE_TABLE = os.environ.get(
-    "ISEO_PIN_CACHE_TABLE",
-    "merveil-data-warehouse.iseo_raw.merveil_pin_cache",
-)
+    "ISEO_PIN_CACHE_TABLE", "merveil-data-warehouse.iseo_raw.merveil_pin_cache")
 RAW_DUVE_CHECKIN_TABLE = os.environ.get(
-    "RAW_DUVE_CHECKIN_TABLE",
-    "merveil-data-warehouse.raw_duve.checkin_events",
-)
-# Source de vérité Mews pour dates + statut annulation. Le webhook Duve est figé
-# au pre-checkin done (cf. incident Crystal Balcom) ; Mews est pollé toutes les 2h.
+    "RAW_DUVE_CHECKIN_TABLE", "merveil-data-warehouse.raw_duve.checkin_events")
 MEWS_FCT_TABLE = os.environ.get(
-    "MEWS_FCT_TABLE",
-    "merveil-data-warehouse.marts.fct_reservations",
-)
+    "MEWS_FCT_TABLE", "merveil-data-warehouse.marts.fct_reservations")
 MEWS_PAYMENTS_TABLE = os.environ.get(
-    "MEWS_PAYMENTS_TABLE",
-    "merveil-data-warehouse.staging.stg_mews__payments",
-)
-# Snapshot Sofia (raw) pour la passe repost : re-détecter les PINs disparus/dérivés.
-RAW_SOFIA_SNAPSHOT_TABLE = os.environ.get(
-    "RAW_SOFIA_SNAPSHOT_TABLE",
-    "merveil-data-warehouse.iseo_raw.raw_standard_devices_snapshot",
-)
+    "MEWS_PAYMENTS_TABLE", "merveil-data-warehouse.staging.stg_mews__payments")
+SMART_LOCKS_TABLE = os.environ.get(
+    "SMART_LOCKS_TABLE", "merveil-data-warehouse.staging.stg_iseo__smart_locks")
+STD_DEVICES_TABLE = os.environ.get(
+    "STD_DEVICES_TABLE", "merveil-data-warehouse.staging.stg_iseo__standard_devices")
 
 ISEO_BASE_URL = os.environ.get("ISEO_BASE_URL", "https://api-archides.jago.cloud")
 ISEO_USERNAME = (os.environ.get("ISEO_MANAGER_USERNAME") or "").strip()
 ISEO_PASSWORD = (os.environ.get("ISEO_MANAGER_PASSWORD") or "").strip()
+
+# Intégration entrante Duve (write path) — cf. to_do 20/06.
+DUVE_CONNECT_URL = os.environ.get(
+    "DUVE_CONNECT_URL", "https://connect.duve.com/api/v1/hooks/duveconnect")
+DUVE_CONNECT_PID = os.environ.get("DUVE_CONNECT_PID", "")
+DUVE_CONNECT_TOKEN = (os.environ.get("DUVE_CONNECT_TOKEN") or "").strip()
+DUVE_FIELD_NAME = os.environ.get(
+    "DUVE_FIELD_NAME", "merveil_paris_iseo_access_link_eIhhEnlspM")
+# La page web guest est sur archides.jago.cloud, PAS le host api- renvoyé par l'API.
+REMOTE_OPEN_HOST = os.environ.get("ISEO_REMOTE_OPEN_HOST", "archides.jago.cloud")
 
 ISEO_SHADOW_MODE = os.environ.get("ISEO_SHADOW_MODE", "true").lower() == "true"
 ALLOWED_PROPERTY_IDS = {
@@ -81,13 +84,10 @@ ALLOWED_PROPERTY_IDS = {
     if pid.strip()
 }
 
-# Fenêtre temporelle des résa à traiter : CI dans les 7 prochains jours
 LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "7"))
-
-# Fallback heures si Duve ne pousse pas les estimated_checkin_time / etc.
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "16:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "12:00")
-
+PIN_COLLISION_RETRIES = 8
 
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
@@ -104,12 +104,10 @@ class _SofiaAuth:
         if not ISEO_USERNAME or not ISEO_PASSWORD:
             raise RuntimeError("ISEO credentials missing")
         resp = requests.post(
-            f"{ISEO_BASE_URL}/oauth/token",
-            auth=("client", ""),
+            f"{ISEO_BASE_URL}/oauth/token", auth=("client", ""),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             data={"grant_type": "password", "username": ISEO_USERNAME, "password": ISEO_PASSWORD},
-            timeout=30,
-        )
+            timeout=30)
         resp.raise_for_status()
         p = resp.json()
         cls._token = p["access_token"]
@@ -120,16 +118,28 @@ class _SofiaAuth:
 
 def _sofia(method: str, path: str, json_body=None) -> requests.Response:
     return requests.request(
-        method,
-        f"{ISEO_BASE_URL}{path}",
-        headers={
-            "Authorization": f"Bearer {_SofiaAuth.get_token()}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-        json=json_body,
-        timeout=30,
-    )
+        method, f"{ISEO_BASE_URL}{path}",
+        headers={"Authorization": f"Bearer {_SofiaAuth.get_token()}",
+                 "Accept": "application/json", "Content-Type": "application/json"},
+        json=json_body, timeout=30)
+
+
+def _duve_push(duve_resa_id: str, code: str, link: str) -> tuple[bool, Optional[str]]:
+    """POST l'intégration entrante Duve : écrit primaryCode (code clavier) +
+    le champ custom ISEO ACCESS LINK (lien remote-open). N'émet aucun message
+    (les messages auto Duve lisent le champ)."""
+    if not (DUVE_CONNECT_PID and DUVE_CONNECT_TOKEN):
+        return False, "Duve connect config missing (PID/TOKEN)"
+    r = requests.post(
+        f"{DUVE_CONNECT_URL}?pid={DUVE_CONNECT_PID}",
+        headers={"Authorization": f"Bearer {DUVE_CONNECT_TOKEN}",
+                 "Content-Type": "application/json"},
+        json={"reservation": duve_resa_id, "primaryCode": code,
+              "additionalFields": [{"name": DUVE_FIELD_NAME, "value": link}]},
+        timeout=30)
+    if r.status_code == 200:
+        return True, None
+    return False, f"Duve HTTP {r.status_code}: {r.text[:200]}"
 
 
 # ── BigQuery ──────────────────────────────────────────────────────────────────
@@ -144,313 +154,164 @@ def _bq() -> bigquery.Client:
     return _bq_client
 
 
-def _resa_to_recreate() -> list[dict]:
-    """Rows à recréer côté Sofia : cache non-archivée, non-recréée, CI dans LOOKAHEAD_DAYS,
-    et résa NON annulée (cross-check Mews via le mapping Duve↔Mews).
-
-    Mapping Duve↔Mews (le payload Duve embarque les ids Mews) :
-      - guestProfiles[isPrimary].externalId  = Mews customer_id
-      - resource.externalPropertyId          = Mews resource_id (= property_id stocké)
-    → on résout la résa Mews et on rafraîchit dates + statut depuis fct_reservations
-    (SoT, pollé 2h), plutôt que de se fier au webhook Duve figé. Les heures de window
-    utilisent les heures de POLITIQUE appart (earliest/latest), stables, et non
-    l'heure estimée du form (volatile → risque de lockout à l'arrivée).
-    """
-    q = f"""
-    WITH cache AS (
-      SELECT *
-      FROM `{PIN_CACHE_TABLE}`
-      WHERE archived_at IS NULL
-        AND recreated_at IS NULL
-        AND pin_value IS NOT NULL
-        AND iseo_guest_tag_id IS NOT NULL
-        AND iseo_lock_tag_id IS NOT NULL
-        -- CI dans ≤7j OU déjà commencé (in-house), tant que pas encore checkout.
-        -- (l'ancien BETWEEN today..+7 excluait les résa dont le CI est passé mais
-        --  encore en cours → guest potentiellement sans code au cutover).
-        AND checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
-        AND checkout_date >= CURRENT_DATE()
-    ),
-    duve_latest AS (
-      SELECT
-        reservation_id AS duve_reservation_id,
-        property_id    AS duve_property_id,   -- = Mews resource_id
-        (SELECT JSON_VALUE(g, '$.externalId')
-           FROM UNNEST(JSON_QUERY_ARRAY(_raw_payload, '$.resource.guestProfiles')) g
-           WHERE JSON_VALUE(g, '$.isPrimary') = 'true'
-           LIMIT 1)                          AS mews_customer_id,
-        received_at
-      FROM `{RAW_DUVE_CHECKIN_TABLE}`
-      QUALIFY ROW_NUMBER() OVER (PARTITION BY reservation_id ORDER BY received_at DESC) = 1
-    ),
-    mews AS (
-      SELECT
-        customer_id, resource_id,
-        reservation_id      AS mews_reservation_id,
-        reservation_number  AS mews_reservation_number,
-        is_cancelled,
-        checkin_date        AS mews_checkin_date,
-        checkout_date       AS mews_checkout_date,
-        earliest_checkin_hour,
-        latest_checkout_hour
-      FROM `{MEWS_FCT_TABLE}`
-    ),
-    -- Paiement par résa Mews (donnée stabilisée à J-7). Impayé = ∃ Failed ET ∄ Charged.
-    payments AS (
-      SELECT reservation_id,
-             COUNTIF(state = 'Charged') AS n_charged,
-             COUNTIF(state = 'Failed')  AS n_failed
-      FROM `{MEWS_PAYMENTS_TABLE}`
-      WHERE reservation_id IS NOT NULL
-      GROUP BY reservation_id
-    ),
-    joined AS (
-      SELECT
-        c.* EXCEPT (cached_at, recreated_at, archived_at, last_error, row_hash),
-        d.duve_property_id,
-        m.mews_reservation_id,
-        m.mews_reservation_number,
-        m.is_cancelled,
-        m.mews_checkin_date,
-        m.mews_checkout_date,
-        m.earliest_checkin_hour,
-        m.latest_checkout_hour,
-        (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid
-      FROM cache c
-      LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
-      LEFT JOIN mews m
-        ON m.customer_id = d.mews_customer_id
-       AND m.resource_id = d.duve_property_id
-      LEFT JOIN payments pay ON pay.reservation_id = m.mews_reservation_id
-      -- Si le guest a plusieurs séjours dans le même appart, prendre la résa Mews
-      -- dont le CI est le plus proche du CI capturé en cache.
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY c.duve_reservation_id
-        ORDER BY ABS(DATE_DIFF(m.mews_checkin_date, c.checkin_date, DAY)) ASC NULLS LAST
-      ) = 1
-    )
-    SELECT * FROM joined
-    WHERE COALESCE(is_cancelled, FALSE) = FALSE   -- annulées gérées par l'archive
-    ORDER BY mews_checkin_date, checkin_date
-    """
-    return [dict(r.items()) for r in _bq().query(q).result()]
-
-
-def _resa_to_repost() -> list[dict]:
-    """Rows à RE-poster : déjà recréées une fois (`recreated_at IS NOT NULL`) mais dont
-    le PIN MERVEIL_RESA a **disparu** côté Sofia (PHANTOM) ou dont la **window a dérivé**
-    (DRIFT, CI/CO Mews modifiés après recreate). Sans cette passe, l'orchestrateur ignore
-    ces rows (filtre `recreated_at IS NULL` du recreate) → un PIN supprimé/dérivé n'est
-    jamais corrigé → guest sans code (cf. backlog #3, prouvé par l'incident natif 15-16/06).
-
-    Détection via le dernier snapshot Sofia (raw, rafraîchi par l'ETL ≤2h — l'orchestrateur
-    tourne à :45, snapshot ≤45 min). Même cross-check Mews que le recreate (skip annulées,
-    refresh dates/heures de politique). Shadow exclu (une row shadow n'a jamais eu de
-    MERVEIL_RESA réel → pas de repost). Le re-POST réutilise `_recreate_pin(force_replace=True)`
-    qui supprime le PIN périmé avant de recréer (corrige le DRIFT, idempotent sur PHANTOM).
-    """
-    q = f"""
-    WITH cache AS (
-      SELECT *
-      FROM `{PIN_CACHE_TABLE}`
-      WHERE archived_at IS NULL
-        AND recreated_at IS NOT NULL          -- déjà recréé au moins une fois
-        AND NOT shadow_mode                    -- shadow = jamais de MERVEIL_RESA réel
-        AND pin_value IS NOT NULL
-        AND iseo_guest_tag_id IS NOT NULL
-        AND iseo_lock_tag_id IS NOT NULL
-        AND checkout_date >= CURRENT_DATE()
-    ),
+# CTEs partagés (mapping Duve↔Mews + résolution lock/tags par appart).
+_DUVE_LATEST_CTE = f"""
     duve_latest AS (
       SELECT
         reservation_id AS duve_reservation_id,
         property_id    AS duve_property_id,
         (SELECT JSON_VALUE(g, '$.externalId')
            FROM UNNEST(JSON_QUERY_ARRAY(_raw_payload, '$.resource.guestProfiles')) g
-           WHERE JSON_VALUE(g, '$.isPrimary') = 'true'
-           LIMIT 1)                          AS mews_customer_id,
-        received_at
+           WHERE JSON_VALUE(g, '$.isPrimary') = 'true' LIMIT 1) AS mews_customer_id
       FROM `{RAW_DUVE_CHECKIN_TABLE}`
       QUALIFY ROW_NUMBER() OVER (PARTITION BY reservation_id ORDER BY received_at DESC) = 1
+    )"""
+
+_LOCKS_CTE = f"""
+    locks AS (
+      SELECT l.lock_id, l.apartment_code,
+             JSON_VALUE(t, '$.name')              AS duve_property_id,
+             CAST(JSON_VALUE(t, '$.id') AS INT64) AS lock_tag_id
+      FROM `{SMART_LOCKS_TABLE}` l, UNNEST(JSON_QUERY_ARRAY(l.tags)) AS t
+      WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
+        AND l.is_present_in_latest_snapshot
     ),
-    mews AS (
-      SELECT
-        customer_id, resource_id,
-        reservation_id      AS mews_reservation_id,
-        reservation_number  AS mews_reservation_number,
-        is_cancelled,
-        checkin_date        AS mews_checkin_date,
-        checkout_date       AS mews_checkout_date,
-        earliest_checkin_hour,
-        latest_checkout_hour
-      FROM `{MEWS_FCT_TABLE}`
-    ),
+    guest_tags AS (
+      SELECT lock_tag_id, guest_tag_id FROM (
+        SELECT
+          CAST(REGEXP_EXTRACT(rule_lock_tags_ids,  r'(\\d+)') AS INT64) AS lock_tag_id,
+          CAST(REGEXP_EXTRACT(rule_guest_tags_ids, r'(\\d+)') AS INT64) AS guest_tag_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY CAST(REGEXP_EXTRACT(rule_lock_tags_ids, r'(\\d+)') AS INT64)
+            ORDER BY COUNT(*) DESC) AS rn
+        FROM `{STD_DEVICES_TABLE}`
+        WHERE is_present_in_latest_snapshot
+          AND rule_lock_tags_ids IS NOT NULL AND rule_lock_tags_ids != '[]'
+          AND rule_guest_tags_ids IS NOT NULL AND rule_guest_tags_ids != '[]'
+        GROUP BY 1, 2
+      ) WHERE rn = 1
+    )"""
+
+_PAYMENTS_CTE = f"""
     payments AS (
       SELECT reservation_id,
              COUNTIF(state = 'Charged') AS n_charged,
              COUNTIF(state = 'Failed')  AS n_failed
       FROM `{MEWS_PAYMENTS_TABLE}`
-      WHERE reservation_id IS NOT NULL
-      GROUP BY reservation_id
+      WHERE reservation_id IS NOT NULL GROUP BY reservation_id
+    )"""
+
+
+def _resa_to_provision() -> list[dict]:
+    """Résas à provisionner : CI dans [today, today+LOOKAHEAD], CO futur, non annulée,
+    PAS déjà couverte par une row de cache active (archived_at IS NULL). Résout
+    lock_id / lock_tag_id / guest_tag_id de l'appart par JOIN."""
+    q = f"""
+    WITH {_DUVE_LATEST_CTE},
+    {_LOCKS_CTE},
+    {_PAYMENTS_CTE},
+    mews AS (
+      SELECT customer_id, resource_id,
+             reservation_id     AS mews_reservation_id,
+             reservation_number AS mews_reservation_number,
+             is_cancelled, checkin_date, checkout_date,
+             earliest_checkin_hour, latest_checkout_hour
+      FROM `{MEWS_FCT_TABLE}`
     ),
-    -- État Sofia courant : MERVEIL_RESA actifs (CO futur) du dernier snapshot.
-    sofia_latest_snap AS (
-      SELECT MAX(snapshot_at) AS snap_at FROM `{RAW_SOFIA_SNAPSHOT_TABLE}`
-    ),
-    sofia_active_merveil AS (
-      SELECT
-        REGEXP_EXTRACT(d.ext_id, r'^MERVEIL_RESA - ([a-f0-9]+)$') AS duve_reservation_id,
-        MAX(DATE(d.rule_date_from_iso)) AS sofia_ci_date,
-        MAX(DATE(d.rule_date_to_iso))   AS sofia_co_date
-      FROM `{RAW_SOFIA_SNAPSHOT_TABLE}` d
-      JOIN sofia_latest_snap s ON d.snapshot_at = s.snap_at
-      WHERE d.deleted = FALSE
-        AND d.ext_id LIKE 'MERVEIL_RESA - %'
-        AND d.rule_date_to_iso > CURRENT_TIMESTAMP()
-      GROUP BY duve_reservation_id
+    active_state AS (
+      SELECT DISTINCT duve_reservation_id
+      FROM `{PIN_CACHE_TABLE}` WHERE archived_at IS NULL
     ),
     joined AS (
       SELECT
-        c.* EXCEPT (cached_at, recreated_at, archived_at, last_error, row_hash),
-        d.duve_property_id,
-        m.is_cancelled,
-        m.mews_checkin_date,
-        m.mews_checkout_date,
-        m.earliest_checkin_hour,
-        m.latest_checkout_hour,
-        (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid,
-        sof.duve_reservation_id AS sofia_present,
-        sof.sofia_ci_date,
-        sof.sofia_co_date
-      FROM cache c
-      LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
-      LEFT JOIN mews m
-        ON m.customer_id = d.mews_customer_id
-       AND m.resource_id = d.duve_property_id
-      LEFT JOIN payments pay ON pay.reservation_id = m.mews_reservation_id
-      LEFT JOIN sofia_active_merveil sof ON sof.duve_reservation_id = c.duve_reservation_id
+        d.duve_reservation_id, d.duve_property_id,
+        lk.lock_id, lk.lock_tag_id, lk.apartment_code,
+        gt.guest_tag_id,
+        m.mews_reservation_id, m.mews_reservation_number,
+        m.checkin_date, m.checkout_date,
+        m.earliest_checkin_hour, m.latest_checkout_hour,
+        (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid
+      FROM mews m
+      JOIN duve_latest d ON d.mews_customer_id = m.customer_id
+                        AND d.duve_property_id = m.resource_id
+      JOIN locks lk      ON lk.duve_property_id = m.resource_id
+      LEFT JOIN guest_tags gt ON gt.lock_tag_id = lk.lock_tag_id
+      LEFT JOIN payments pay  ON pay.reservation_id = m.mews_reservation_id
+      LEFT JOIN active_state s ON s.duve_reservation_id = d.duve_reservation_id
+      WHERE m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
+        AND m.checkout_date >= CURRENT_DATE()
+        AND COALESCE(m.is_cancelled, FALSE) = FALSE
+        AND s.duve_reservation_id IS NULL
       QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY c.duve_reservation_id
-        ORDER BY ABS(DATE_DIFF(m.mews_checkin_date, c.checkin_date, DAY)) ASC NULLS LAST
-      ) = 1
+        PARTITION BY d.duve_reservation_id ORDER BY m.checkin_date) = 1
     )
-    SELECT * FROM joined
-    WHERE COALESCE(is_cancelled, FALSE) = FALSE         -- annulées gérées par l'archive
-      AND (
-        sofia_present IS NULL                            -- PHANTOM : plus de PIN Sofia
-        OR sofia_ci_date != COALESCE(mews_checkin_date, checkin_date)   -- DRIFT CI
-        OR sofia_co_date != COALESCE(mews_checkout_date, checkout_date) -- DRIFT CO
-      )
-    ORDER BY checkin_date
+    SELECT * FROM joined ORDER BY checkin_date
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
 
 def _resa_to_archive() -> list[dict]:
-    """Rows à archiver : checkout passé OU résa annulée (cross-check Mews).
-    DELETE Sofia (skip en shadow) + set archived_at.
-
-    L'annulation est le trou symétrique de l'incident Crystal : une résa annulée
-    en cours de window gardait un code fonctionnel car on n'archivait que sur CO passé.
-    On résout la résa Mews via le mapping Duve↔Mews et on révoque si is_cancelled.
-    """
+    """Rows actives à archiver : CO passé OU résa annulée (cross-check Mews).
+    DELETE Sofia device (par extId) + DELETE invitation (par id stocké)."""
     q = f"""
-    WITH cache AS (
-      SELECT duve_reservation_id, pin_value, iseo_lock_tag_id, iseo_guest_tag_id,
-             checkin_date, checkout_date, shadow_mode
-      FROM `{PIN_CACHE_TABLE}`
-      WHERE archived_at IS NULL
-    ),
-    duve_latest AS (
-      SELECT
-        reservation_id AS duve_reservation_id,
-        property_id    AS duve_property_id,
-        (SELECT JSON_VALUE(g, '$.externalId')
-           FROM UNNEST(JSON_QUERY_ARRAY(_raw_payload, '$.resource.guestProfiles')) g
-           WHERE JSON_VALUE(g, '$.isPrimary') = 'true'
-           LIMIT 1)                          AS mews_customer_id,
-        received_at
-      FROM `{RAW_DUVE_CHECKIN_TABLE}`
-      QUALIFY ROW_NUMBER() OVER (PARTITION BY reservation_id ORDER BY received_at DESC) = 1
+    WITH {_DUVE_LATEST_CTE},
+    cache AS (
+      SELECT duve_reservation_id, iseo_invitation_id, checkout_date, shadow_mode
+      FROM `{PIN_CACHE_TABLE}` WHERE archived_at IS NULL
     ),
     mews AS (
       SELECT customer_id, resource_id, is_cancelled, checkin_date AS mews_checkin_date
       FROM `{MEWS_FCT_TABLE}`
     ),
     joined AS (
-      SELECT
-        c.duve_reservation_id, c.pin_value, c.iseo_lock_tag_id, c.iseo_guest_tag_id,
-        c.checkout_date, c.shadow_mode,
-        COALESCE(m.is_cancelled, FALSE) AS is_cancelled
+      SELECT c.duve_reservation_id, c.iseo_invitation_id, c.checkout_date, c.shadow_mode,
+             COALESCE(m.is_cancelled, FALSE) AS is_cancelled
       FROM cache c
       LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
-      LEFT JOIN mews m
-        ON m.customer_id = d.mews_customer_id
-       AND m.resource_id = d.duve_property_id
+      LEFT JOIN mews m ON m.customer_id = d.mews_customer_id
+                      AND m.resource_id = d.duve_property_id
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY c.duve_reservation_id
-        ORDER BY ABS(DATE_DIFF(m.mews_checkin_date, c.checkin_date, DAY)) ASC NULLS LAST
-      ) = 1
+        ORDER BY ABS(DATE_DIFF(m.mews_checkin_date, c.checkout_date, DAY)) ASC NULLS LAST) = 1
     )
-    SELECT
-      duve_reservation_id, pin_value, iseo_lock_tag_id, iseo_guest_tag_id, shadow_mode,
-      CASE WHEN is_cancelled THEN 'cancelled' ELSE 'checkout_passed' END AS archive_reason
+    SELECT duve_reservation_id, iseo_invitation_id, shadow_mode,
+           CASE WHEN is_cancelled THEN 'cancelled' ELSE 'checkout_passed' END AS archive_reason
     FROM joined
-    WHERE checkout_date < CURRENT_DATE()
-       OR is_cancelled
+    WHERE checkout_date < CURRENT_DATE() OR is_cancelled
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
 
-def _mark_recreate_success(duve_resa_id: str) -> None:
-    """Recreate Sofia OK → set recreated_at + clear last_error. Idempotent."""
+# ── State writers ───────────────────────────────────────────────────────────
+
+def _save_provisioned(row: dict, pin_value: str, device_id: int,
+                      inv_id: Optional[int], inv_code: Optional[str],
+                      link: Optional[str], duve_ok: bool) -> None:
     q = f"""
-    UPDATE `{PIN_CACHE_TABLE}`
-    SET recreated_at = CURRENT_TIMESTAMP(),
-        last_error   = NULL
-    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    INSERT INTO `{PIN_CACHE_TABLE}` (
+      duve_reservation_id, mews_reservation_number, apartment_code, pin_value,
+      iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id, iseo_device_id,
+      iseo_invitation_id, invitation_code, invitation_link,
+      checkin_date, checkout_date, cached_at, provisioned_at, duve_pushed_at,
+      shadow_mode)
+    VALUES (@duve, @num, @apt, @pin, @gtag, @lock, @ltag, @dev,
+            @inv, @code, @link, @ci, @co, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(),
+            {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'}, FALSE)
     """
     cfg = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
-    ])
-    _bq().query(q, job_config=cfg).result()
-
-
-def _mark_recreate_error(duve_resa_id: str, error: str) -> None:
-    """Recreate Sofia FAIL → write last_error mais NE TOUCHE PAS recreated_at.
-    Au prochain run, la query `WHERE recreated_at IS NULL` re-sélectionne la résa → auto-retry.
-    """
-    q = f"""
-    UPDATE `{PIN_CACHE_TABLE}`
-    SET last_error = @err
-    WHERE duve_reservation_id = @id AND archived_at IS NULL
-    """
-    cfg = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
-        bigquery.ScalarQueryParameter("err", "STRING", error[:500]),
-    ])
-    _bq().query(q, job_config=cfg).result()
-
-
-def _mark_would(duve_resa_id: str, window_from_ms: Optional[int] = None,
-                window_to_ms: Optional[int] = None, skip_reason: Optional[str] = None) -> None:
-    """Persiste la décision DRY-RUN (observabilité shadow) : ce que l'orchestrateur
-    RECRÉERAIT (window calculée) ou pourquoi il SKIP. Permet de valider la logique
-    de recreate depuis le dashboard avant le cutover, sans toucher Sofia.
-    `would_recreate_at` est set seulement si pas de skip."""
-    q = f"""
-    UPDATE `{PIN_CACHE_TABLE}`
-    SET would_window_from = TIMESTAMP_MILLIS(@from_ms),
-        would_window_to   = TIMESTAMP_MILLIS(@to_ms),
-        would_skip_reason = @skip,
-        would_recreate_at = CASE WHEN @skip IS NULL THEN CURRENT_TIMESTAMP() ELSE NULL END
-    WHERE duve_reservation_id = @id AND archived_at IS NULL
-    """
-    cfg = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
-        bigquery.ScalarQueryParameter("from_ms", "INT64", window_from_ms),
-        bigquery.ScalarQueryParameter("to_ms", "INT64", window_to_ms),
-        bigquery.ScalarQueryParameter("skip", "STRING", skip_reason),
+        bigquery.ScalarQueryParameter("duve", "STRING", row["duve_reservation_id"]),
+        bigquery.ScalarQueryParameter("num", "STRING", row.get("mews_reservation_number")),
+        bigquery.ScalarQueryParameter("apt", "STRING", row.get("apartment_code")),
+        bigquery.ScalarQueryParameter("pin", "STRING", pin_value),
+        bigquery.ScalarQueryParameter("gtag", "INT64", row.get("guest_tag_id")),
+        bigquery.ScalarQueryParameter("lock", "INT64", row.get("lock_id")),
+        bigquery.ScalarQueryParameter("ltag", "INT64", row.get("lock_tag_id")),
+        bigquery.ScalarQueryParameter("dev", "INT64", device_id),
+        bigquery.ScalarQueryParameter("inv", "INT64", inv_id),
+        bigquery.ScalarQueryParameter("code", "STRING", inv_code),
+        bigquery.ScalarQueryParameter("link", "STRING", link),
+        bigquery.ScalarQueryParameter("ci", "DATE", str(row["checkin_date"])),
+        bigquery.ScalarQueryParameter("co", "DATE", str(row["checkout_date"])),
     ])
     _bq().query(q, job_config=cfg).result()
 
@@ -458,8 +319,7 @@ def _mark_would(duve_resa_id: str, window_from_ms: Optional[int] = None,
 def _mark_archived(duve_resa_id: str, error: Optional[str] = None) -> None:
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
-    SET archived_at = CURRENT_TIMESTAMP(),
-        last_error  = @err
+    SET archived_at = CURRENT_TIMESTAMP(), last_error = @err
     WHERE duve_reservation_id = @id AND archived_at IS NULL
     """
     cfg = bigquery.QueryJobConfig(query_parameters=[
@@ -469,6 +329,8 @@ def _mark_archived(duve_resa_id: str, error: Optional[str] = None) -> None:
     _bq().query(q, job_config=cfg).result()
 
 
+# ── Window calc (Paris tz) ────────────────────────────────────────────────────
+
 def _hm_to_min(h: Optional[str]) -> Optional[int]:
     try:
         hh, mm = h[:5].split(":")
@@ -477,272 +339,214 @@ def _hm_to_min(h: Optional[str]) -> Optional[int]:
         return None
 
 
-# Bornes absolues : jamais ouvrir avant 7h, jamais fermer après 23h59.
 WINDOW_FLOOR_CI = "07:00"
 WINDOW_CEIL_CO = "23:59"
 
 
 def _earliest_hour(policy: Optional[str], default: str) -> str:
-    """La plus tôt entre la politique appart et le défaut, plancher 07h."""
-    p = _hm_to_min(policy)
-    d = _hm_to_min(default)
+    p, d = _hm_to_min(policy), _hm_to_min(default)
     chosen = default if p is None else (policy[:5] if p <= d else default)
     return WINDOW_FLOOR_CI if _hm_to_min(chosen) < _hm_to_min(WINDOW_FLOOR_CI) else chosen
 
 
 def _latest_hour(policy: Optional[str], default: str) -> str:
-    """La plus tard entre la politique appart et le défaut, plafond 23h59."""
-    p = _hm_to_min(policy)
-    d = _hm_to_min(default)
+    p, d = _hm_to_min(policy), _hm_to_min(default)
     chosen = default if p is None else (policy[:5] if p >= d else default)
     return WINDOW_CEIL_CO if _hm_to_min(chosen) > _hm_to_min(WINDOW_CEIL_CO) else chosen
 
 
-# ── Window calc (Paris timezone via zoneinfo) ─────────────────────────────────
-
-def _build_window_ms(checkin_date: str, checkout_date: str,
-                     ci_hour: Optional[str], co_hour: Optional[str]) -> tuple[int, int]:
-    """Construit dateInterval ms epoch UTC depuis dates DATE + heures Paris HH:MM."""
-    ci_h, ci_m = ((ci_hour or DEFAULT_CI_HOUR)[:5].split(":") + ["00"])[:2]
-    co_h, co_m = ((co_hour or DEFAULT_CO_HOUR)[:5].split(":") + ["00"])[:2]
-    ci_y, ci_mo, ci_d = (int(x) for x in checkin_date.split("-"))
-    co_y, co_mo, co_d = (int(x) for x in checkout_date.split("-"))
-    ci_dt = datetime(ci_y, ci_mo, ci_d, int(ci_h), int(ci_m), tzinfo=PARIS_TZ)
-    co_dt = datetime(co_y, co_mo, co_d, int(co_h), int(co_m), tzinfo=PARIS_TZ)
+def _build_window_ms(ci_date: str, co_date: str, ci_hour: str, co_hour: str) -> tuple[int, int]:
+    ci_h, ci_m = (ci_hour[:5].split(":") + ["00"])[:2]
+    co_h, co_m = (co_hour[:5].split(":") + ["00"])[:2]
+    cy, cmo, cd = (int(x) for x in ci_date.split("-"))
+    oy, omo, od = (int(x) for x in co_date.split("-"))
+    ci_dt = datetime(cy, cmo, cd, int(ci_h), int(ci_m), tzinfo=PARIS_TZ)
+    co_dt = datetime(oy, omo, od, int(co_h), int(co_m), tzinfo=PARIS_TZ)
     return int(ci_dt.timestamp() * 1000), int(co_dt.timestamp() * 1000)
 
 
-# ── Main recreate logic ───────────────────────────────────────────────────────
+# ── Provision (A→E) ───────────────────────────────────────────────────────────
 
-def _recreate_pin(row: dict, force_replace: bool = False) -> tuple[bool, Optional[str]]:
-    """POST nouveau PIN côté Sofia avec MÊME deviceId + window calculée.
-
-    force_replace=True (passe repost) : supprime le MERVEIL_RESA existant avant de
-    re-poster. Indispensable pour le cas DRIFT (le PIN existe avec une window périmée →
-    un POST simple renverrait 'already present' sans corriger). Sur PHANTOM (PIN absent)
-    le delete est un no-op (404). Le delete n'a lieu qu'après TOUS les skip-checks
-    (whitelist/paiement/dates/shadow) → jamais de suppression sans recréation derrière.
-    """
+def _provision(row: dict) -> tuple[bool, Optional[str]]:
     duve_resa_id = row["duve_reservation_id"]
 
-    # Whitelist
     apt_pid = (row.get("duve_property_id") or "").lower()
     if ALLOWED_PROPERTY_IDS and apt_pid not in ALLOWED_PROPERTY_IDS:
-        logger.info(f"⏭️ {duve_resa_id} hors whitelist property={apt_pid} → skip")
-        _mark_would(duve_resa_id, skip_reason="hors whitelist")
         return False, "skipped: whitelist"
-
-    # Payment-gate : pas de recreate tant que le paiement n'est pas validé (∃ Failed ET
-    # ∄ Charged). Le code reste supprimé = pas d'accès pour un impayé. Re-évalué à chaque
-    # run → recreate dès que le paiement passe. Donnée BQ stabilisée (≤2h, OK à J-7).
+    if row.get("guest_tag_id") is None:
+        return False, "skipped: pas de guest tag pour cet appart (master code couvre)"
+    if row.get("lock_tag_id") is None or row.get("lock_id") is None:
+        return False, "skipped: lock non résolue"
     if row.get("payment_unpaid"):
-        logger.info(f"⛔ {duve_resa_id} paiement non validé → pas de recreate")
-        _mark_would(duve_resa_id, skip_reason="paiement non validé")
-        return False, "payment not validated"
+        return False, "skipped: paiement non validé"
 
-    # Dates : Mews (SoT, rafraîchi 2h) d'abord, fallback cache.
-    ci_date = row.get("mews_checkin_date") or row.get("checkin_date")
-    co_date = row.get("mews_checkout_date") or row.get("checkout_date")
+    ci_date = row.get("checkin_date")
+    co_date = row.get("checkout_date")
     if ci_date is None or co_date is None:
-        _mark_would(duve_resa_id, skip_reason="dates CI/CO manquantes")
         return False, "missing CI/CO date"
-    ci_date_str = ci_date.isoformat() if hasattr(ci_date, "isoformat") else str(ci_date)
-    co_date_str = co_date.isoformat() if hasattr(co_date, "isoformat") else str(co_date)
-
-    # Bornes d'heures : window la plus LARGE entre la politique appart et le standard
-    # (CI 16h / CO 12h). CI = le plus tôt, CO = le plus tard → jamais plus étroit que
-    # le standard, jamais de lockout. On n'utilise PAS l'heure estimée du form (volatile,
-    # cf. incident Crystal). NB : la donnée résa porte souvent CO 11h, mais le standard
-    # réel est 12h → on prend 12h pour ne pas couper l'accès avant le départ.
+    ci_str, co_str = str(ci_date), str(co_date)
     ci_hour = _earliest_hour(row.get("earliest_checkin_hour"), DEFAULT_CI_HOUR)
     co_hour = _latest_hour(row.get("latest_checkout_hour"), DEFAULT_CO_HOUR)
-
-    try:
-        ci_ms, co_ms = _build_window_ms(ci_date_str, co_date_str, ci_hour, co_hour)
-    except Exception as e:
-        _mark_would(duve_resa_id, skip_reason=f"window calc: {e}"[:200])
-        return False, f"window calc failed: {e}"
-
-    # ⚠ Sofia rejette les windows trop dans le passé (dont window.to < now)
+    ci_ms, co_ms = _build_window_ms(ci_str, co_str, ci_hour, co_hour)
     if co_ms < int(time.time() * 1000):
-        _mark_would(duve_resa_id, skip_reason="checkout déjà passé")
-        return False, f"checkout already passed: {co_date_str} {co_hour}"
+        return False, "checkout already passed"
 
-    ext_id = f"MERVEIL_RESA - {duve_resa_id}"
-    payload = {
-        "type": "ISEO_PIN",
-        "deviceId": row["pin_value"],
-        "extId": ext_id,
-        "notes": ext_id,
-        "validationMode": "ONE_HOUR_VALIDATION",
-        "validationPeriod": 24,
-        "additionalCredentialRules": [],
-        "credentialRule": {
-            "name": ext_id,
-            "description": "merveil_dwh_v3",
-            "lockTagIds": [int(row["iseo_lock_tag_id"])],
-            "lockTagMatchingMode": "AT_LEAST_ONE_TAG",
-            "guestTagIds": [int(row["iseo_guest_tag_id"])],
-            "guestTagMatchingMode": "EVERY_TAG",
-            "daysOfTheWeek": [1, 2, 3, 4, 5, 6, 7],
-            "dateInterval": {"from": ci_ms, "to": co_ms},
-            "timeInterval": {"from": 0, "to": 86340},
-            "alwaysOpen": False, "holidays": True, "openOnPrivacy": False,
-        },
-    }
+    win = {"from": ci_ms, "to": co_ms}
+    pin_ext = f"MERVEIL_RESA - {duve_resa_id}"
+    inv_ext = f"MERVEIL_INV - {duve_resa_id}"
 
     logger.info(
-        f"→ recreate {duve_resa_id} deviceId={row['pin_value']} "
+        f"→ provision {duve_resa_id} ({row.get('apartment_code')}) "
         f"window={datetime.fromtimestamp(ci_ms/1000, timezone.utc).isoformat()} → "
-        f"{datetime.fromtimestamp(co_ms/1000, timezone.utc).isoformat()}"
-    )
+        f"{datetime.fromtimestamp(co_ms/1000, timezone.utc).isoformat()}")
 
-    # Persiste la window dry-run (observabilité shadow ET prod) avant tout POST.
-    _mark_would(duve_resa_id, window_from_ms=ci_ms, window_to_ms=co_ms)
-
-    # Shadow effectif PAR RÉSA : kill-switch global OU la capture était en shadow
-    # (= le PIN Duve n'a pas été supprimé → recréer ferait doublon). Seules les résa
-    # captées en prod (shadow_mode=false) déclenchent un vrai POST.
-    if ISEO_SHADOW_MODE or bool(row.get("shadow_mode")):
-        logger.info(f"🌗 SHADOW (résa {duve_resa_id}): POST Sofia skipped")
+    if ISEO_SHADOW_MODE:
+        logger.info(f"🌗 SHADOW {duve_resa_id}: would provision (skip Sofia/Duve/state)")
         return True, None
 
-    # Repost : supprimer le MERVEIL_RESA périmé avant de recréer (no-op si déjà absent).
-    if force_replace:
-        g = _sofia("GET", f"/api/v2/standardDevices/extId/{ext_id}")
-        if g.status_code == 200:
-            old_id = g.json().get("id")
-            rdel = _sofia("DELETE", f"/api/v2/standardDevices/{old_id}")
-            logger.info(f"♻️ repost {duve_resa_id}: deleted stale PIN id={old_id} (HTTP {rdel.status_code})")
-        elif g.status_code != 404:
-            logger.warning(f"⚠️ repost {duve_resa_id}: GET avant delete HTTP {g.status_code} — POST quand même")
+    # A+B. device (get-or-create par extId → idempotent sur retry partiel)
+    pin_value, device_id = _get_or_create_device(row, pin_ext, win)
+    if pin_value is None:
+        return False, f"device creation failed: {device_id}"  # device_id porte l'erreur
 
-    r = _sofia("POST", "/api/v2/standardDevices", json_body=payload)
+    # C. invitation (get-or-create)
+    inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
+    link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
+
+    # D. Duve push (code clavier + lien)
+    duve_ok, duve_err = _duve_push(duve_resa_id, pin_value, link or "")
+    if not duve_ok:
+        logger.warning(f"⚠️ Duve push failed for {duve_resa_id}: {duve_err}")
+
+    # E. état
+    _save_provisioned(row, pin_value, device_id, inv_id, inv_code, link, duve_ok)
+    if not duve_ok:
+        return False, f"Sofia OK mais Duve KO: {duve_err}"
+    return True, None
+
+
+def _get_or_create_device(row: dict, pin_ext: str, win: dict) -> tuple[Optional[str], object]:
+    """Retourne (pin_value, device_id). Réutilise le device existant (même extId)
+    s'il existe (retry partiel). Sinon génère un code 4 chiffres unique."""
+    g = _sofia("GET", f"/api/v2/standardDevices/extId/{pin_ext}")
+    if g.status_code == 200:
+        d = g.json()
+        return str(d.get("deviceId")), d.get("id")
+
+    payload = {
+        "type": "ISEO_PIN", "extId": pin_ext, "notes": pin_ext,
+        "validationMode": "ONE_HOUR_VALIDATION", "validationPeriod": 24,
+        "additionalCredentialRules": [],
+        "credentialRule": {
+            "name": pin_ext, "description": "merveil_dwh_v3",
+            "lockTagIds": [int(row["lock_tag_id"])], "lockTagMatchingMode": "AT_LEAST_ONE_TAG",
+            "guestTagIds": [int(row["guest_tag_id"])], "guestTagMatchingMode": "EVERY_TAG",
+            "daysOfTheWeek": [1, 2, 3, 4, 5, 6, 7],
+            "dateInterval": win, "timeInterval": {"from": 0, "to": 86340},
+            "alwaysOpen": False, "holidays": True, "openOnPrivacy": False},
+    }
+    last_err = None
+    for _ in range(PIN_COLLISION_RETRIES):
+        pin_value = f"{random.randint(0, 9999):04d}"
+        payload["deviceId"] = pin_value
+        r = _sofia("POST", "/api/v2/standardDevices", json_body=payload)
+        if r.status_code in (200, 201):
+            logger.info(f"✅ device créé id={r.json().get('id')} PIN={pin_value}")
+            return pin_value, r.json().get("id")
+        if "already present" in r.text.lower():
+            last_err = "code collision"
+            continue
+        return None, f"HTTP {r.status_code}: {r.text[:200]}"
+    return None, last_err or "no free PIN"
+
+
+def _get_or_create_invitation(row: dict, inv_ext: str, win: dict) -> tuple[Optional[int], Optional[str]]:
+    g = _sofia("GET", f"/api/v2/invitations/extId/{inv_ext}")
+    if g.status_code == 200:
+        d = g.json()
+        return d.get("id"), d.get("code")
+    r = _sofia("POST", "/api/v2/invitations", json_body={
+        "name": inv_ext, "extId": inv_ext, "smartLockIds": [int(row["lock_id"])],
+        "daysOfTheWeek": [1, 2, 3, 4, 5, 6, 7],
+        "dateInterval": win, "timeInterval": {"from": 0, "to": 86340},
+        "numberOfDevices": 0})
     if r.status_code in (200, 201):
-        new_pin = r.json()
-        logger.info(f"✅ Recreated PIN id={new_pin.get('id')} for {duve_resa_id}")
-        return True, None
-    # "already present" est AMBIGU :
-    #  (a) notre propre MERVEIL_RESA existe déjà → vrai retry idempotent (OK) ;
-    #  (b) la VALEUR du code (deviceId) est déjà prise par un AUTRE credential
-    #      (autre appart / DUVE_PIN concurrent) → collision réelle : notre serrure
-    #      n'a PAS le code, le guest est locked out. Le marquer "succès" poserait
-    #      recreated_at et ne retenterait jamais (bug). On lève l'ambiguïté en
-    #      vérifiant que NOTRE extId existe avec NOTRE deviceId.
-    if "already present" in r.text.lower():
-        g = _sofia("GET", f"/api/v2/standardDevices/extId/{ext_id}")
-        if g.status_code == 200 and str(g.json().get("deviceId")) == str(row["pin_value"]):
-            logger.info(f"ℹ️ PIN MERVEIL_RESA déjà présent pour {duve_resa_id} (retry idempotent)")
-            return True, None
-        logger.error(
-            f"⛔ {duve_resa_id}: collision code deviceId={row['pin_value']} déjà utilisé par "
-            f"un autre credential (notre extId GET HTTP {g.status_code}) — guest sans code."
-        )
-        return False, f"code collision: deviceId {row['pin_value']} already used by another credential"
-    return False, f"HTTP {r.status_code}: {r.text[:300]}"
+        d = r.json()
+        logger.info(f"✅ invitation id={d.get('id')} code={d.get('code')}")
+        return d.get("id"), d.get("code")
+    logger.warning(f"⚠️ invitation KO {inv_ext}: HTTP {r.status_code} {r.text[:200]}")
+    return None, None
 
 
-def _archive_pin(row: dict) -> tuple[bool, Optional[str]]:
-    """DELETE le PIN côté Sofia (search by extId = MERVEIL_RESA - <id>) puis flag archived."""
+def _archive(row: dict) -> tuple[bool, Optional[str]]:
+    """DELETE Sofia device (par extId) + DELETE invitation (par id). Pas de user."""
     duve_resa_id = row["duve_reservation_id"]
-    ext_id = f"MERVEIL_RESA - {duve_resa_id}"
-
-    # Per-résa : on ne DELETE Sofia que pour les résa captées en prod (shadow_mode=false).
-    # Les résa shadow n'ont jamais eu de MERVEIL_RESA créé → rien à supprimer.
     if ISEO_SHADOW_MODE or bool(row.get("shadow_mode")):
-        logger.info(f"🌗 SHADOW (résa {duve_resa_id}): DELETE Sofia skipped (archive)")
+        logger.info(f"🌗 SHADOW {duve_resa_id}: archive skipped")
         return True, None
 
-    # GET pour obtenir id
-    r = _sofia("GET", f"/api/v2/standardDevices/extId/{ext_id}")
-    if r.status_code == 404:
-        logger.info(f"ℹ️ {duve_resa_id}: pas de PIN MERVEIL_RESA côté Sofia (déjà delete?) → archive direct")
-        return True, None
-    if r.status_code != 200:
-        return False, f"GET HTTP {r.status_code}: {r.text[:200]}"
-    sid = r.json().get("id")
-    rdel = _sofia("DELETE", f"/api/v2/standardDevices/{sid}")
-    if rdel.status_code in (200, 204):
-        logger.info(f"🗑️ Archived {duve_resa_id} (deleted Sofia id={sid})")
-        return True, None
-    return False, f"DELETE HTTP {rdel.status_code}: {rdel.text[:200]}"
+    errs = []
+    # device
+    g = _sofia("GET", f"/api/v2/standardDevices/extId/MERVEIL_RESA - {duve_resa_id}")
+    if g.status_code == 200:
+        sid = g.json().get("id")
+        rd = _sofia("DELETE", f"/api/v2/standardDevices/{sid}")
+        if rd.status_code not in (200, 204):
+            errs.append(f"device DELETE {rd.status_code}")
+    elif g.status_code != 404:
+        errs.append(f"device GET {g.status_code}")
+    # invitation
+    inv_id = row.get("iseo_invitation_id")
+    if inv_id:
+        ri = _sofia("DELETE", f"/api/v2/invitations/{int(inv_id)}")
+        if ri.status_code not in (200, 204, 404):
+            errs.append(f"inv DELETE {ri.status_code}")
+    if errs:
+        return False, "; ".join(errs)
+    logger.info(f"🗑️ archived {duve_resa_id} ({row.get('archive_reason')})")
+    return True, None
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run() -> None:
     logger.info("=" * 70)
-    logger.info(
-        f"🚀 ISEO Orchestrator (shadow={ISEO_SHADOW_MODE}, whitelist={len(ALLOWED_PROPERTY_IDS)} property_ids)"
-    )
+    logger.info(f"🚀 ISEO Orchestrator V3 (shadow={ISEO_SHADOW_MODE}, "
+                f"whitelist={len(ALLOWED_PROPERTY_IDS)} property_ids)")
     logger.info("=" * 70)
 
-    # ── 1. Recreate à J-7 (résa à venir dans les 7 prochains jours) ─────────
-    to_recreate = _resa_to_recreate()
-    logger.info(f"📋 {len(to_recreate)} résa(s) à recréer (CI dans 0-{LOOKAHEAD_DAYS}j)")
-
+    to_provision = _resa_to_provision()
+    logger.info(f"📋 {len(to_provision)} résa(s) à provisionner (CI dans 0-{LOOKAHEAD_DAYS}j, pas encore couvertes)")
     ok = fail = 0
-    for row in to_recreate:
-        success, err = _recreate_pin(row)
+    for row in to_provision:
+        try:
+            success, err = _provision(row)
+        except Exception as e:
+            success, err = False, f"exception: {e}"
         if success:
-            try:
-                if not (ISEO_SHADOW_MODE or bool(row.get("shadow_mode"))):
-                    _mark_recreate_success(row["duve_reservation_id"])
-                else:
-                    logger.info(f"🌗 cache.recreated_at update skipped (shadow résa)")
-            except Exception as e:
-                logger.warning(f"⚠️ cache update failed for {row['duve_reservation_id']}: {e}")
             ok += 1
         else:
-            try:
-                _mark_recreate_error(row["duve_reservation_id"], err)
-            except Exception:
-                pass
-            logger.warning(f"⚠️ recreate failed for {row['duve_reservation_id']}: {err}")
             fail += 1
+            if not str(err).startswith("skipped"):
+                logger.warning(f"⚠️ provision failed {row['duve_reservation_id']}: {err}")
 
-    # ── 2. Repost (PIN disparu/dérivé côté Sofia malgré recreated_at) ───────
-    # Cf. backlog #3 : un PIN supprimé/dérivé après recreate n'était jamais corrigé.
-    to_repost = _resa_to_repost()
-    logger.info(f"♻️ {len(to_repost)} résa(s) à re-poster (PIN absent ou window dérivée)")
-    repost_ok = repost_fail = 0
-    for row in to_repost:
-        success, err = _recreate_pin(row, force_replace=True)
-        if success:
-            try:
-                if not (ISEO_SHADOW_MODE or bool(row.get("shadow_mode"))):
-                    _mark_recreate_success(row["duve_reservation_id"])
-            except Exception as e:
-                logger.warning(f"⚠️ cache update (repost) failed for {row['duve_reservation_id']}: {e}")
-            repost_ok += 1
-        else:
-            try:
-                _mark_recreate_error(row["duve_reservation_id"], err)
-            except Exception:
-                pass
-            logger.warning(f"⚠️ repost failed for {row['duve_reservation_id']}: {err}")
-            repost_fail += 1
-
-    # ── 3. Archive (checkout passé) ─────────────────────────────────────────
     to_archive = _resa_to_archive()
     logger.info(f"🗑️ {len(to_archive)} résa(s) à archiver (CO passé ou annulée)")
     archived = 0
     for row in to_archive:
-        success, err = _archive_pin(row)
+        try:
+            success, err = _archive(row)
+        except Exception as e:
+            success, err = False, f"exception: {e}"
         if success:
-            # En shadow mode, on archive aussi côté BQ pour éviter l'accumulation
-            # de rows expirées (le DELETE Sofia reste skipped via _archive_pin).
             try:
                 _mark_archived(row["duve_reservation_id"])
                 archived += 1
             except Exception as e:
-                logger.warning(f"⚠️ archive update failed for {row['duve_reservation_id']}: {e}")
+                logger.warning(f"⚠️ archive state update failed {row['duve_reservation_id']}: {e}")
         else:
-            logger.warning(f"⚠️ archive failed for {row['duve_reservation_id']}: {err}")
+            logger.warning(f"⚠️ archive failed {row['duve_reservation_id']}: {err}")
 
     logger.info("=" * 70)
-    logger.info(
-        f"DONE — recreate ok={ok} fail={fail} | "
-        f"repost ok={repost_ok} fail={repost_fail} | archived={archived}"
-    )
+    logger.info(f"DONE — provision ok={ok} fail/skip={fail} | archived={archived}")
     logger.info("=" * 70)

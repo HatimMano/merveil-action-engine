@@ -27,27 +27,31 @@ persistant génère une ligne fraîche par jour donc reste capté ; borne ≤ TT
 ### Mode `cancellations_brief` (2026-05-23)
 Mail récap quotidien envoyé à 11h Paris à `alerte_ventes@archides.fr` + `emilia@archides.fr` (override via env `CANCELLATIONS_TO`). Ne passe **pas** par le dispatcher trigger/action — c'est un rapport, pas un événement déclencheur. Query directe sur `dashboard_ops.dash_ops_cancellations_recent` filtré sur `cancelled_at >= NOW() - 24h`. HTML minimaliste (KPIs + table compacte) avec bouton `Voir le détail dans le dashboard →` qui pointe vers `https://direction.archides.fr/ops-front?tab=cancellations&preset=24h`. Reuse infra Gmail API (secret `alerts-gmail-sa-key` + Domain-Wide Delegation existante).
 
-### Mode `iseo_orchestrator` (2026-06-08) — Pipeline V3 ISEO
-Cf. [[project_iseo_integration_2026]] section "Architecture V3".
+### Mode `iseo_orchestrator` — Pipeline V3 100% DWH (refonte 2026-06-20, natif coupé)
+Cf. [[project_iseo_integration_2026]] + `Archides/to_do_20_06.md`.
 
-Le mode lit `iseo_raw.merveil_pin_cache` (alimentée par `webhook-gateway/src/core/iseo_pin_cacher.py` au pre-checkin done) + JOIN `raw_duve.checkin_events` pour les heures CI/CO live + JOIN `stg_iseo__smart_locks` pour les tags. Pour chaque résa où `checkin_date ∈ [today, today+7j]` ET `recreated_at IS NULL` :
-- Calcule la window cible `[CI + estimated_checkin_time Paris, CO + estimated_checkout_time Paris]` (fallback 16h/11h). Heure d'été/hiver gérée.
-- POST Sofia `/api/v2/standardDevices` avec MÊME `deviceId` (= pin_value capturé), extId `MERVEIL_RESA - <duve_id>`. Réutilise `iseo_user_id` + `iseo_guest_tag_id` + `iseo_lock_tag_id` de la cache.
-- UPDATE cache `recreated_at = NOW()`. Sur erreur Sofia → `last_error` + flag visible dans dashboard.
+⚠️ **Refonte majeure 2026-06-20** : l'intégration native Duve↔Sofia est **coupée dans les 2 sens** (création Duve→Sofia + livraison Sofia→Duve). Le DWH est **seul maître** du cycle PIN. **Le cacher `webhook-gateway/iseo_pin_cacher.py` est retiré** (plus de `DUVE_PIN` à capturer). L'ancienne logique capture/recreate + PHANTOM/DRIFT est **supprimée**.
 
-Cycle archive : `WHERE (checkout_date < today OR résa annulée) AND archived_at IS NULL` → DELETE Sofia + flag `archived_at`.
+**Provision (J-7)** — `_resa_to_provision()` : résas Mews non annulées, payées, `checkin_date ∈ [today, today+7j]`, CO futur, **pas déjà couvertes par une row de cache active** (`archived_at IS NULL`). Pour chacune (`_provision`) :
+- **A.** génère un code PIN **4 chiffres** unique account-wide (retry sur `already present`).
+- **B.** `POST /api/v2/standardDevices` (extId `MERVEIL_RESA - <duve_id>`) — **réutilise le guest tag + lock tag de l'appart** (PAS de création user/tag par résa). Window = heures de politique appart (floor 7h / ceil 23h59), tz Paris.
+- **C.** `POST /api/v2/invitations` (extId `MERVEIL_INV - <duve_id>`, `smartLockIds=[lock_id]`, `numberOfDevices:0`) → `code` → lien `https://archides.jago.cloud/remoteOpen?code=<code>` (⚠️ host `archides`, PAS le `api-archides` renvoyé par l'API). Lien gated sur la window (OK pendant le séjour).
+- **D.** `POST` intégration entrante Duve (`DUVE_CONNECT_URL?pid=DUVE_CONNECT_PID`, secret `duve-connect-token`) : `primaryCode` (code clavier) + champ `merveil_paris_iseo_access_link_eIhhEnlspM` (lien). N'émet aucun message (messages auto Duve lisent le champ).
+- **E.** INSERT état dans `iseo_raw.merveil_pin_cache` (colonnes `iseo_device_id`, `iseo_invitation_id`, `invitation_code/link`, `provisioned_at`, `duve_pushed_at`). Device + invitation sont **get-or-create par extId** → idempotent sur retry partiel.
 
-**Passe repost (2026-06-18, backlog #3)** — entre recreate et archive. `_resa_to_repost()` sélectionne les rows déjà recréées (`recreated_at IS NOT NULL`, non archivées, CO futur, non shadow) et JOIN le dernier `iseo_raw.raw_standard_devices_snapshot` → re-poste celles dont le MERVEIL_RESA est **absent** (PHANTOM) ou **window dérivée** (DRIFT vs CI/CO Mews). `_recreate_pin(force_replace=True)` fait **delete-before-post** (delete uniquement après les skip-checks). Couvre le cas « PIN supprimé après recreate » (incident natif) que le filtre `recreated_at IS NULL` du recreate laissait sans correction. ⚠ « already present » au POST = collision de code (DUVE_PIN natif concurrent, coexistence) → PHANTOM persiste, repost retente (bénin). Cf. ADR 2026-06-18.
+**Résolution ids appart (JOIN BQ, pas de seed)** : `duve property_id (GUID) == Mews resource_id == nom du lock tag`. → `lock_id` + `lock_tag_id` via `stg_iseo__smart_locks` ; `guest_tag_id` = guest tag le plus fréquent des PINs existants de l'appart (`stg_iseo__standard_devices.rule_guest_tags_ids`). Si pas de guest tag (appart neuf) → skip (master code couvre).
 
-**Mapping Duve↔Mews + refresh Mews (2026-06-13)** — l'orchestrateur ne se fie plus au webhook Duve figé. Le payload Duve embarque les ids Mews : `guestProfiles[isPrimary].externalId = customer_id`, `externalPropertyId (= property_id) = resource_id`. `_resa_to_recreate` et `_resa_to_archive` JOIN `marts.fct_reservations` (env `MEWS_FCT_TABLE`) sur `customer_id + resource_id` (résa Mews dont le CI est le plus proche du CI cache) pour : (1) **refresh dates** (Mews SoT, pollé 2h) ; (2) **skip les annulées** au recreate + **les archiver** (DELETE Sofia, skip shadow) — comble le trou « résa annulée en cours de window garde un code » ; (3) **bornes window = heures de politique appart** (`earliest_checkin_hour`/`latest_checkout_hour`) et non l'heure estimée du form (volatile → lockout à l'arrivée, cf. incident Crystal Balcom). Cf. ADR `Archides/docs/decisions.md` 2026-06-13.
+**Archive** — `_resa_to_archive()` : rows actives où CO passé OU résa annulée (cross-check Mews). `_archive` : `DELETE /standardDevices/{id}` (par extId) + `DELETE /invitations/{id}`. **Pas de user à supprimer** (on réutilise le user d'appart partagé → pas de fuite quota).
 
-**Mode shadow** (`ISEO_SHADOW_MODE=true`) : log "would POST" sans appeler Sofia. Activé au boot pour validation 1 semaine avant cutover.
+**Mapping Duve↔Mews** : payload checkin Duve embarque `guestProfiles[isPrimary].externalId = customer_id` ; JOIN `fct_reservations` sur `customer_id + resource_id` (résa au CI le plus proche). Skip annulées au provision + archive.
 
-**Whitelist** (`ISEO_ALLOWED_PROPERTY_IDS=csv`) : skip les résa hors whitelist. Au démarrage prod : `c12a7244-f97b-4633-b6a7-b16f0079821c` (= P02-DAL40-1D uniquement).
+**Mode shadow** (`ISEO_SHADOW_MODE=true`) : log "would provision" sans appel Sofia/Duve ni écriture d'état.
 
-**Secrets requis** : `ISEO_MANAGER_USERNAME` + `ISEO_MANAGER_PASSWORD` (mountés via Secret Manager dans `deploy.sh`). Le SA `action-engine-sa` a `roles/secretmanager.secretAccessor` project-wide, pas besoin d'IAM additionnel.
+**Whitelist** (`ISEO_ALLOWED_PROPERTY_IDS=csv de GUID`) : **cutover = DAL40 seul** (`c12a7244…`). Liste des 13 apparts à ré-activer en commentaire dans `deploy.sh`.
 
-**Test local** : `gcloud run jobs execute merveil-action-engine-iseo --region=europe-west1 --project=merveil-data-warehouse --wait`. Pour forcer le pickup d'une résa qui dépasse 7j (test) : `gcloud run jobs update merveil-action-engine-iseo --update-env-vars ISEO_LOOKAHEAD_DAYS=400`.
+**Secrets requis** : `ISEO_MANAGER_USERNAME` + `ISEO_MANAGER_PASSWORD` + `DUVE_CONNECT_TOKEN` (=`duve-connect-token`). Env : `DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18`. SA `action-engine-sa` a `secretAccessor` project-wide.
+
+**Test local** : `gcloud run jobs execute merveil-action-engine-iseo --region=europe-west1 --project=merveil-data-warehouse --wait`. Forcer une résa >7j : `--update-env-vars ISEO_LOOKAHEAD_DAYS=400`.
 
 ## Execution Flow
 ```
