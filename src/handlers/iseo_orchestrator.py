@@ -33,16 +33,20 @@ Modes :
 Trigger : Cloud Run Job `merveil-action-engine-iseo` (scheduler 2h à :45).
 """
 
+import base64
 import logging
 import os
 import random
 import time
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
-from google.cloud import bigquery
+from google.cloud import bigquery, secretmanager
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 logger = logging.getLogger(__name__)
@@ -84,10 +88,21 @@ ALLOWED_PROPERTY_IDS = {
     if pid.strip()
 }
 
+# Alerting mail (réutilise l'infra Gmail API du service — secret alerts-gmail-sa-key
+# lu via Secret Manager + Domain-Wide Delegation, comme cancellations_brief).
+GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@archides.fr")
+ISEO_ALERT_TO = os.getenv("ISEO_ALERT_TO", "hatim@archides.fr")
+
 LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "7"))
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "16:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "12:00")
 PIN_COLLISION_RETRIES = 8
+# Guest tag de repli quand un appart n'a aucun PIN existant d'où dériver son tag.
+# 132094 = tag "Merveil guest" déjà partagé cross-apparts ; le credentialRule scope
+# par lockTagIds donc un guest tag partagé + le lock tag de l'appart suffit.
+DEFAULT_GUEST_TAG_ID = (
+    int(os.environ["ISEO_DEFAULT_GUEST_TAG_ID"])
+    if os.environ.get("ISEO_DEFAULT_GUEST_TAG_ID") else None)
 
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
@@ -140,6 +155,26 @@ def _duve_push(duve_resa_id: str, code: str, link: str) -> tuple[bool, Optional[
     if r.status_code == 200:
         return True, None
     return False, f"Duve HTTP {r.status_code}: {r.text[:200]}"
+
+
+def _send_alert(subject: str, body: str) -> None:
+    """Envoie un mail d'alerte (best-effort — ne fait jamais planter le job)."""
+    try:
+        name = f"projects/{PROJECT_ID}/secrets/alerts-gmail-sa-key/versions/latest"
+        sa_info = secretmanager.SecretManagerServiceClient().access_secret_version(
+            name=name).payload.data.decode()
+        import json as _json
+        creds = service_account.Credentials.from_service_account_info(
+            _json.loads(sa_info), scopes=["https://www.googleapis.com/auth/gmail.send"]
+        ).with_subject(GMAIL_SENDER)
+        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["From"], msg["To"], msg["Subject"] = GMAIL_SENDER, ISEO_ALERT_TO, subject
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        svc.users().messages().send(userId=GMAIL_SENDER, body={"raw": raw}).execute()
+        logger.info(f"📧 alerte envoyée à {ISEO_ALERT_TO}: {subject}")
+    except Exception as e:
+        logger.error(f"⚠️ envoi alerte échoué: {e}")
 
 
 # ── BigQuery ──────────────────────────────────────────────────────────────────
@@ -315,6 +350,27 @@ def _save_provisioned(row: dict, pin_value: str, device_id: int,
         bigquery.ScalarQueryParameter("co", "DATE", str(row["checkout_date"])),
     ])
     _bq().query(q, job_config=cfg).result()
+
+
+def _resa_duve_retry() -> list[dict]:
+    """Rows provisionnées côté Sofia mais dont le push Duve a échoué
+    (`duve_pushed_at IS NULL`) → à re-pousser (code + lien déjà en cache)."""
+    q = f"""
+    SELECT duve_reservation_id, pin_value, invitation_link
+    FROM `{PIN_CACHE_TABLE}`
+    WHERE archived_at IS NULL AND provisioned_at IS NOT NULL AND duve_pushed_at IS NULL
+    """
+    return [dict(r.items()) for r in _bq().query(q).result()]
+
+
+def _mark_duve_pushed(duve_resa_id: str) -> None:
+    q = f"""
+    UPDATE `{PIN_CACHE_TABLE}`
+    SET duve_pushed_at = CURRENT_TIMESTAMP(), last_error = NULL
+    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    """
+    _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id)])).result()
 
 
 def _mark_archived(duve_resa_id: str, error: Optional[str] = None) -> None:
@@ -511,14 +567,26 @@ def _archive(row: dict) -> tuple[bool, Optional[str]]:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run() -> None:
+    """Wrapper : tout crash → alerte mail + exit non-zero (visible Cloud Run)."""
+    try:
+        _run_inner()
+    except Exception as e:
+        logger.critical(f"🔴 ISEO orchestrator CRASH: {e}")
+        _send_alert("🔴 ISEO orchestrator — CRASH", f"Le job a planté.\n\nException : {e}")
+        raise
+
+
+def _run_inner() -> None:
     logger.info("=" * 70)
     logger.info(f"🚀 ISEO Orchestrator V3 (shadow={ISEO_SHADOW_MODE}, "
                 f"whitelist={len(ALLOWED_PROPERTY_IDS)} property_ids)")
     logger.info("=" * 70)
+    errors: list[str] = []
 
+    # 1. Provision (J-7)
     to_provision = _resa_to_provision()
     logger.info(f"📋 {len(to_provision)} résa(s) à provisionner (CI dans 0-{LOOKAHEAD_DAYS}j, pas encore couvertes)")
-    ok = fail = 0
+    ok = skip = 0
     for row in to_provision:
         try:
             success, err = _provision(row)
@@ -526,11 +594,25 @@ def run() -> None:
             success, err = False, f"exception: {e}"
         if success:
             ok += 1
+        elif str(err).startswith("skipped"):
+            skip += 1
         else:
-            fail += 1
-            if not str(err).startswith("skipped"):
-                logger.warning(f"⚠️ provision failed {row['duve_reservation_id']}: {err}")
+            logger.warning(f"⚠️ provision failed {row['duve_reservation_id']}: {err}")
+            errors.append(f"provision {row['duve_reservation_id']} ({row.get('apartment_code')}): {err}")
 
+    # 2. Retry du push Duve (Sofia OK mais Duve KO à un run précédent)
+    retry = 0
+    if not ISEO_SHADOW_MODE:
+        for row in _resa_duve_retry():
+            done, err = _duve_push(row["duve_reservation_id"], row.get("pin_value") or "",
+                                   row.get("invitation_link") or "")
+            if done:
+                _mark_duve_pushed(row["duve_reservation_id"])
+                retry += 1
+            else:
+                errors.append(f"duve-retry {row['duve_reservation_id']}: {err}")
+
+    # 3. Archive (CO passé / annulée)
     to_archive = _resa_to_archive()
     logger.info(f"🗑️ {len(to_archive)} résa(s) à archiver (CO passé ou annulée)")
     archived = 0
@@ -544,10 +626,17 @@ def run() -> None:
                 _mark_archived(row["duve_reservation_id"])
                 archived += 1
             except Exception as e:
-                logger.warning(f"⚠️ archive state update failed {row['duve_reservation_id']}: {e}")
+                errors.append(f"archive state {row['duve_reservation_id']}: {e}")
         else:
-            logger.warning(f"⚠️ archive failed {row['duve_reservation_id']}: {err}")
+            errors.append(f"archive {row['duve_reservation_id']}: {err}")
 
     logger.info("=" * 70)
-    logger.info(f"DONE — provision ok={ok} fail/skip={fail} | archived={archived}")
+    logger.info(f"DONE — provision ok={ok} skip={skip} | duve-retry={retry} | "
+                f"archived={archived} | erreurs={len(errors)}")
     logger.info("=" * 70)
+
+    if errors:
+        body = (f"{len(errors)} erreur(s) sur le run ISEO orchestrator "
+                f"(provision ok={ok}, duve-retry={retry}, archived={archived}) :\n\n"
+                + "\n".join(f"• {e}" for e in errors[:50]))
+        _send_alert(f"⚠️ ISEO orchestrator — {len(errors)} erreur(s)", body)
