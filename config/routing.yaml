@@ -200,14 +200,6 @@ triggers:
       - type: email_digest
         bucket: 2h
 
-  # Écart critique cache BQ ↔ Sofia (MISSING_RECREATE = guest sans code, PHANTOM_DWH,
-  # DUPLICATE_SOFIA). Avant : visible seulement dans le tab 7.8. Bucket 2h, latence ≤2h.
-  iseo_reconciliation:
-    enabled: true
-    actions:
-      - type: email_digest
-        bucket: 2h
-
   # ── Désactivés ────────────────────────────────────────────────────────────
   client_risk:
     enabled: false   # legacy disabled (clients_at_risk hors UNION dash_alerts)

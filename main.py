@@ -32,9 +32,9 @@ if __name__ == "__main__":
             from src.handlers.cancellations_brief import run as run_cancellations_brief
             run_cancellations_brief()
         elif FREQ == "iseo_orchestrator":
-            # Mode standalone : recreate PINs côté Sofia à J-7 du CI (pipeline V3).
-            # Lit iseo_raw.merveil_pin_cache + raw_duve.checkin_events, POST Sofia.
-            # Indépendant du dispatcher trigger/action.
+            # Mode standalone : pipeline V3 100% DWH (natif coupé). Provisionne les
+            # PINs Sofia à J-7 (POST device + invitation + push Duve), resync le drift
+            # de dates, archive après CO/annulation. Indépendant du dispatcher.
             from src.handlers.iseo_orchestrator import run as run_iseo_orchestrator
             run_iseo_orchestrator()
         else:

@@ -41,6 +41,8 @@ Cf. [[project_iseo_integration_2026]] + `Archides/to_do_20_06.md`.
 
 **Résolution ids appart (JOIN BQ, pas de seed)** : `duve property_id (GUID) == Mews resource_id == nom du lock tag`. → `lock_id` + `lock_tag_id` via `stg_iseo__smart_locks` ; `guest_tag_id` = guest tag le plus fréquent des PINs existants de l'appart (`stg_iseo__standard_devices.rule_guest_tags_ids`). Si pas de guest tag (appart neuf) → skip (master code couvre).
 
+**Resync drift de dates (2026-06-20)** — `_resa_to_resync()` : rows actives dont la window cache (= dates Mews au provision) ≠ dates live `fct_reservations` (séjour étendu/raccourci/décalé après provision). `_resync` : `DELETE` device+invitation puis re-`POST` avec la window live + **le MÊME code PIN** (réutilisé via `_post_device(pin_value=…)`, libéré par le DELETE) ; le lien remote-open change (nouvelle invitation) → re-push Duve. UPDATE l'état cache (CI/CO + ids + `provisioned_at`). Sans ça, une extension de séjour = guest lockout sur les nuits ajoutées (master couvre, dégradé).
+
 **Archive** — `_resa_to_archive()` : rows actives où CO passé OU résa annulée (cross-check Mews). `_archive` : `DELETE /standardDevices/{id}` (par extId) + `DELETE /invitations/{id}`. **Pas de user à supprimer** (on réutilise le user d'appart partagé → pas de fuite quota).
 
 **Mapping Duve↔Mews** : payload checkin Duve embarque `guestProfiles[isPrimary].externalId = customer_id` ; JOIN `fct_reservations` sur `customer_id + resource_id` (résa au CI le plus proche). Skip annulées au provision + archive.
@@ -50,6 +52,14 @@ Cf. [[project_iseo_integration_2026]] + `Archides/to_do_20_06.md`.
 **Whitelist** (`ISEO_ALLOWED_PROPERTY_IDS=csv de GUID`) : **cutover = DAL40 seul** (`c12a7244…`). Liste des 13 apparts à ré-activer en commentaire dans `deploy.sh`.
 
 **Secrets requis** : `ISEO_MANAGER_USERNAME` + `ISEO_MANAGER_PASSWORD` + `DUVE_CONNECT_TOKEN` (=`duve-connect-token`). Env : `DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18`. SA `action-engine-sa` a `secretAccessor` project-wide.
+
+**Retry Duve** (`_resa_duve_retry`) : à chaque run, re-pousse Duve pour les rows `provisioned_at IS NOT NULL AND duve_pushed_at IS NULL` (Sofia OK mais Duve KO à un run précédent) — code + lien lus depuis la cache, sans rappel Sofia.
+
+**Alerting** : `run()` est un wrapper qui envoie un **mail** (`ISEO_ALERT_TO`, infra Gmail `alerts-gmail-sa-key` via Secret Manager + DWD) — récap si ≥1 erreur (provision/retry/archive), CRASH + exit non-zero si exception. ⚠️ délimiteur env `^;^` dans `deploy.sh` (les emails contiennent `@`).
+
+**État cutover (20/06)** : live sur **5 apparts AVEC guest tag** (OUR12-1D, TBG52-1D, TBG52-1G, SEB23-3F, SEB23-3G). `ISEO_SHADOW_MODE=false`.
+
+**Trous connus à traiter** : (1) ~~drift de dates~~ → **FAIT 2026-06-20** (`_resa_to_resync`, cf. ci-dessus) ; (2) **fallback guest tag** (`ISEO_DEFAULT_GUEST_TAG_ID=132094`) pour les 4 apparts sans tag dérivable (ABO58/CLE7/POC5/SEB44) → **en attente confirmation Pascal (ISEO)** sur l'effet de bord d'un guest tag partagé sur un credentialRule scopé par lockTag ; sinon master only ; (3) élargir whitelist aux 13 ; (4) ~~retirer le cacher~~ → **FAIT 2026-06-20** (cacher webhook + topic/sub/endpoint supprimés ; reste à droper le topic `iseo-pin-to-cache` + sub + DLQ côté infra) ; (5) ~~tab dashboard~~ → **FAIT 2026-06-20** (`dash_ops_pin_pipeline` refondu sur le nouveau vocabulaire provision/invitation/duve + drift ; ancienne réconciliation PHANTOM/DRIFT supprimée).
 
 **Test local** : `gcloud run jobs execute merveil-action-engine-iseo --region=europe-west1 --project=merveil-data-warehouse --wait`. Forcer une résa >7j : `--update-env-vars ISEO_LOOKAHEAD_DAYS=400`.
 

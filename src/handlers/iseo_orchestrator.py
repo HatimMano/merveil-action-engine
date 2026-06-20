@@ -318,6 +318,46 @@ def _resa_to_archive() -> list[dict]:
     return [dict(r.items()) for r in _bq().query(q).result()]
 
 
+def _resa_to_resync() -> list[dict]:
+    """Rows actives dont la window cache ≠ dates live Mews = drift de dates post-
+    provision (extension / raccourcissement / décalage du séjour). À resync Sofia
+    pour que la fenêtre du PIN colle au séjour réel. Annulations → _resa_to_archive."""
+    q = f"""
+    WITH {_DUVE_LATEST_CTE},
+    cache AS (
+      SELECT duve_reservation_id, pin_value, iseo_device_id, iseo_invitation_id,
+             iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id,
+             checkin_date AS cache_ci, checkout_date AS cache_co
+      FROM `{PIN_CACHE_TABLE}`
+      WHERE archived_at IS NULL AND provisioned_at IS NOT NULL
+    ),
+    mews AS (
+      SELECT customer_id, resource_id, is_cancelled,
+             checkin_date, checkout_date, earliest_checkin_hour, latest_checkout_hour
+      FROM `{MEWS_FCT_TABLE}`
+    ),
+    joined AS (
+      SELECT c.duve_reservation_id, c.pin_value, c.iseo_device_id, c.iseo_invitation_id,
+             c.iseo_guest_tag_id, c.iseo_lock_id, c.iseo_lock_tag_id,
+             d.duve_property_id,
+             m.checkin_date AS live_ci, m.checkout_date AS live_co,
+             m.earliest_checkin_hour, m.latest_checkout_hour
+      FROM cache c
+      JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
+      JOIN mews m ON m.customer_id = d.mews_customer_id
+                 AND m.resource_id = d.duve_property_id
+      WHERE COALESCE(m.is_cancelled, FALSE) = FALSE
+        AND m.checkout_date >= CURRENT_DATE()
+        AND (m.checkin_date != c.cache_ci OR m.checkout_date != c.cache_co)
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY c.duve_reservation_id
+        ORDER BY ABS(DATE_DIFF(m.checkin_date, c.cache_ci, DAY))) = 1
+    )
+    SELECT * FROM joined ORDER BY live_ci
+    """
+    return [dict(r.items()) for r in _bq().query(q).result()]
+
+
 # ── State writers ───────────────────────────────────────────────────────────
 
 def _save_provisioned(row: dict, pin_value: str, device_id: int,
@@ -348,6 +388,30 @@ def _save_provisioned(row: dict, pin_value: str, device_id: int,
         bigquery.ScalarQueryParameter("link", "STRING", link),
         bigquery.ScalarQueryParameter("ci", "DATE", str(row["checkin_date"])),
         bigquery.ScalarQueryParameter("co", "DATE", str(row["checkout_date"])),
+    ])
+    _bq().query(q, job_config=cfg).result()
+
+
+def _save_resynced(duve_resa_id: str, ci: str, co: str, device_id: object,
+                   inv_id: Optional[int], inv_code: Optional[str],
+                   link: Optional[str], duve_ok: bool) -> None:
+    q = f"""
+    UPDATE `{PIN_CACHE_TABLE}`
+    SET checkin_date = @ci, checkout_date = @co, iseo_device_id = @dev,
+        iseo_invitation_id = @inv, invitation_code = @code, invitation_link = @link,
+        provisioned_at = CURRENT_TIMESTAMP(),
+        duve_pushed_at = {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'},
+        last_error = NULL
+    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    """
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
+        bigquery.ScalarQueryParameter("ci", "DATE", ci),
+        bigquery.ScalarQueryParameter("co", "DATE", co),
+        bigquery.ScalarQueryParameter("dev", "INT64", device_id),
+        bigquery.ScalarQueryParameter("inv", "INT64", inv_id),
+        bigquery.ScalarQueryParameter("code", "STRING", inv_code),
+        bigquery.ScalarQueryParameter("link", "STRING", link),
     ])
     _bq().query(q, job_config=cfg).result()
 
@@ -482,15 +546,9 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     return True, None
 
 
-def _get_or_create_device(row: dict, pin_ext: str, win: dict) -> tuple[Optional[str], object]:
-    """Retourne (pin_value, device_id). Réutilise le device existant (même extId)
-    s'il existe (retry partiel). Sinon génère un code 4 chiffres unique."""
-    g = _sofia("GET", f"/api/v2/standardDevices/extId/{pin_ext}")
-    if g.status_code == 200:
-        d = g.json()
-        return str(d.get("deviceId")), d.get("id")
-
-    payload = {
+def _device_payload(row: dict, pin_ext: str, win: dict) -> dict:
+    """Payload POST /standardDevices sans deviceId (= le code, ajouté par _post_device)."""
+    return {
         "type": "ISEO_PIN", "extId": pin_ext, "notes": pin_ext,
         "validationMode": "ONE_HOUR_VALIDATION", "validationPeriod": 24,
         "additionalCredentialRules": [],
@@ -502,19 +560,45 @@ def _get_or_create_device(row: dict, pin_ext: str, win: dict) -> tuple[Optional[
             "dateInterval": win, "timeInterval": {"from": 0, "to": 86340},
             "alwaysOpen": False, "holidays": True, "openOnPrivacy": False},
     }
-    last_err = None
-    for _ in range(PIN_COLLISION_RETRIES):
-        pin_value = f"{random.randint(0, 9999):04d}"
+
+
+def _post_device(row: dict, pin_ext: str, win: dict,
+                 pin_value: Optional[str] = None) -> tuple[Optional[str], object]:
+    """POST un device. Si pin_value fourni (resync) on tente de réutiliser le même
+    code (libéré par le DELETE qui précède) ; sinon on génère un code 4 chiffres
+    unique account-wide (retry sur collision)."""
+    payload = _device_payload(row, pin_ext, win)
+    if pin_value is not None:
         payload["deviceId"] = pin_value
         r = _sofia("POST", "/api/v2/standardDevices", json_body=payload)
         if r.status_code in (200, 201):
-            logger.info(f"✅ device créé id={r.json().get('id')} PIN={pin_value}")
             return pin_value, r.json().get("id")
+        if "already present" not in r.text.lower():
+            return None, f"HTTP {r.status_code}: {r.text[:200]}"
+        logger.warning(f"⚠️ code {pin_value} repris entre-temps → régénération")
+    last_err = None
+    for _ in range(PIN_COLLISION_RETRIES):
+        pv = f"{random.randint(0, 9999):04d}"
+        payload["deviceId"] = pv
+        r = _sofia("POST", "/api/v2/standardDevices", json_body=payload)
+        if r.status_code in (200, 201):
+            logger.info(f"✅ device créé id={r.json().get('id')} PIN={pv}")
+            return pv, r.json().get("id")
         if "already present" in r.text.lower():
             last_err = "code collision"
             continue
         return None, f"HTTP {r.status_code}: {r.text[:200]}"
     return None, last_err or "no free PIN"
+
+
+def _get_or_create_device(row: dict, pin_ext: str, win: dict) -> tuple[Optional[str], object]:
+    """Retourne (pin_value, device_id). Réutilise le device existant (même extId)
+    s'il existe (retry partiel). Sinon génère un code 4 chiffres unique."""
+    g = _sofia("GET", f"/api/v2/standardDevices/extId/{pin_ext}")
+    if g.status_code == 200:
+        d = g.json()
+        return str(d.get("deviceId")), d.get("id")
+    return _post_device(row, pin_ext, win)
 
 
 def _get_or_create_invitation(row: dict, inv_ext: str, win: dict) -> tuple[Optional[int], Optional[str]]:
@@ -564,6 +648,66 @@ def _archive(row: dict) -> tuple[bool, Optional[str]]:
     return True, None
 
 
+def _resync(row: dict) -> tuple[bool, Optional[str]]:
+    """Resync window Sofia après drift de dates : DELETE device+invitation puis
+    re-POST avec la window live + le MÊME code PIN (le guest garde son code clavier ;
+    le lien remote-open change car nouvelle invitation). UPDATE l'état cache."""
+    duve_resa_id = row["duve_reservation_id"]
+    apt_pid = (row.get("duve_property_id") or "").lower()
+    if ALLOWED_PROPERTY_IDS and apt_pid not in ALLOWED_PROPERTY_IDS:
+        return False, "skipped: whitelist"
+
+    ci_str, co_str = str(row["live_ci"]), str(row["live_co"])
+    ci_hour = _earliest_hour(row.get("earliest_checkin_hour"), DEFAULT_CI_HOUR)
+    co_hour = _latest_hour(row.get("latest_checkout_hour"), DEFAULT_CO_HOUR)
+    ci_ms, co_ms = _build_window_ms(ci_str, co_str, ci_hour, co_hour)
+    if co_ms < int(time.time() * 1000):
+        return False, "skipped: checkout passé (sera archivé)"
+    win = {"from": ci_ms, "to": co_ms}
+
+    if ISEO_SHADOW_MODE:
+        logger.info(f"🌗 SHADOW {duve_resa_id}: would resync window → {ci_str}→{co_str}")
+        return True, None
+
+    # Adapter les clés cache → clés attendues par les helpers partagés.
+    row["lock_tag_id"] = row.get("iseo_lock_tag_id")
+    row["lock_id"] = row.get("iseo_lock_id")
+    row["guest_tag_id"] = row.get("iseo_guest_tag_id")
+    if row["lock_tag_id"] is None or row["lock_id"] is None or row["guest_tag_id"] is None:
+        return False, "resync impossible: ids appart manquants en cache"
+
+    pin_ext = f"MERVEIL_RESA - {duve_resa_id}"
+    inv_ext = f"MERVEIL_INV - {duve_resa_id}"
+
+    # 1. DELETE device + invitation existants
+    g = _sofia("GET", f"/api/v2/standardDevices/extId/{pin_ext}")
+    if g.status_code == 200:
+        rd = _sofia("DELETE", f"/api/v2/standardDevices/{g.json().get('id')}")
+        if rd.status_code not in (200, 204):
+            return False, f"resync device DELETE {rd.status_code}"
+    elif g.status_code != 404:
+        return False, f"resync device GET {g.status_code}"
+    if row.get("iseo_invitation_id"):
+        _sofia("DELETE", f"/api/v2/invitations/{int(row['iseo_invitation_id'])}")
+
+    # 2. re-POST device (même code si possible) + invitation (nouveau code/lien)
+    pin_value, device_id = _post_device(row, pin_ext, win, pin_value=row.get("pin_value"))
+    if pin_value is None:
+        return False, f"resync device re-POST failed: {device_id}"
+    inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
+    link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
+
+    # 3. Duve push (code identique, lien neuf)
+    duve_ok, duve_err = _duve_push(duve_resa_id, pin_value, link or "")
+
+    # 4. état
+    _save_resynced(duve_resa_id, ci_str, co_str, device_id, inv_id, inv_code, link, duve_ok)
+    if not duve_ok:
+        return False, f"resync Sofia OK mais Duve KO: {duve_err}"
+    logger.info(f"🔄 resync {duve_resa_id} window → {ci_str}→{co_str}")
+    return True, None
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run() -> None:
@@ -600,6 +744,22 @@ def _run_inner() -> None:
             logger.warning(f"⚠️ provision failed {row['duve_reservation_id']}: {err}")
             errors.append(f"provision {row['duve_reservation_id']} ({row.get('apartment_code')}): {err}")
 
+    # 1b. Resync drift de dates (window cache ≠ dates live Mews)
+    to_resync = _resa_to_resync()
+    if to_resync:
+        logger.info(f"🔄 {len(to_resync)} résa(s) à resync (drift de dates)")
+    resynced = 0
+    for row in to_resync:
+        try:
+            success, err = _resync(row)
+        except Exception as e:
+            success, err = False, f"exception: {e}"
+        if success:
+            resynced += 1
+        elif not str(err).startswith("skipped"):
+            logger.warning(f"⚠️ resync failed {row['duve_reservation_id']}: {err}")
+            errors.append(f"resync {row['duve_reservation_id']} ({row.get('duve_property_id')}): {err}")
+
     # 2. Retry du push Duve (Sofia OK mais Duve KO à un run précédent)
     retry = 0
     if not ISEO_SHADOW_MODE:
@@ -631,12 +791,12 @@ def _run_inner() -> None:
             errors.append(f"archive {row['duve_reservation_id']}: {err}")
 
     logger.info("=" * 70)
-    logger.info(f"DONE — provision ok={ok} skip={skip} | duve-retry={retry} | "
-                f"archived={archived} | erreurs={len(errors)}")
+    logger.info(f"DONE — provision ok={ok} skip={skip} | resync={resynced} | "
+                f"duve-retry={retry} | archived={archived} | erreurs={len(errors)}")
     logger.info("=" * 70)
 
     if errors:
         body = (f"{len(errors)} erreur(s) sur le run ISEO orchestrator "
-                f"(provision ok={ok}, duve-retry={retry}, archived={archived}) :\n\n"
+                f"(provision ok={ok}, resync={resynced}, duve-retry={retry}, archived={archived}) :\n\n"
                 + "\n".join(f"• {e}" for e in errors[:50]))
         _send_alert(f"⚠️ ISEO orchestrator — {len(errors)} erreur(s)", body)
