@@ -54,8 +54,11 @@ echo "🚀 Déploiement du job iseo-orchestrator (pipeline V3 100% DWH — natif
 #   - ISEO_SHADOW_MODE=false → live. Mettre =true pour un dry-run (log "would provision").
 #   - DUVE_CONNECT_TOKEN (secret) + DUVE_CONNECT_PID (intégration entrante Duve dédiée DWH).
 #   - ⚠️ CUTOVER progressif : 5 apparts AVEC guest tag (OUR12-1D, TBG52-1D, TBG52-1G,
-#     SEB23-3F, SEB23-3G). Les 4 sans guest tag (ABO58, CLE7, POC5, SEB44) restent
-#     hors whitelist → master code (à régler lundi : fallback ISEO_DEFAULT_GUEST_TAG_ID).
+#     SEB23-3F, SEB23-3G). Les 4 sans guest tag (ABO58, CLE7, POC5, SEB44) → couverts
+#     par le fallback ISEO_DEFAULT_GUEST_TAG_ID=132094 (tag générique "Merveil guest",
+#     credentialRule scopé par lockTag) dès qu'ils sont ajoutés à la whitelist.
+#     Fallback validé OK par Pascal (ISEO) ; n'affecte pas les 5 apparts déjà live
+#     (ils ont leur propre guest tag, le fallback ne s'applique que si tag appart absent).
 #     Liste complète des 13 apparts pour ré-élargir ensuite :
 #       c12a7244-f97b-4633-b6a7-b16f0079821c,1068206f-58c2-4ff8-8d71-b16f0079821c,
 #       22785cb3-555b-4020-92d6-b16f0079821c,ef51211e-3550-456a-9410-b16f0079821c,
@@ -71,7 +74,7 @@ gcloud run jobs deploy merveil-action-engine-iseo \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest,ISEO_MANAGER_USERNAME=iseo-manager-username:latest,ISEO_MANAGER_PASSWORD=iseo-manager-password:latest,DUVE_CONNECT_TOKEN=duve-connect-token:latest \
   --service-account $SA \
   --project $PROJECT \
-  --set-env-vars "^;^GCP_PROJECT_ID=$PROJECT;FREQ=iseo_orchestrator;ISEO_SHADOW_MODE=false;DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18;GMAIL_SENDER=noreply@archides.fr;ISEO_ALERT_TO=hatim@archides.fr;ISEO_ALLOWED_PROPERTY_IDS=e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,ed0d0ccd-d5a0-4cbf-9f6f-b1d20103b89f,70edbca0-6abb-4bae-bd89-b16f0079821c,aa37778e-7257-40ad-9b5c-b16f0079821c"
+  --set-env-vars "^;^GCP_PROJECT_ID=$PROJECT;FREQ=iseo_orchestrator;ISEO_SHADOW_MODE=false;DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18;GMAIL_SENDER=noreply@archides.fr;ISEO_ALERT_TO=hatim@archides.fr;ISEO_DEFAULT_GUEST_TAG_ID=132094;ISEO_ALLOWED_PROPERTY_IDS=e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,ed0d0ccd-d5a0-4cbf-9f6f-b1d20103b89f,70edbca0-6abb-4bae-bd89-b16f0079821c,aa37778e-7257-40ad-9b5c-b16f0079821c"
 
 echo ""
 echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-7)"

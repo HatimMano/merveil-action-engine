@@ -495,7 +495,16 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     if ALLOWED_PROPERTY_IDS and apt_pid not in ALLOWED_PROPERTY_IDS:
         return False, "skipped: whitelist"
     if row.get("guest_tag_id") is None:
-        return False, "skipped: pas de guest tag pour cet appart (master code couvre)"
+        # Fallback : appart sans guest tag dérivable (aucun PIN existant n'en porte).
+        # Le credentialRule est scopé par lockTagIds → un guest tag générique partagé
+        # ("Merveil guest" 132094) suffit, le lock tag de l'appart fait le scoping.
+        if DEFAULT_GUEST_TAG_ID is not None:
+            row["guest_tag_id"] = DEFAULT_GUEST_TAG_ID
+            logger.info(
+                f"… {row.get('apartment_code')}: pas de guest tag appart → "
+                f"fallback générique {DEFAULT_GUEST_TAG_ID}")
+        else:
+            return False, "skipped: pas de guest tag pour cet appart (master code couvre)"
     if row.get("lock_tag_id") is None or row.get("lock_id") is None:
         return False, "skipped: lock non résolue"
     if row.get("payment_unpaid"):
