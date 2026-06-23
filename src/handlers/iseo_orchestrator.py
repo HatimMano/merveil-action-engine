@@ -519,7 +519,7 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     co_hour = _latest_hour(row.get("latest_checkout_hour"), DEFAULT_CO_HOUR)
     ci_ms, co_ms = _build_window_ms(ci_str, co_str, ci_hour, co_hour)
     if co_ms < int(time.time() * 1000):
-        return False, "checkout already passed"
+        return False, "skipped: checkout déjà passé (sera archivé demain)"
 
     win = {"from": ci_ms, "to": co_ms}
     pin_ext = f"MERVEIL_RESA - {duve_resa_id}"
