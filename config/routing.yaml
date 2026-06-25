@@ -204,7 +204,7 @@ triggers:
   # Compte bancaire sous son seuil (seed treasury_thresholds). Le message propose
   # le montant à virer. Bucket daily (snapshot bancaire daily). N2 → N3.
   treasury_low:
-    enabled: true
+    enabled: false   # alerte désactivée — visualisation dashboard d'abord (2026-06-25)
     actions:
       - type: email_digest
         bucket: daily
