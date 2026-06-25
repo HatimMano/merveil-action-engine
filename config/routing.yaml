@@ -200,6 +200,15 @@ triggers:
       - type: email_digest
         bucket: 2h
 
+  # ── Trésorerie ────────────────────────────────────────────────────────────
+  # Compte bancaire sous son seuil (seed treasury_thresholds). Le message propose
+  # le montant à virer. Bucket daily (snapshot bancaire daily). N2 → N3.
+  treasury_low:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
   # ── Désactivés ────────────────────────────────────────────────────────────
   client_risk:
     enabled: false   # legacy disabled (clients_at_risk hors UNION dash_alerts)
