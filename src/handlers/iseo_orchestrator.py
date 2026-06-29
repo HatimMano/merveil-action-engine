@@ -718,6 +718,66 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     return True, None
 
 
+# ── Purge des DUVE_PIN natifs orphelins ────────────────────────────────────────
+
+def _native_duve_pins_to_purge() -> list[dict]:
+    """DUVE_PIN natifs encore vivants en Sofia alors que la résa est annulée ou
+    déjà checked-out, SUR LES APPARTS CUTOVER UNIQUEMENT (whitelist). L'intégration
+    native est coupée → plus personne ne supprime ces PIN à l'annulation/au départ,
+    laissant un code valide à un guest qui ne devrait plus entrer.
+
+    ⚠️ Scope STRICT à la whitelist : sur les ~120 apparts non cutover, le DUVE_PIN
+    natif reste l'UNIQUE code du guest — ne JAMAIS purger en dehors de la whitelist.
+    On ne touche pas non plus les résas ACTIVE (leur DUVE_PIN double notre code mais
+    reste l'unique code des résas >J-7 pas encore provisionnées) — nettoyées au CO."""
+    if not ALLOWED_PROPERTY_IDS:
+        return []
+    q = f"""
+    WITH {_DUVE_LATEST_CTE},
+    dpin AS (
+      SELECT ext_id, duve_reservation_id, user_firstname, user_lastname, active_from
+      FROM `{STD_DEVICES_TABLE}`
+      WHERE ext_id LIKE 'DUVE_PIN - %' AND deleted = FALSE AND is_present_in_latest_snapshot
+    ),
+    m AS (
+      SELECT customer_id, resource_id, reservation_number, is_cancelled, checkin_date, checkout_date
+      FROM `{MEWS_FCT_TABLE}`
+    )
+    SELECT p.ext_id, p.duve_reservation_id,
+           TRIM(CONCAT(COALESCE(p.user_firstname,''),' ',COALESCE(p.user_lastname,''))) AS guest,
+           m.reservation_number,
+           CASE WHEN m.is_cancelled THEN 'cancelled' ELSE 'checked_out' END AS reason
+    FROM dpin p
+    JOIN duve_latest d ON d.duve_reservation_id = p.duve_reservation_id
+    JOIN m ON m.customer_id = d.mews_customer_id AND m.resource_id = d.duve_property_id
+    WHERE LOWER(d.duve_property_id) IN UNNEST(@wl)
+      AND (m.is_cancelled OR m.checkout_date < CURRENT_DATE())
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY p.ext_id
+      ORDER BY ABS(DATE_DIFF(m.checkin_date, DATE(p.active_from), DAY))) = 1
+    """
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("wl", "STRING", sorted(ALLOWED_PROPERTY_IDS))])
+    return [dict(r.items()) for r in _bq().query(q, job_config=cfg).result()]
+
+
+def _purge_native_orphan(row: dict) -> tuple[bool, Optional[str]]:
+    """DELETE le DUVE_PIN natif (par extId)."""
+    ext = row["ext_id"]
+    if ISEO_SHADOW_MODE:
+        logger.info(f"🌗 SHADOW: would purge {ext} ({row.get('reason')}, {row.get('guest')})")
+        return True, None
+    g = _sofia("GET", f"/api/v2/standardDevices/extId/{ext}")
+    if g.status_code == 404:
+        return True, None  # déjà supprimé
+    if g.status_code != 200:
+        return False, f"GET {g.status_code}"
+    rd = _sofia("DELETE", f"/api/v2/standardDevices/{g.json().get('id')}")
+    if rd.status_code not in (200, 204, 404):
+        return False, f"DELETE {rd.status_code}"
+    logger.info(f"🧹 purged DUVE_PIN {ext} ({row.get('reason')}, résa {row.get('reservation_number')}, {row.get('guest')})")
+    return True, None
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run() -> None:
@@ -800,13 +860,28 @@ def _run_inner() -> None:
         else:
             errors.append(f"archive {row['duve_reservation_id']}: {err}")
 
+    # 4. Purge des DUVE_PIN natifs orphelins (résa annulée/checked-out) — whitelist only
+    to_purge = _native_duve_pins_to_purge()
+    if to_purge:
+        logger.info(f"🧹 {len(to_purge)} DUVE_PIN natif(s) orphelin(s) à purger (whitelist)")
+    purged = 0
+    for row in to_purge:
+        try:
+            success, err = _purge_native_orphan(row)
+        except Exception as e:
+            success, err = False, f"exception: {e}"
+        if success:
+            purged += 1
+        else:
+            errors.append(f"purge {row.get('ext_id')}: {err}")
+
     logger.info("=" * 70)
     logger.info(f"DONE — provision ok={ok} skip={skip} | resync={resynced} | "
-                f"duve-retry={retry} | archived={archived} | erreurs={len(errors)}")
+                f"duve-retry={retry} | archived={archived} | purged={purged} | erreurs={len(errors)}")
     logger.info("=" * 70)
 
     if errors:
         body = (f"{len(errors)} erreur(s) sur le run ISEO orchestrator "
-                f"(provision ok={ok}, resync={resynced}, duve-retry={retry}, archived={archived}) :\n\n"
+                f"(provision ok={ok}, resync={resynced}, duve-retry={retry}, archived={archived}, purged={purged}) :\n\n"
                 + "\n".join(f"• {e}" for e in errors[:50]))
         _send_alert(f"⚠️ ISEO orchestrator — {len(errors)} erreur(s)", body)
