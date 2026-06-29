@@ -495,17 +495,15 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     apt_pid = (row.get("duve_property_id") or "").lower()
     if ALLOWED_PROPERTY_IDS and apt_pid not in ALLOWED_PROPERTY_IDS:
         return False, "skipped: whitelist"
-    if row.get("guest_tag_id") is None:
-        # Fallback : appart sans guest tag dérivable (aucun PIN existant n'en porte).
-        # Le credentialRule est scopé par lockTagIds → un guest tag générique partagé
-        # ("Merveil guest" 132094) suffit, le lock tag de l'appart fait le scoping.
-        if DEFAULT_GUEST_TAG_ID is not None:
-            row["guest_tag_id"] = DEFAULT_GUEST_TAG_ID
-            logger.info(
-                f"… {row.get('apartment_code')}: pas de guest tag appart → "
-                f"fallback générique {DEFAULT_GUEST_TAG_ID}")
-        else:
-            return False, "skipped: pas de guest tag pour cet appart (master code couvre)"
+    # Guest tag : TOUJOURS le tag générique partagé (DEFAULT_GUEST_TAG_ID). Le
+    # credentialRule scope l'accès par le lockTag de l'appart → le guest tag n'a
+    # aucun effet de bord (confirmé ISEO). Réutiliser le guest tag dominant de
+    # l'appart faisait hériter le PIN du NOM du vrai guest attaché à ce tag (ex
+    # Bianca Aranha sur SEB23-3G) → label faux dans l'UI Luckey. Le tag partagé
+    # donne un label uniforme et neutre (le vrai guest reste sur le dashboard).
+    if DEFAULT_GUEST_TAG_ID is None:
+        return False, "skipped: ISEO_DEFAULT_GUEST_TAG_ID non configuré"
+    row["guest_tag_id"] = DEFAULT_GUEST_TAG_ID
     if row.get("lock_tag_id") is None or row.get("lock_id") is None:
         return False, "skipped: lock non résolue"
     if row.get("payment_unpaid"):
@@ -682,7 +680,9 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     # Adapter les clés cache → clés attendues par les helpers partagés.
     row["lock_tag_id"] = row.get("iseo_lock_tag_id")
     row["lock_id"] = row.get("iseo_lock_id")
-    row["guest_tag_id"] = row.get("iseo_guest_tag_id")
+    # Guest tag générique partagé (cf. _provision) — pas le tag cache historique,
+    # pour que le re-POST resync porte aussi le label uniforme.
+    row["guest_tag_id"] = DEFAULT_GUEST_TAG_ID if DEFAULT_GUEST_TAG_ID is not None else row.get("iseo_guest_tag_id")
     if row["lock_tag_id"] is None or row["lock_id"] is None or row["guest_tag_id"] is None:
         return False, "resync impossible: ids appart manquants en cache"
 
