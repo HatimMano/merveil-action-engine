@@ -308,7 +308,8 @@ def _resa_to_archive() -> list[dict]:
                       AND m.resource_id = d.duve_property_id
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY c.duve_reservation_id
-        ORDER BY ABS(DATE_DIFF(m.mews_checkin_date, c.checkout_date, DAY)) ASC NULLS LAST) = 1
+        ORDER BY COALESCE(m.is_cancelled, FALSE) ASC,
+                 ABS(DATE_DIFF(m.mews_checkin_date, c.checkout_date, DAY)) ASC NULLS LAST) = 1
     )
     SELECT duve_reservation_id, iseo_invitation_id, shadow_mode,
            CASE WHEN is_cancelled THEN 'cancelled' ELSE 'checkout_passed' END AS archive_reason
