@@ -8,8 +8,12 @@ seul maître du cycle PIN. Pour chaque résa Mews non annulée, payée, dont le 
 dans les LOOKAHEAD_DAYS prochains jours (et pas encore provisionnée) :
 
   A. génère un code PIN 4 chiffres (unique account-wide, retry sur collision)
-  B. POST Sofia /standardDevices (credentialRule sur le guest tag + lock tag de
-     l'appart — RÉUTILISÉS, pas de création user/tag par résa)
+  B. crée (get-or-create par extId) un user Sofia DÉDIÉ à la résa, au VRAI nom du
+     guest (firstname/lastname), avec un password aléatoire jamais partagé → le user
+     est `enabled=True` et porte un tag `user` auto-créé. Ce tag sert de guestTagId →
+     l'UI Luckey affiche le vrai nom du guest. POST Sofia /standardDevices
+     (credentialRule sur ce guest tag + le lock tag de l'appart). Le device ancre le
+     user (pas de garbage-collection).
   C. POST Sofia /invitations (smartLockIds=[lock_id]) → code → lien remote-open
      `https://archides.jago.cloud/remoteOpen?code=<code>`
   D. POST intégration Duve (champ custom) : primaryCode = code clavier +
@@ -18,13 +22,17 @@ dans les LOOKAHEAD_DAYS prochains jours (et pas encore provisionnée) :
   E. INSERT état dans iseo_raw.merveil_pin_cache.
 
 Archive (CO passé OU résa annulée) : DELETE Sofia device + DELETE invitation +
-flag archived_at. Pas de user à supprimer (on réutilise le user d'appart partagé).
+DELETE le user dédié de la résa (par extId) + flag archived_at.
+
+⚠️ enabled : un user créé via l'API est enabled=False SAUF si on fournit un
+`password` à la création (le schéma create n'a pas de champ `enabled`). Un user
+enabled=False finit garbage-collecté / perd son tag → PIN cassé. D'où le password
+aléatoire systématique (le guest ne se connecte jamais, il ouvre au PIN clavier).
 
 Résolution des ids appart (par JOIN BQ, pas de seed) :
   - duve property_id (GUID) == Mews resource_id == nom du lock tag Sofia
   - lock_id + lock_tag_id ← stg_iseo__smart_locks (par nom de tag = property_id)
-  - guest_tag_id ← guest tag le plus fréquent des PINs existants de cet appart
-    (stg_iseo__standard_devices.rule_guest_tags_ids)
+  - guest_tag_id ← tag `user` du user dédié de la résa (créé en B)
 
 Modes :
   - ISEO_SHADOW_MODE=true → log "would provision" sans appel Sofia/Duve
@@ -37,6 +45,7 @@ import base64
 import logging
 import os
 import random
+import secrets
 import time
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
@@ -97,12 +106,6 @@ LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "7"))
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "16:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "12:00")
 PIN_COLLISION_RETRIES = 8
-# Guest tag de repli quand un appart n'a aucun PIN existant d'où dériver son tag.
-# 132094 = tag "Merveil guest" déjà partagé cross-apparts ; le credentialRule scope
-# par lockTagIds donc un guest tag partagé + le lock tag de l'appart suffit.
-DEFAULT_GUEST_TAG_ID = (
-    int(os.environ["ISEO_DEFAULT_GUEST_TAG_ID"])
-    if os.environ.get("ISEO_DEFAULT_GUEST_TAG_ID") else None)
 
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
@@ -247,7 +250,7 @@ def _resa_to_provision() -> list[dict]:
     {_LOCKS_CTE},
     {_PAYMENTS_CTE},
     mews AS (
-      SELECT customer_id, resource_id,
+      SELECT customer_id, resource_id, customer_name,
              reservation_id     AS mews_reservation_id,
              reservation_number AS mews_reservation_number,
              is_cancelled, checkin_date, checkout_date,
@@ -262,7 +265,7 @@ def _resa_to_provision() -> list[dict]:
       SELECT
         d.duve_reservation_id, d.duve_property_id,
         lk.lock_id, lk.lock_tag_id, lk.apartment_code,
-        gt.guest_tag_id,
+        gt.guest_tag_id, m.customer_name,
         m.mews_reservation_id, m.mews_reservation_number,
         m.checkin_date, m.checkout_date,
         m.earliest_checkin_hour, m.latest_checkout_hour,
@@ -333,14 +336,14 @@ def _resa_to_resync() -> list[dict]:
       WHERE archived_at IS NULL AND provisioned_at IS NOT NULL
     ),
     mews AS (
-      SELECT customer_id, resource_id, is_cancelled,
+      SELECT customer_id, resource_id, customer_name, is_cancelled,
              checkin_date, checkout_date, earliest_checkin_hour, latest_checkout_hour
       FROM `{MEWS_FCT_TABLE}`
     ),
     joined AS (
       SELECT c.duve_reservation_id, c.pin_value, c.iseo_device_id, c.iseo_invitation_id,
              c.iseo_guest_tag_id, c.iseo_lock_id, c.iseo_lock_tag_id,
-             d.duve_property_id,
+             d.duve_property_id, m.customer_name,
              m.checkin_date AS live_ci, m.checkout_date AS live_co,
              m.earliest_checkin_hour, m.latest_checkout_hour
       FROM cache c
@@ -487,6 +490,53 @@ def _build_window_ms(ci_date: str, co_date: str, ci_hour: str, co_hour: str) -> 
     return int(ci_dt.timestamp() * 1000), int(co_dt.timestamp() * 1000)
 
 
+# ── Guest user dédié (un par résa, au vrai nom) ────────────────────────────────
+
+def _split_name(name: Optional[str]) -> tuple[str, str]:
+    parts = (name or "").strip().split()
+    if not parts:
+        return "Merveil", "Guest"
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
+def _user_tag_id(user: dict) -> Optional[int]:
+    """Le tag de type 'user' auto-créé avec le user (= le seul valide comme guestTagId)."""
+    for t in (user.get("tags") or []):
+        if t.get("type") == "user" and t.get("id"):
+            return t["id"]
+    return None
+
+
+def _get_or_create_guest_user(duve_resa_id: str, guest_name: Optional[str]) -> tuple[Optional[int], Optional[str]]:
+    """Get-or-create (par extId) un user Sofia dédié à la résa, au vrai nom du guest.
+    Retourne (guest_tag_id, error). Le user est créé avec un password aléatoire pour
+    être enabled=True (sinon il est GC / perd son tag). Le password n'est jamais
+    partagé — le guest ouvre au PIN clavier + lien remote-open."""
+    ext = f"MERVEIL_USER - {duve_resa_id}"
+    g = _sofia("GET", f"/api/v2/users/extId/{ext}")
+    if g.status_code == 200:
+        tag = _user_tag_id(g.json())
+        return (tag, None) if tag else (None, "user existant sans tag 'user'")
+
+    fn, ln = _split_name(guest_name)
+    email = f"resa-{duve_resa_id}@guest.archides.fr"  # unique par résa, jamais utilisé
+    r = _sofia("POST", "/api/v2/users", json_body={
+        "username": email, "email": email, "password": "Mv!" + secrets.token_urlsafe(16),
+        "firstname": fn, "lastname": ln, "roleIds": [5], "extId": ext})
+    if r.status_code not in (200, 201):
+        return None, f"user POST HTTP {r.status_code}: {r.text[:200]}"
+    tag = _user_tag_id(r.json())
+    if tag is None:  # fallback : relire le user pour récupérer son tag
+        g2 = _sofia("GET", f"/api/v2/users/extId/{ext}")
+        tag = _user_tag_id(g2.json()) if g2.status_code == 200 else None
+    if tag is None:
+        return None, "user créé sans tag 'user'"
+    logger.info(f"✅ user guest créé '{(fn + ' ' + ln).strip()}' → tag {tag}")
+    return tag, None
+
+
 # ── Provision (A→E) ───────────────────────────────────────────────────────────
 
 def _provision(row: dict) -> tuple[bool, Optional[str]]:
@@ -495,15 +545,6 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     apt_pid = (row.get("duve_property_id") or "").lower()
     if ALLOWED_PROPERTY_IDS and apt_pid not in ALLOWED_PROPERTY_IDS:
         return False, "skipped: whitelist"
-    # Guest tag : TOUJOURS le tag générique partagé (DEFAULT_GUEST_TAG_ID). Le
-    # credentialRule scope l'accès par le lockTag de l'appart → le guest tag n'a
-    # aucun effet de bord (confirmé ISEO). Réutiliser le guest tag dominant de
-    # l'appart faisait hériter le PIN du NOM du vrai guest attaché à ce tag (ex
-    # Bianca Aranha sur SEB23-3G) → label faux dans l'UI Luckey. Le tag partagé
-    # donne un label uniforme et neutre (le vrai guest reste sur le dashboard).
-    if DEFAULT_GUEST_TAG_ID is None:
-        return False, "skipped: ISEO_DEFAULT_GUEST_TAG_ID non configuré"
-    row["guest_tag_id"] = DEFAULT_GUEST_TAG_ID
     if row.get("lock_tag_id") is None or row.get("lock_id") is None:
         return False, "skipped: lock non résolue"
     if row.get("payment_unpaid"):
@@ -532,6 +573,12 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     if ISEO_SHADOW_MODE:
         logger.info(f"🌗 SHADOW {duve_resa_id}: would provision (skip Sofia/Duve/state)")
         return True, None
+
+    # User dédié à la résa (vrai nom du guest) → son tag 'user' = guest tag du PIN.
+    tag_id, uerr = _get_or_create_guest_user(duve_resa_id, row.get("customer_name"))
+    if tag_id is None:
+        return False, f"guest user creation failed: {uerr}"
+    row["guest_tag_id"] = tag_id
 
     # A+B. device (get-or-create par extId → idempotent sur retry partiel)
     pin_value, device_id = _get_or_create_device(row, pin_ext, win)
@@ -628,14 +675,15 @@ def _get_or_create_invitation(row: dict, inv_ext: str, win: dict) -> tuple[Optio
 
 
 def _archive(row: dict) -> tuple[bool, Optional[str]]:
-    """DELETE Sofia device (par extId) + DELETE invitation (par id). Pas de user."""
+    """DELETE Sofia device (par extId) + DELETE invitation (par id) + DELETE le user
+    dédié de la résa (par extId)."""
     duve_resa_id = row["duve_reservation_id"]
     if ISEO_SHADOW_MODE or bool(row.get("shadow_mode")):
         logger.info(f"🌗 SHADOW {duve_resa_id}: archive skipped")
         return True, None
 
     errs = []
-    # device
+    # device (à supprimer avant le user — il l'ancre)
     g = _sofia("GET", f"/api/v2/standardDevices/extId/MERVEIL_RESA - {duve_resa_id}")
     if g.status_code == 200:
         sid = g.json().get("id")
@@ -650,6 +698,14 @@ def _archive(row: dict) -> tuple[bool, Optional[str]]:
         ri = _sofia("DELETE", f"/api/v2/invitations/{int(inv_id)}")
         if ri.status_code not in (200, 204, 404):
             errs.append(f"inv DELETE {ri.status_code}")
+    # user dédié (sinon accumulation de users guest)
+    gu = _sofia("GET", f"/api/v2/users/extId/MERVEIL_USER - {duve_resa_id}")
+    if gu.status_code == 200:
+        ru = _sofia("DELETE", f"/api/v2/users/{gu.json().get('id')}")
+        if ru.status_code not in (200, 204, 404):
+            errs.append(f"user DELETE {ru.status_code}")
+    elif gu.status_code != 404:
+        errs.append(f"user GET {gu.status_code}")
     if errs:
         return False, "; ".join(errs)
     logger.info(f"🗑️ archived {duve_resa_id} ({row.get('archive_reason')})")
@@ -680,10 +736,12 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     # Adapter les clés cache → clés attendues par les helpers partagés.
     row["lock_tag_id"] = row.get("iseo_lock_tag_id")
     row["lock_id"] = row.get("iseo_lock_id")
-    # Guest tag générique partagé (cf. _provision) — pas le tag cache historique,
-    # pour que le re-POST resync porte aussi le label uniforme.
-    row["guest_tag_id"] = DEFAULT_GUEST_TAG_ID if DEFAULT_GUEST_TAG_ID is not None else row.get("iseo_guest_tag_id")
-    if row["lock_tag_id"] is None or row["lock_id"] is None or row["guest_tag_id"] is None:
+    # Guest tag = tag 'user' du user dédié de la résa (get-or-create idempotent).
+    tag_id, uerr = _get_or_create_guest_user(duve_resa_id, row.get("customer_name"))
+    if tag_id is None:
+        return False, f"resync guest user failed: {uerr}"
+    row["guest_tag_id"] = tag_id
+    if row["lock_tag_id"] is None or row["lock_id"] is None:
         return False, "resync impossible: ids appart manquants en cache"
 
     pin_ext = f"MERVEIL_RESA - {duve_resa_id}"
