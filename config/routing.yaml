@@ -42,11 +42,30 @@ digest_buckets:
       - alerte_ventes@archides.fr
       - hatim@archides.fr
 
+  data_quality:
+    # Gouvernance données fixes — violations de contrat (POC ops_apparts, owner Emilia).
+    # ⚠ POC : route vers Hatim le temps de la validation. Pour passer en prod, basculer
+    # default_recipients sur l'owner (emilia@archides.fr), ou implémenter le routage
+    # dynamique depuis gouvernance_ownership.alert_email (évolution handler — Phase 2).
+    send_if_empty: false
+    subject_prefix: "[Merveil Gouvernance]"
+    default_recipients:
+      - hatim@archides.fr
+
 # ============================================================================
 # Triggers
 # ============================================================================
 
 triggers:
+
+  # ── Gouvernance données fixes (POC 2026-06-30) ────────────────────────────
+  # Violation de contrat détectée par dbt (dash_governance_contracts) sur les
+  # données de référence du DWH Feed. 1 alerte/domaine/jour, routée à l'owner.
+  data_contract_breach:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: data_quality
 
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×

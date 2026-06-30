@@ -209,6 +209,15 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 | low_review_cleanliness | breezeway_task | ✅ (placeholder) | 0 |
 | client_risk | email_digest@daily | ❌ disabled | ~18 |
 | inspection_overdue | asana_task | ❌ disabled (POC) | ~41 |
+| data_contract_breach | email_digest@data_quality | ✅ (POC) | ~1 |
+
+### Gouvernance données fixes — `data_contract_breach` (POC 2026-06-30)
+Greffe la gouvernance des données de référence sur le pipeline trigger/action sans nouveau service. Cf. ADR `decisions.md` 2026-06-30 + `docs/audit/gouvernance-donnees-regles-2026-06-29.md`.
+- **Détection** (dbt) : `dashboard_quality.dash_governance_contracts` = 1 ligne/violation de contrat sur les snapshots DWH Feed (POC : onglet Appartements — clé dupliquée, format code, chambres/surface illisibles, snapshot périmé). Scalable : 1 domaine = 1 bloc UNION.
+- **Registre** (seed) : `gouvernance.gouvernance_ownership` = `domaine→owner→table→freshness_max_hours→alert_email`. Backbone, owner-as-data.
+- **Trigger** : `trigger_data_contract_breach` agrège par domaine (1 alerte/domaine/jour), rattache l'owner, porte `owner_email` dans le `context`.
+- **Routage** : bucket `data_quality` (subject `[Merveil Gouvernance]`). ⚠ POC route vers `hatim@archides.fr` ; basculer `default_recipients` sur l'owner (`emilia@archides.fr`) au passage prod, ou implémenter le routage dynamique depuis `gouvernance_ownership.alert_email` (le flush résout le destinataire par bucket, pas par trigger — Phase 2 handler).
+- **Ajouter un domaine** : +1 ligne seed, +1 bloc UNION dans `dash_governance_contracts`, (si owner distinct) +1 bucket. 0 modif dispatcher.
 
 **Ajouter un trigger** :
 1. Créer `dbt/models/triggers/trigger_<name>.sql` (schema unifié, 1 ligne par occurrence)
