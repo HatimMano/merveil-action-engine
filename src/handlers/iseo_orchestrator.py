@@ -261,6 +261,15 @@ def _resa_to_provision() -> list[dict]:
       SELECT DISTINCT duve_reservation_id
       FROM `{PIN_CACHE_TABLE}` WHERE archived_at IS NULL
     ),
+    -- Résas Mews déjà couvertes par une row active (via un AUTRE duve_id). Une résa
+    -- Mews (cancel+recreate) peut avoir 2 reservations Duve ; le JOIN Duve↔Mews sur
+    -- (customer_id, resource_id) n'est pas unique → sans ça chaque duve_id provisionne
+    -- un device = doublon sur la même serrure (cf. churn RUIQING/CLE7-0D).
+    active_by_mews AS (
+      SELECT DISTINCT mews_reservation_number
+      FROM `{PIN_CACHE_TABLE}`
+      WHERE archived_at IS NULL AND mews_reservation_number IS NOT NULL
+    ),
     joined AS (
       SELECT
         d.duve_reservation_id, d.duve_property_id,
@@ -277,12 +286,16 @@ def _resa_to_provision() -> list[dict]:
       LEFT JOIN guest_tags gt ON gt.lock_tag_id = lk.lock_tag_id
       LEFT JOIN payments pay  ON pay.reservation_id = m.mews_reservation_id
       LEFT JOIN active_state s ON s.duve_reservation_id = d.duve_reservation_id
+      LEFT JOIN active_by_mews am
+        ON am.mews_reservation_number = CAST(m.mews_reservation_number AS STRING)
       WHERE m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
         AND m.checkout_date >= CURRENT_DATE()
         AND COALESCE(m.is_cancelled, FALSE) = FALSE
         AND s.duve_reservation_id IS NULL
+        AND am.mews_reservation_number IS NULL
       QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY d.duve_reservation_id ORDER BY m.checkin_date) = 1
+        PARTITION BY CAST(m.mews_reservation_number AS STRING)
+        ORDER BY d.duve_reservation_id) = 1
     )
     SELECT * FROM joined ORDER BY checkin_date
     """
