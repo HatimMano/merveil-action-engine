@@ -13,17 +13,27 @@ import logging
 import os
 import sys
 
-from src.core.dispatcher import TriggerDispatcher
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-FREQ = os.getenv("FREQ")  # 4h | daily | weekly | cancellations_brief | iseo_orchestrator | None
+FREQ = os.getenv("FREQ")  # 4h | daily | weekly | 2h | cancellations_brief | iseo_orchestrator
 
 
 if __name__ == "__main__":
+    # Fail-fast : sans FREQ, le dispatcher bufferise les digests puis les JETTE
+    # (run(freq=None) ne flush jamais) → toutes les alertes mail muettes, zéro
+    # erreur visible. Arrive si un deploy écrase les env vars (--set-env-vars).
+    # Mieux vaut un job en échec bruyant qu'un faux succès silencieux.
+    # Exécution manuelle : passer un FREQ explicite (ex: FREQ=daily).
+    if not FREQ:
+        logging.critical(
+            "FREQ absent des env vars — les digests seraient silencieusement perdus. "
+            "Vérifier le deploy (--set-env-vars doit inclure FREQ) ou passer FREQ explicitement."
+        )
+        sys.exit(1)
+
     try:
         if FREQ == "cancellations_brief":
             # Mode standalone : brief annulations 11h Paris pour l'équipe RC.
@@ -38,6 +48,7 @@ if __name__ == "__main__":
             from src.handlers.iseo_orchestrator import run as run_iseo_orchestrator
             run_iseo_orchestrator()
         else:
+            from src.core.dispatcher import TriggerDispatcher
             TriggerDispatcher().run(freq=FREQ)
         sys.exit(0)
     except Exception as e:

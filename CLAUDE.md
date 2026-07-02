@@ -133,7 +133,7 @@ rules:
 ```
 
 ## Frequency Filtering
-The runner reads `FREQ` env var at startup. If set, only rules with a matching `frequency` are executed (rules without `frequency` always run). If `FREQ` is unset, all enabled rules run.
+Le job lit `FREQ` au démarrage. **FREQ absent/vide = CRITICAL + exit(1)** (fail-fast 2026-07-02) : les actions directes tourneraient mais les digests seraient bufferisés puis jetés sans erreur. Toujours définir FREQ, y compris en exécution manuelle.
 
 | FREQ value | Triggered by |
 |---|---|
@@ -141,7 +141,7 @@ The runner reads `FREQ` env var at startup. If set, only rules with a matching `
 | `daily` | Cloud Scheduler daily at 07:00 |
 | `weekly` | Cloud Scheduler every Monday at 08:00 |
 | `monthly` | Cloud Scheduler 1st of month at 08:00 |
-| (not set) | Manual execution — runs all rules |
+| (not set) | ⛔ **CRITICAL + exit(1) depuis 2026-07-02** — sans FREQ, le dispatcher bufferisait les digests puis les jetait (`run(freq=None)` ne flush jamais) = alertes muettes silencieuses (typiquement après un deploy qui écrase les env vars). L'ancien "runs all rules" décrivait le legacy ActionRunner supprimé en Phase E. Exécution manuelle : toujours passer un FREQ explicite. |
 
 ### Cloud Scheduler setup
 ⚠️ Utiliser l'API v1 régionale (pas v2) — seule compatible avec l'auth OAuth du scheduler.
