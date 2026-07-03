@@ -7,4 +7,3 @@ venv/
 .DS_Store
 
 utils/
-src/handlers/context_email.py
