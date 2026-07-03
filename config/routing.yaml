@@ -67,6 +67,15 @@ triggers:
       - type: email_digest
         bucket: data_quality
 
+  # ── Tests dbt (chantier tests 2026-07-03) ──────────────────────────────────
+  # Échecs de `dbt test` post-run (dbt_raw.test_runs, 1 trigger agrégé/jour).
+  # CRITICAL = erreur SQL (test cassé), WARNING = assertion violée par la donnée.
+  dbt_test_failure:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: data_quality
+
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
   # 6 fois/jour → 1 mail/jour). Le scheduler merveil-action-engine-4h est
