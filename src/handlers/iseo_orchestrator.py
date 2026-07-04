@@ -103,7 +103,7 @@ GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@archides.fr")
 ISEO_ALERT_TO = os.getenv("ISEO_ALERT_TO", "hatim@archides.fr")
 
 LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "7"))
-DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "16:00")
+DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "13:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "12:00")
 PIN_COLLISION_RETRIES = 8
 
