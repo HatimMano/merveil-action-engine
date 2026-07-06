@@ -44,7 +44,6 @@ Trigger : Cloud Run Job `merveil-action-engine-iseo` (scheduler 2h à :45).
 import base64
 import logging
 import os
-import random
 import secrets
 import time
 from datetime import datetime, timezone
@@ -212,23 +211,6 @@ _LOCKS_CTE = f"""
              CAST(JSON_VALUE(t, '$.id') AS INT64) AS lock_tag_id
       FROM `{SMART_LOCKS_TABLE}` l, UNNEST(JSON_QUERY_ARRAY(l.tags)) AS t
       WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
-    ),
-    guest_tags AS (
-      SELECT lock_tag_id, guest_tag_id FROM (
-        SELECT lock_tag_id, guest_tag_id,
-               ROW_NUMBER() OVER (PARTITION BY lock_tag_id ORDER BY n DESC) AS rn
-        FROM (
-          SELECT
-            CAST(REGEXP_EXTRACT(rule_lock_tags_ids,  r'(\\d+)') AS INT64) AS lock_tag_id,
-            CAST(REGEXP_EXTRACT(rule_guest_tags_ids, r'(\\d+)') AS INT64) AS guest_tag_id,
-            COUNT(*) AS n
-          FROM `{STD_DEVICES_TABLE}`
-          WHERE is_present_in_latest_snapshot
-            AND rule_lock_tags_ids IS NOT NULL AND rule_lock_tags_ids != '[]'
-            AND rule_guest_tags_ids IS NOT NULL AND rule_guest_tags_ids != '[]'
-          GROUP BY 1, 2
-        )
-      ) WHERE rn = 1
     )"""
 
 _PAYMENTS_CTE = f"""
@@ -244,7 +226,7 @@ _PAYMENTS_CTE = f"""
 def _resa_to_provision() -> list[dict]:
     """Résas à provisionner : CI dans [today, today+LOOKAHEAD], CO futur, non annulée,
     PAS déjà couverte par une row de cache active (archived_at IS NULL). Résout
-    lock_id / lock_tag_id / guest_tag_id de l'appart par JOIN."""
+    lock_id / lock_tag_id de l'appart par JOIN (le guest tag = user dédié créé au provision)."""
     q = f"""
     WITH {_DUVE_LATEST_CTE},
     {_LOCKS_CTE},
@@ -274,7 +256,7 @@ def _resa_to_provision() -> list[dict]:
       SELECT
         d.duve_reservation_id, d.duve_property_id,
         lk.lock_id, lk.lock_tag_id, lk.apartment_code,
-        gt.guest_tag_id, m.customer_name,
+        m.customer_name,
         m.mews_reservation_id, m.mews_reservation_number,
         m.checkin_date, m.checkout_date,
         m.earliest_checkin_hour, m.latest_checkout_hour,
@@ -283,7 +265,6 @@ def _resa_to_provision() -> list[dict]:
       JOIN duve_latest d ON d.mews_customer_id = m.customer_id
                         AND d.duve_property_id = m.resource_id
       LEFT JOIN locks lk ON lk.duve_property_id = m.resource_id
-      LEFT JOIN guest_tags gt ON gt.lock_tag_id = lk.lock_tag_id
       LEFT JOIN payments pay  ON pay.reservation_id = m.mews_reservation_id
       LEFT JOIN active_state s ON s.duve_reservation_id = d.duve_reservation_id
       LEFT JOIN active_by_mews am
@@ -401,6 +382,7 @@ def _resa_to_resync() -> list[dict]:
     joined AS (
       SELECT c.duve_reservation_id, c.pin_value, c.iseo_device_id, c.iseo_invitation_id,
              c.iseo_guest_tag_id, c.iseo_lock_id, c.iseo_lock_tag_id,
+             c.cache_ci, c.cache_co,
              d.duve_property_id, m.customer_name,
              m.checkin_date AS live_ci, m.checkout_date AS live_co,
              m.earliest_checkin_hour, m.latest_checkout_hour
@@ -410,7 +392,10 @@ def _resa_to_resync() -> list[dict]:
                  AND m.resource_id = d.duve_property_id
       WHERE COALESCE(m.is_cancelled, FALSE) = FALSE
         AND m.checkout_date >= CURRENT_DATE()
-        AND (m.checkin_date != c.cache_ci OR m.checkout_date != c.cache_co)
+        -- drift de dates OU invitation manquante (échec au provision) : le resync
+        -- recrée device (même PIN) + invitation → guest récupère son lien remote-open.
+        AND (m.checkin_date != c.cache_ci OR m.checkout_date != c.cache_co
+             OR c.iseo_invitation_id IS NULL)
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY c.duve_reservation_id
         ORDER BY ABS(DATE_DIFF(m.checkin_date, c.cache_ci, DAY))) = 1
@@ -577,6 +562,8 @@ def _get_or_create_guest_user(duve_resa_id: str, guest_name: Optional[str]) -> t
     if g.status_code == 200:
         tag = _user_tag_id(g.json())
         return (tag, None) if tag else (None, "user existant sans tag 'user'")
+    if g.status_code != 404:  # 401/500… ≠ absent : ne PAS créer un doublon
+        return None, f"user GET HTTP {g.status_code}"
 
     fn, ln = _split_name(guest_name)
     email = f"resa-{duve_resa_id}@guest.archides.fr"  # unique par résa, jamais utilisé
@@ -585,7 +572,12 @@ def _get_or_create_guest_user(duve_resa_id: str, guest_name: Optional[str]) -> t
         "firstname": fn, "lastname": ln, "roleIds": [5], "extId": ext})
     if r.status_code not in (200, 201):
         return None, f"user POST HTTP {r.status_code}: {r.text[:200]}"
-    tag = _user_tag_id(r.json())
+    body = r.json()
+    if body.get("enabled") is False:
+        # Contrat empirique password→enabled : si Sofia le change, le user sera GC
+        # en minutes (perte du tag) → PIN cassé. On le signale au lieu de subir.
+        logger.warning(f"⚠️ user {ext} créé enabled=False (comportement password→enabled changé ?)")
+    tag = _user_tag_id(body)
     if tag is None:  # fallback : relire le user pour récupérer son tag
         g2 = _sofia("GET", f"/api/v2/users/extId/{ext}")
         tag = _user_tag_id(g2.json()) if g2.status_code == 200 else None
@@ -691,7 +683,7 @@ def _post_device(row: dict, pin_ext: str, win: dict,
         logger.warning(f"⚠️ code {pin_value} repris entre-temps → régénération")
     last_err = None
     for _ in range(PIN_COLLISION_RETRIES):
-        pv = f"{random.randint(0, 9999):04d}"
+        pv = f"{secrets.randbelow(10000):04d}"
         payload["deviceId"] = pv
         r = _sofia("POST", "/api/v2/standardDevices", json_body=payload)
         if r.status_code in (200, 201):
@@ -711,6 +703,8 @@ def _get_or_create_device(row: dict, pin_ext: str, win: dict) -> tuple[Optional[
     if g.status_code == 200:
         d = g.json()
         return str(d.get("deviceId")), d.get("id")
+    if g.status_code != 404:  # ≠ absent : ne pas créer un doublon device
+        return None, f"device GET {g.status_code}: {g.text[:120]}"
     return _post_device(row, pin_ext, win)
 
 
@@ -719,6 +713,9 @@ def _get_or_create_invitation(row: dict, inv_ext: str, win: dict) -> tuple[Optio
     if g.status_code == 200:
         d = g.json()
         return d.get("id"), d.get("code")
+    if g.status_code != 404:  # ≠ absent : ne pas créer un doublon invitation
+        logger.warning(f"⚠️ invitation GET {inv_ext}: HTTP {g.status_code}")
+        return None, None
     r = _sofia("POST", "/api/v2/invitations", json_body={
         "name": inv_ext, "extId": inv_ext, "smartLockIds": [int(row["lock_id"])],
         "daysOfTheWeek": [1, 2, 3, 4, 5, 6, 7],
@@ -812,21 +809,35 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     pin_ext = f"MERVEIL_RESA - {duve_resa_id}"
     inv_ext = f"MERVEIL_INV - {duve_resa_id}"
 
-    # 1. DELETE device + invitation existants
-    g = _sofia("GET", f"/api/v2/standardDevices/extId/{pin_ext}")
-    if g.status_code == 200:
-        rd = _sofia("DELETE", f"/api/v2/standardDevices/{g.json().get('id')}")
-        if rd.status_code not in (200, 204):
-            return False, f"resync device DELETE {rd.status_code}"
-    elif g.status_code != 404:
-        return False, f"resync device GET {g.status_code}"
-    if row.get("iseo_invitation_id"):
-        _sofia("DELETE", f"/api/v2/invitations/{int(row['iseo_invitation_id'])}")
+    # Drift de dates ? Sinon on est ici pour réparer une invitation manquante → NE PAS
+    # toucher au device (éviter une fenêtre de lockout ≤2h si le re-POST échoue après
+    # le DELETE, et le churn Sofia). Le device n'a besoin d'être refait que si la window
+    # a changé.
+    has_drift = (str(row["live_ci"]) != str(row.get("cache_ci"))
+                 or str(row["live_co"]) != str(row.get("cache_co")))
 
-    # 2. re-POST device (même code si possible) + invitation (nouveau code/lien)
-    pin_value, device_id = _post_device(row, pin_ext, win, pin_value=row.get("pin_value"))
-    if pin_value is None:
-        return False, f"resync device re-POST failed: {device_id}"
+    if has_drift:
+        # 1. DELETE device puis re-POST avec la window live (même code PIN).
+        g = _sofia("GET", f"/api/v2/standardDevices/extId/{pin_ext}")
+        if g.status_code == 200:
+            rd = _sofia("DELETE", f"/api/v2/standardDevices/{g.json().get('id')}")
+            if rd.status_code not in (200, 204):
+                return False, f"resync device DELETE {rd.status_code}"
+        elif g.status_code != 404:
+            return False, f"resync device GET {g.status_code}"
+        pin_value, device_id = _post_device(row, pin_ext, win, pin_value=row.get("pin_value"))
+        if pin_value is None:
+            return False, f"resync device re-POST failed: {device_id}"
+    else:
+        # Invitation-only : device intact (window déjà correcte), on garde son état cache.
+        pin_value, device_id = str(row.get("pin_value")), row.get("iseo_device_id")
+
+    # Invitation : DELETE l'ancienne (si présente) + recréer (nouveau code/lien). Sans la
+    # vérif du DELETE, un échec ferait réutiliser l'ancienne invitation (window périmée).
+    if row.get("iseo_invitation_id"):
+        ri = _sofia("DELETE", f"/api/v2/invitations/{int(row['iseo_invitation_id'])}")
+        if ri.status_code not in (200, 204, 404):
+            return False, f"resync invitation DELETE {ri.status_code}"
     inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
     link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
 
