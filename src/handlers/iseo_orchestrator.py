@@ -813,6 +813,16 @@ def _native_duve_pins_to_purge() -> list[dict]:
     m AS (
       SELECT customer_id, resource_id, reservation_number, is_cancelled, checkin_date, checkout_date
       FROM `{MEWS_FCT_TABLE}`
+    ),
+    -- Résas actives (non annulées, CO à venir) par guest×appart. Si une existe, le
+    -- DUVE_PIN peut être l'unique code d'une résa JUMELLE active (rebooking Mews
+    -- cancel+recreate mêmes dates) → NE PAS purger, sinon guest sans code jusqu'à J-7.
+    -- Le WHERE seul ne protège pas ce cas : le jumeau actif (CO futur) est filtré,
+    -- seul le jumeau annulé passe → purge à tort. D'où ce garde anti-jointure.
+    active AS (
+      SELECT DISTINCT customer_id, resource_id
+      FROM `{MEWS_FCT_TABLE}`
+      WHERE NOT COALESCE(is_cancelled, FALSE) AND checkout_date >= CURRENT_DATE()
     )
     SELECT p.ext_id, p.duve_reservation_id,
            TRIM(CONCAT(COALESCE(p.user_firstname,''),' ',COALESCE(p.user_lastname,''))) AS guest,
@@ -821,8 +831,10 @@ def _native_duve_pins_to_purge() -> list[dict]:
     FROM dpin p
     JOIN duve_latest d ON d.duve_reservation_id = p.duve_reservation_id
     JOIN m ON m.customer_id = d.mews_customer_id AND m.resource_id = d.duve_property_id
+    LEFT JOIN active a ON a.customer_id = d.mews_customer_id AND a.resource_id = d.duve_property_id
     WHERE LOWER(d.duve_property_id) IN UNNEST(@wl)
       AND (m.is_cancelled OR m.checkout_date < CURRENT_DATE())
+      AND a.customer_id IS NULL
     QUALIFY ROW_NUMBER() OVER (PARTITION BY p.ext_id
       ORDER BY ABS(DATE_DIFF(m.checkin_date, DATE(p.active_from), DAY))) = 1
     """
