@@ -205,6 +205,7 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 | superhost_risk | email_digest@daily | ✅ | ~25 |
 | dispo_daily_summary | email_digest@daily | ✅ | ~2 |
 | gap_pricing_summary | email_digest@daily | ✅ | ~3 |
+| beyond_surcote_gap | email_digest@daily | ✅ | ~22 |
 | champagne_direct | breezeway_task | ❌ disabled | ~5 |
 | low_review_cleanliness | breezeway_task | ✅ (placeholder) | 0 |
 | client_risk | email_digest@daily | ❌ disabled | ~18 |

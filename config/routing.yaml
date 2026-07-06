@@ -172,6 +172,12 @@ triggers:
       - type: email_digest
         bucket: daily
 
+  beyond_surcote_gap:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
   # ── Triggers nécessitant des actions ciblées ──────────────────────────────
   champagne_direct:
     enabled: false   # legacy disabled
