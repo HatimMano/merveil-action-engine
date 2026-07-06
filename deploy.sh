@@ -5,6 +5,12 @@
 
 set -e
 
+# ⚠️ Build depuis le dossier DU SERVICE, jamais le CWD courant : `gcloud builds submit`
+# sans source utilise le CWD → lancé depuis un autre repo (ex. dbt), il buildait l'image
+# de CE repo et l'écrasait sur l'action-engine (incident 2026-07-06 : jobs iseo/2h/daily
+# se sont mis à exécuter dbt). Le cd garantit le bon contexte de build.
+cd "$(dirname "$0")"
+
 PROJECT="merveil-data-warehouse"
 REGION="europe-west1"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/merveil-docker/merveil-action-engine:latest"
