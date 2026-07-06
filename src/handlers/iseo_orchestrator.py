@@ -74,6 +74,8 @@ SMART_LOCKS_TABLE = os.environ.get(
     "SMART_LOCKS_TABLE", "merveil-data-warehouse.staging.stg_iseo__smart_locks")
 STD_DEVICES_TABLE = os.environ.get(
     "STD_DEVICES_TABLE", "merveil-data-warehouse.staging.stg_iseo__standard_devices")
+WHITELIST_TABLE = os.environ.get(
+    "ISEO_WHITELIST_TABLE", "merveil-data-warehouse.staging.iseo_whitelisted_apartments")
 
 ISEO_BASE_URL = os.environ.get("ISEO_BASE_URL", "https://api-archides.jago.cloud")
 ISEO_USERNAME = (os.environ.get("ISEO_MANAGER_USERNAME") or "").strip()
@@ -90,6 +92,9 @@ DUVE_FIELD_NAME = os.environ.get(
 REMOTE_OPEN_HOST = os.environ.get("ISEO_REMOTE_OPEN_HOST", "archides.jago.cloud")
 
 ISEO_SHADOW_MODE = os.environ.get("ISEO_SHADOW_MODE", "true").lower() == "true"
+# Whitelist des apparts cutover. Source de vérité = seed BQ iseo_whitelisted_apartments
+# (chargé au run via _load_whitelist → élargir = 1 ligne dans le seed, sans redeploy).
+# La valeur env ci-dessous = FALLBACK si le seed est vide/inaccessible (garde-fou).
 ALLOWED_PROPERTY_IDS = {
     pid.strip().lower()
     for pid in (os.environ.get("ISEO_ALLOWED_PROPERTY_IDS") or "").split(",")
@@ -926,6 +931,32 @@ def _purge_native_orphan(row: dict) -> tuple[bool, Optional[str]]:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _load_whitelist() -> set:
+    """Whitelist des GUID property_id depuis le seed BQ iseo_whitelisted_apartments.
+    Fallback sur ISEO_ALLOWED_PROPERTY_IDS (env) si le seed est vide OU inaccessible —
+    garde-fou : jamais élargir ni vider la whitelist par accident sur un incident BQ.
+    Le seed est le point unique d'élargissement (aussi lu par les 2 modèles dbt)."""
+    try:
+        # TRIM + exige les 2 colonnes non vides : une ligne `,<guid>` (apartment_code
+        # vide) provisionnerait un appart non surveillé par les modèles dbt ; un GUID
+        # avec espace parasite sortirait silencieusement du pipeline.
+        rows = _bq().query(
+            f"SELECT DISTINCT TRIM(LOWER(property_id)) AS pid FROM `{WHITELIST_TABLE}` "
+            f"WHERE COALESCE(TRIM(property_id), '') != '' "
+            f"  AND COALESCE(TRIM(apartment_code), '') != ''").result()
+        pids = {r["pid"] for r in rows if r["pid"]}
+        if pids:
+            return pids
+        logger.warning("⚠️ whitelist seed BQ vide → fallback env var")
+    except Exception as e:
+        logger.warning(f"⚠️ whitelist seed BQ inaccessible ({e}) → fallback env var")
+    if not ALLOWED_PROPERTY_IDS:
+        # Seed ET env vides : un set vide = allow-all sur _provision/_resync (l'inverse
+        # de la purge, gatée elle). On refuse de provisionner tout le parc → CRASH (mail).
+        raise RuntimeError("whitelist ISEO vide (seed BQ + env var) — refus de provisionner")
+    return ALLOWED_PROPERTY_IDS
+
+
 def run() -> None:
     """Wrapper : tout crash → alerte mail + exit non-zero (visible Cloud Run)."""
     try:
@@ -937,9 +968,11 @@ def run() -> None:
 
 
 def _run_inner() -> None:
+    global ALLOWED_PROPERTY_IDS
+    ALLOWED_PROPERTY_IDS = _load_whitelist()
     logger.info("=" * 70)
     logger.info(f"🚀 ISEO Orchestrator V3 (shadow={ISEO_SHADOW_MODE}, "
-                f"whitelist={len(ALLOWED_PROPERTY_IDS)} property_ids)")
+                f"whitelist={len(ALLOWED_PROPERTY_IDS)} property_ids depuis le seed BQ)")
     logger.info("=" * 70)
     errors: list[str] = []
 

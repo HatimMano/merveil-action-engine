@@ -58,7 +58,10 @@ echo "🚀 Déploiement du job iseo-orchestrator (pipeline V3 100% DWH — natif
 #     Son tag 'user' auto-créé = guestTagId du PIN → l'UI Luckey affiche le vrai nom. Le
 #     user est supprimé à l'archive (cf. iseo_orchestrator.py). Plus de tag générique
 #     partagé (ancien ISEO_DEFAULT_GUEST_TAG_ID : 184106 system KO, 184181 GC'd).
-#     Liste complète des 13 apparts pour ré-élargir ensuite :
+#   - ⭐ WHITELIST pilotée par le SEED dbt `iseo_whitelisted_apartments` (source unique,
+#     lue au run par _load_whitelist + par les 2 modèles dbt). Élargir = 1 ligne dans le
+#     seed CSV, sans redeploy. L'ISEO_ALLOWED_PROPERTY_IDS ci-dessous n'est plus qu'un
+#     FALLBACK (si le seed est vide/inaccessible). Liste complète des 13 apparts (ref) :
 #       c12a7244-f97b-4633-b6a7-b16f0079821c,1068206f-58c2-4ff8-8d71-b16f0079821c,
 #       22785cb3-555b-4020-92d6-b16f0079821c,ef51211e-3550-456a-9410-b16f0079821c,
 #       aa37778e-7257-40ad-9b5c-b16f0079821c,70edbca0-6abb-4bae-bd89-b16f0079821c,

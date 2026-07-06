@@ -49,7 +49,7 @@ Cf. [[project_iseo_integration_2026]] + `Archides/to_do_20_06.md`.
 
 **Mode shadow** (`ISEO_SHADOW_MODE=true`) : log "would provision" sans appel Sofia/Duve ni écriture d'état.
 
-**Whitelist** (`ISEO_ALLOWED_PROPERTY_IDS=csv de GUID`) : **cutover = 7 apparts live** (SEB23-3F, SEB23-3G, CLE7-0D, OUR12-1D, TBG52-1D, TBG52-1G, MRI16-0D). Liste des apparts à ré-activer en commentaire dans `deploy.sh`. ⚠ **3 whitelists à garder alignées** sur ces 7 apparts : `ISEO_ALLOWED_PROPERTY_IDS` (deploy.sh, en GUID), `trigger_iseo_pin_missing.sql` et `dash_ops_lock_events.sql` (en code appart). Candidat à un seed dbt partagé.
+**Whitelist** — ⭐ **source unique = seed dbt `iseo_whitelisted_apartments`** (`apartment_code, property_id`), depuis 2026-07-06. Chargée au run par `_load_whitelist()` (query BQ, fallback `ISEO_ALLOWED_PROPERTY_IDS` env si seed vide/inaccessible) ET par les 2 modèles dbt `trigger_iseo_pin_missing.sql` + `dash_ops_lock_events.sql` (via `ref()`). **Élargir le cutover = ajouter 1 ligne dans le seed CSV + `dbt seed`** (le job dbt le fait avant `dbt run`), aucun redeploy de l'orchestrateur. Fini le drift des 3 whitelists hardcodées. Cutover actuel = 7 apparts (SEB23-3F/3G, CLE7-0D, OUR12-1D, TBG52-1D/1G, MRI16-0D). ~113 apparts prêts (lockTag ok) à élargir par lots progressifs, monitorés via 7.8 réconciliation + gaps.
 
 **Secrets requis** : `ISEO_MANAGER_USERNAME` + `ISEO_MANAGER_PASSWORD` + `DUVE_CONNECT_TOKEN` (=`duve-connect-token`). Env : `DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18`. SA `action-engine-sa` a `secretAccessor` project-wide.
 
