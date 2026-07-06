@@ -282,7 +282,7 @@ def _resa_to_provision() -> list[dict]:
       FROM mews m
       JOIN duve_latest d ON d.mews_customer_id = m.customer_id
                         AND d.duve_property_id = m.resource_id
-      JOIN locks lk      ON lk.duve_property_id = m.resource_id
+      LEFT JOIN locks lk ON lk.duve_property_id = m.resource_id
       LEFT JOIN guest_tags gt ON gt.lock_tag_id = lk.lock_tag_id
       LEFT JOIN payments pay  ON pay.reservation_id = m.mews_reservation_id
       LEFT JOIN active_state s ON s.duve_reservation_id = d.duve_reservation_id
@@ -300,6 +300,51 @@ def _resa_to_provision() -> list[dict]:
     SELECT * FROM joined ORDER BY checkin_date
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
+
+
+def _whitelisted_gaps() -> list[dict]:
+    """Trous silencieux : résas whitelistées à provisionner bientôt (CI ≤ J-lookahead,
+    CO ≥ today, non annulées, pas déjà couvertes par une row cache active) mais NON
+    provisionnables faute de mapping Duve (webhook checkin absent) OU de lock résolue.
+    Sans ça une résa sans mapping Duve est effacée par le INNER JOIN de _resa_to_provision
+    (ni skip ni erreur) → guest potentiellement sans code sans aucun signal."""
+    if not ALLOWED_PROPERTY_IDS:
+        return []
+    q = f"""
+    WITH {_DUVE_LATEST_CTE},
+    {_LOCKS_CTE},
+    active_by_mews AS (
+      SELECT DISTINCT mews_reservation_number
+      FROM `{PIN_CACHE_TABLE}`
+      WHERE archived_at IS NULL AND mews_reservation_number IS NOT NULL
+    )
+    SELECT m.reservation_number, m.resource_id, m.customer_name, m.checkin_date,
+           (d.duve_reservation_id IS NULL) AS no_duve,
+           (lk.lock_id IS NULL)            AS no_lock
+    FROM `{MEWS_FCT_TABLE}` m
+    LEFT JOIN duve_latest d ON d.mews_customer_id = m.customer_id
+                           AND d.duve_property_id = m.resource_id
+    LEFT JOIN locks lk       ON lk.duve_property_id = m.resource_id
+    LEFT JOIN active_by_mews am
+      ON am.mews_reservation_number = CAST(m.reservation_number AS STRING)
+    WHERE LOWER(m.resource_id) IN UNNEST(@wl)
+      AND m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
+      AND m.checkout_date >= CURRENT_DATE()
+      AND COALESCE(m.is_cancelled, FALSE) = FALSE
+      AND am.mews_reservation_number IS NULL
+      -- lock manquante = anormal sur whitelist (alerte à tout horizon). Mapping Duve
+      -- manquant = souvent juste un guest qui n'a pas fini son pré-checkin → n'alerter
+      -- que si le CI est imminent (≤ J+2), sinon spam self-résolu à chaque run.
+      AND (lk.lock_id IS NULL
+           OR (d.duve_reservation_id IS NULL
+               AND m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL 2 DAY)))
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY CAST(m.reservation_number AS STRING)
+      ORDER BY m.checkin_date) = 1
+    """
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("wl", "STRING", sorted(ALLOWED_PROPERTY_IDS))])
+    return [dict(r.items()) for r in _bq().query(q, job_config=cfg).result()]
 
 
 def _resa_to_archive() -> list[dict]:
@@ -691,9 +736,16 @@ def _archive(row: dict) -> tuple[bool, Optional[str]]:
     """DELETE Sofia device (par extId) + DELETE invitation (par id) + DELETE le user
     dédié de la résa (par extId)."""
     duve_resa_id = row["duve_reservation_id"]
-    if ISEO_SHADOW_MODE or bool(row.get("shadow_mode")):
-        logger.info(f"🌗 SHADOW {duve_resa_id}: archive skipped")
+    if bool(row.get("shadow_mode")):
+        # Row provisionnée en shadow (aucun device Sofia) → mark archived OK, rien à supprimer.
+        logger.info(f"🌗 SHADOW row {duve_resa_id}: archive (pas d'appel Sofia)")
         return True, None
+    if ISEO_SHADOW_MODE:
+        # Shadow GLOBAL sur une row LIVE : NE PAS marquer archived (sinon le PIN Sofia
+        # n'est jamais supprimé mais la row est figée → code valide résiduel). On laisse
+        # la row active pour qu'elle soit réellement archivée dès que shadow repasse off.
+        logger.info(f"🌗 SHADOW global {duve_resa_id}: would archive (row live laissée active)")
+        return False, "skipped: shadow global (row live)"
 
     errs = []
     # device (à supprimer avant le user — il l'ancre)
@@ -897,6 +949,14 @@ def _run_inner() -> None:
             logger.warning(f"⚠️ provision failed {row['duve_reservation_id']}: {err}")
             errors.append(f"provision {row['duve_reservation_id']} ({row.get('apartment_code')}): {err}")
 
+    # 1a. Trous silencieux : résas whitelistées à provisionner sans mapping Duve / lock.
+    for g in _whitelisted_gaps():
+        reason = "pas de mapping Duve (webhook checkin absent)" if g.get("no_duve") else "lock non résolue"
+        msg = (f"gap provision résa {g.get('reservation_number')} "
+               f"({g.get('customer_name')}, CI {g.get('checkin_date')}) : {reason}")
+        logger.warning("⚠️ " + msg)
+        errors.append(msg)
+
     # 1b. Resync drift de dates (window cache ≠ dates live Mews)
     to_resync = _resa_to_resync()
     if to_resync:
@@ -940,6 +1000,8 @@ def _run_inner() -> None:
                 archived += 1
             except Exception as e:
                 errors.append(f"archive state {row['duve_reservation_id']}: {e}")
+        elif str(err).startswith("skipped"):
+            pass  # shadow global : row live laissée active (cf. _archive)
         else:
             errors.append(f"archive {row['duve_reservation_id']}: {err}")
 

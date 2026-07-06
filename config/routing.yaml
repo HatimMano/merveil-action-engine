@@ -228,6 +228,14 @@ triggers:
       - type: email_digest
         bucket: 2h
 
+  # Écarts cache DWH ↔ Sofia (dash_ops_pin_reconciliation). MISSING_IN_SOFIA = code
+  # supprimé UI Sofia pendant séjour (incident Crystal Balcom). Bucket 2h.
+  iseo_reconciliation:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: 2h
+
   # ── Trésorerie ────────────────────────────────────────────────────────────
   # Compte bancaire sous son seuil (seed treasury_thresholds). Le message propose
   # le montant à virer. Bucket daily (snapshot bancaire daily). N2 → N3.

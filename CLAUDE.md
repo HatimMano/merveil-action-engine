@@ -7,7 +7,7 @@ Python 3.12 + **Cloud Run Job** (runs once and terminates — not an HTTP server
 - `merveil-action-engine-daily` → FREQ=daily (dispatcher trigger/action) — englobe maintenant tous les triggers
 - `merveil-action-engine-cancellations-brief` → FREQ=cancellations_brief (standalone, court-circuite le dispatcher pour envoyer un rapport mail annulations 24h à 11h Paris ; cf. `src/handlers/cancellations_brief.py`)
 - `merveil-action-engine-iseo` → FREQ=iseo_orchestrator (standalone, pipeline V3 ISEO — recreate PINs Sofia à J-7 du CI avec MÊME deviceId capturé au pre-checkin done par webhook-gateway ; cf. `src/handlers/iseo_orchestrator.py`). Scheduler **`merveil-action-engine-iseo-2h` toutes les 2h à :45** Europe/Paris (`45 */2 * * *`) — passé de quotidien (7h30) à 2h le **2026-06-18** pour fermer le lockout near-CI + la latence d'annulation. Calé sur la cascade : ETL `:00` → dbt `:15` → dashboard `:30` → **orchestrateur `:45`** (fct_reservations frais, zéro chevauchement). Cf. ADR 2026-06-18.
-- `merveil-action-engine-2h` → FREQ=2h (dispatcher, bucket `2h`) — **alertes serrures ISEO** (`iseo_pin_missing`, `iseo_etl_stale`, **`iseo_reconciliation`** depuis 2026-06-18 = écarts critical cache↔Sofia). Scheduler toutes les 2h à :00. Bucket `2h` TTL 4h (dédup). Destinataires : `digest_buckets.2h.default_recipients` dans `routing.yaml` (⚠ le flush n'utilise PAS `params.recipients` per-trigger). Cf. ADR 2026-06-13 + 2026-06-18.
+- `merveil-action-engine-2h` → FREQ=2h (dispatcher, bucket `2h`) — **alertes serrures ISEO** (`iseo_pin_missing`, `iseo_etl_stale`, **`iseo_reconciliation`**). Scheduler toutes les 2h à :00. Bucket `2h` TTL 4h (dédup). Destinataires : `digest_buckets.2h.default_recipients` dans `routing.yaml` (⚠ le flush n'utilise PAS `params.recipients` per-trigger). Cf. ADR 2026-06-13 + 2026-06-18. **`iseo_reconciliation` recréé 2026-07-06** sur le nouveau modèle `dash_ops_pin_reconciliation` (V3) : `MISSING_IN_SOFIA` (cache actif mais device absent Sofia = code supprimé UI / recreate planté = **incident fondateur Crystal Balcom**, CRITICAL), `ORPHAN_SOFIA` (device Sofia sans cache actif), `STALE_AFTER_CO` (cache actif CO passé = archive KO). L'ancien PHANTOM/DRIFT (schéma capture/recreate) était bien supprimé le 20/06 → la réconciliation a été **absente entre-temps**.
 
 5 Cloud Schedulers : **daily 7h + 2h serrures (:00) + iseo 2h (:45) + 11h cancellations ENABLED** (prod), 4H + weekly PAUSED.
 Reads pending actions (Breezeway) + rule tables (digest) produced by dbt.
@@ -49,7 +49,7 @@ Cf. [[project_iseo_integration_2026]] + `Archides/to_do_20_06.md`.
 
 **Mode shadow** (`ISEO_SHADOW_MODE=true`) : log "would provision" sans appel Sofia/Duve ni écriture d'état.
 
-**Whitelist** (`ISEO_ALLOWED_PROPERTY_IDS=csv de GUID`) : **cutover = DAL40 seul** (`c12a7244…`). Liste des 13 apparts à ré-activer en commentaire dans `deploy.sh`.
+**Whitelist** (`ISEO_ALLOWED_PROPERTY_IDS=csv de GUID`) : **cutover = 7 apparts live** (SEB23-3F, SEB23-3G, CLE7-0D, OUR12-1D, TBG52-1D, TBG52-1G, MRI16-0D). Liste des apparts à ré-activer en commentaire dans `deploy.sh`. ⚠ **3 whitelists à garder alignées** sur ces 7 apparts : `ISEO_ALLOWED_PROPERTY_IDS` (deploy.sh, en GUID), `trigger_iseo_pin_missing.sql` et `dash_ops_lock_events.sql` (en code appart). Candidat à un seed dbt partagé.
 
 **Secrets requis** : `ISEO_MANAGER_USERNAME` + `ISEO_MANAGER_PASSWORD` + `DUVE_CONNECT_TOKEN` (=`duve-connect-token`). Env : `DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18`. SA `action-engine-sa` a `secretAccessor` project-wide.
 
