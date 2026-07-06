@@ -994,12 +994,15 @@ def _run_inner() -> None:
             errors.append(f"provision {row['duve_reservation_id']} ({row.get('apartment_code')}): {err}")
 
     # 1a. Trous silencieux : résas whitelistées à provisionner sans mapping Duve / lock.
+    # Loggés à CHAQUE run mais mail 1×/jour seulement (run ~08:45 Paris) — un no_duve se
+    # résout souvent seul quand le guest fait son pré-checkin, inutile de spammer toutes les 2h.
+    gaps: list[str] = []
     for g in _whitelisted_gaps():
         reason = "pas de mapping Duve (webhook checkin absent)" if g.get("no_duve") else "lock non résolue"
-        msg = (f"gap provision résa {g.get('reservation_number')} "
+        msg = (f"résa {g.get('reservation_number')} "
                f"({g.get('customer_name')}, CI {g.get('checkin_date')}) : {reason}")
-        logger.warning("⚠️ " + msg)
-        errors.append(msg)
+        logger.warning("⚠️ gap provision " + msg)
+        gaps.append(msg)
 
     # 1b. Resync drift de dates (window cache ≠ dates live Mews)
     to_resync = _resa_to_resync()
@@ -1074,3 +1077,12 @@ def _run_inner() -> None:
                 f"(provision ok={ok}, resync={resynced}, duve-retry={retry}, archived={archived}, purged={purged}) :\n\n"
                 + "\n".join(f"• {e}" for e in errors[:50]))
         _send_alert(f"⚠️ ISEO orchestrator — {len(errors)} erreur(s)", body)
+
+    # Gaps : mail 1×/jour (run du matin ~08:45 Paris), séparé des erreurs dures qui,
+    # elles, alertent à chaque run. Évite le spam sur un gap qui se résout tout seul.
+    if gaps and datetime.now(PARIS_TZ).hour == 8:
+        _send_alert(
+            f"ℹ️ ISEO — {len(gaps)} résa(s) whitelistée(s) sans code à surveiller",
+            "Résas à provisionner bientôt mais sans mapping Duve (pré-checkin guest pas "
+            "encore fait — souvent auto-résolu) ou sans lock résolue (à investiguer) :\n\n"
+            + "\n".join(f"• {g}" for g in gaps[:50]))
