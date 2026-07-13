@@ -56,7 +56,7 @@ gcloud run jobs deploy merveil-action-engine-cancellations-brief \
 
 echo "🚀 Déploiement du job iseo-orchestrator (pipeline V3 100% DWH — natif coupé)..."
 # Notes :
-#   - Pipeline V3 : provision J-7 (device + invitation + push Duve) / archive au checkout.
+#   - Pipeline V3 : provision J-3 (device + invitation + push Duve) / archive au checkout.
 #   - ISEO_SHADOW_MODE=false → live. Mettre =true pour un dry-run (log "would provision").
 #   - DUVE_CONNECT_TOKEN (secret) + DUVE_CONNECT_PID (intégration entrante Duve dédiée DWH).
 #   - Guest tag : 1 user Sofia DÉDIÉ par résa, au vrai nom du guest (firstname/lastname),
@@ -85,4 +85,4 @@ gcloud run jobs deploy merveil-action-engine-iseo \
   --set-env-vars "^;^GCP_PROJECT_ID=$PROJECT;FREQ=iseo_orchestrator;ISEO_SHADOW_MODE=false;DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18;GMAIL_SENDER=noreply@archides.fr;ISEO_ALERT_TO=hatim@archides.fr;ISEO_ALLOWED_PROPERTY_IDS=e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,ed0d0ccd-d5a0-4cbf-9f6f-b1d20103b89f,70edbca0-6abb-4bae-bd89-b16f0079821c,aa37778e-7257-40ad-9b5c-b16f0079821c,3cc98d6e-294c-43df-848b-b16f0079821c,880c9419-8e25-4740-b8c3-b1c200b95203"
 
 echo ""
-echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-7)"
+echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-3)"

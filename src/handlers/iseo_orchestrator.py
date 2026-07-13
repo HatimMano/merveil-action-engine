@@ -106,7 +106,7 @@ ALLOWED_PROPERTY_IDS = {
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@archides.fr")
 ISEO_ALERT_TO = os.getenv("ISEO_ALERT_TO", "hatim@archides.fr")
 
-LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "7"))
+LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "3"))
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "13:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "12:00")
 PIN_COLLISION_RETRIES = 8
@@ -868,7 +868,7 @@ def _native_duve_pins_to_purge() -> list[dict]:
     ⚠️ Scope STRICT à la whitelist : sur les ~120 apparts non cutover, le DUVE_PIN
     natif reste l'UNIQUE code du guest — ne JAMAIS purger en dehors de la whitelist.
     On ne touche pas non plus les résas ACTIVE (leur DUVE_PIN double notre code mais
-    reste l'unique code des résas >J-7 pas encore provisionnées) — nettoyées au CO."""
+    reste l'unique code des résas >J-3 pas encore provisionnées) — nettoyées au CO."""
     if not ALLOWED_PROPERTY_IDS:
         return []
     q = f"""
@@ -884,7 +884,7 @@ def _native_duve_pins_to_purge() -> list[dict]:
     ),
     -- Résas actives (non annulées, CO à venir) par guest×appart. Si une existe, le
     -- DUVE_PIN peut être l'unique code d'une résa JUMELLE active (rebooking Mews
-    -- cancel+recreate mêmes dates) → NE PAS purger, sinon guest sans code jusqu'à J-7.
+    -- cancel+recreate mêmes dates) → NE PAS purger, sinon guest sans code jusqu'à J-3.
     -- Le WHERE seul ne protège pas ce cas : le jumeau actif (CO futur) est filtré,
     -- seul le jumeau annulé passe → purge à tort. D'où ce garde anti-jointure.
     active AS (
@@ -976,7 +976,7 @@ def _run_inner() -> None:
     logger.info("=" * 70)
     errors: list[str] = []
 
-    # 1. Provision (J-7)
+    # 1. Provision (J-3)
     to_provision = _resa_to_provision()
     logger.info(f"📋 {len(to_provision)} résa(s) à provisionner (CI dans 0-{LOOKAHEAD_DAYS}j, pas encore couvertes)")
     ok = skip = 0

@@ -43,7 +43,7 @@ if __name__ == "__main__":
             run_cancellations_brief()
         elif FREQ == "iseo_orchestrator":
             # Mode standalone : pipeline V3 100% DWH (natif coupé). Provisionne les
-            # PINs Sofia à J-7 (POST device + invitation + push Duve), resync le drift
+            # PINs Sofia à J-3 (POST device + invitation + push Duve), resync le drift
             # de dates, archive après CO/annulation. Indépendant du dispatcher.
             from src.handlers.iseo_orchestrator import run as run_iseo_orchestrator
             run_iseo_orchestrator()
