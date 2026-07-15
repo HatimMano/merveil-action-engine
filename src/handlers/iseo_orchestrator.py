@@ -319,11 +319,12 @@ def _whitelisted_gaps() -> list[dict]:
       AND COALESCE(m.is_cancelled, FALSE) = FALSE
       AND am.mews_reservation_number IS NULL
       -- lock manquante = anormal sur whitelist (alerte à tout horizon). Mapping Duve
-      -- manquant = souvent juste un guest qui n'a pas fini son pré-checkin → n'alerter
-      -- que si le CI est imminent (≤ J+2), sinon spam self-résolu à chaque run.
+      -- manquant = un guest qui n'a pas rempli son pré-checkin (vérifié 15/07 : les 4
+      -- gaps du mail étaient tous ce cas, aucun event à recevoir) → n'alerter qu'à
+      -- J-1 du CI, avant c'est du bruit qui se résout tout seul.
       AND (lk.lock_id IS NULL
            OR (d.duve_reservation_id IS NULL
-               AND m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL 2 DAY)))
+               AND m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY)))
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY CAST(m.reservation_number AS STRING)
       ORDER BY m.checkin_date) = 1
@@ -998,7 +999,8 @@ def _run_inner() -> None:
     # résout souvent seul quand le guest fait son pré-checkin, inutile de spammer toutes les 2h.
     gaps: list[str] = []
     for g in _whitelisted_gaps():
-        reason = "pas de mapping Duve (webhook checkin absent)" if g.get("no_duve") else "lock non résolue"
+        reason = ("pré-checkin Duve pas rempli (CI ≤ J+1) — relancer le guest, "
+                  "le code fixe couvre en attendant") if g.get("no_duve") else "lock non résolue"
         msg = (f"résa {g.get('reservation_number')} "
                f"({g.get('customer_name')}, CI {g.get('checkin_date')}) : {reason}")
         logger.warning("⚠️ gap provision " + msg)
