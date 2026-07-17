@@ -18,7 +18,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-FREQ = os.getenv("FREQ")  # 4h | daily | weekly | 2h | cancellations_brief | iseo_orchestrator
+FREQ = os.getenv("FREQ")  # 4h | daily | weekly | 2h | cancellations_brief | iseo_orchestrator | beyond_push
 
 
 if __name__ == "__main__":
@@ -47,6 +47,12 @@ if __name__ == "__main__":
             # de dates, archive après CO/annulation. Indépendant du dispatcher.
             from src.handlers.iseo_orchestrator import run as run_iseo_orchestrator
             run_iseo_orchestrator()
+        elif FREQ == "beyond_push":
+            # Mode standalone : push déclaratif des fenêtres de prix gaps 1N vers
+            # Beyond (état voulu = dash_beyond_push_targets, GET → diff → PATCH,
+            # log beyond_raw.price_pushes_log). Indépendant du dispatcher.
+            from src.handlers.beyond_push import run as run_beyond_push
+            run_beyond_push()
         else:
             from src.core.dispatcher import TriggerDispatcher
             TriggerDispatcher().run(freq=FREQ)
