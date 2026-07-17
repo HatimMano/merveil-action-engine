@@ -76,6 +76,15 @@ triggers:
       - type: email_digest
         bucket: data_quality
 
+  # ── Continuité des flux finance (2026-07-17) ──────────────────────────────
+  # Un flux de données compta silencieux = trou invisible (exports Mews perdus
+  # sans retry, job factures en PERMISSION_DENIED 3 sem.). 1 alerte/flux/jour.
+  finance_flow_stale:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: data_quality
+
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
   # 6 fois/jour → 1 mail/jour). Le scheduler merveil-action-engine-4h est
