@@ -211,6 +211,7 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 | dispo_daily_summary | email_digest@daily | ✅ | ~2 |
 | gap_pricing_summary | email_digest@daily | ✅ | ~3 |
 | beyond_surcote_gap | email_digest@daily | ✅ | ~22 |
+| beyond_gap_filled | email_digest@daily | ✅ | rare (🎉 gap 1N vendu sous fenêtre DWH — fenêtre 24h sur created_at) |
 | budget_landing_gap | email_digest@daily | ✅ | 0-2 (mois courant <90% dès le 10 · M+1 OTB <50% dès le 15) |
 | champagne_direct | breezeway_task | ❌ disabled | ~5 |
 | low_review_cleanliness | breezeway_task | ✅ (placeholder) | 0 |
