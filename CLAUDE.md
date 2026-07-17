@@ -220,6 +220,9 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 | data_contract_breach | email_digest@data_quality | ✅ (POC) | ~1 |
 | finance_flow_stale | email_digest@data_quality | ✅ | 0 (tout frais) — 6 flux finance surveillés (exports Mews, ledger/factures Pennylane, payments API, écritures OTAs), seuils 30h→216h, CRITICAL à 2× |
 
+### ⚠ Buckets digest — `flush_with` obligatoire pour les buckets custom (fix 2026-07-17)
+`run(freq)` ne flushe que le bucket **homonyme** de FREQ + les buckets déclarant `flush_with: <freq>` dans `routing.yaml`. **Bug silencieux corrigé le 17/07** : le bucket `data_quality` (gouvernance, `dbt_test_failure`, `finance_flow_stale`) n'avait AUCUN `flush_with` → bufferisé puis jeté à chaque run daily, **0 mail envoyé depuis sa création** (vérifié `dispatched_actions` : aucune ligne bucket=data_quality). Tout nouveau bucket à destinataires dédiés DOIT porter `flush_with: daily` (ou `2h`/`4h`). Buckets satellites actuels : `data_quality` (Hatim, gouvernance) + `beyond` (hatim+raphael+mickael, trigger `beyond_gap_filled`). Le TTL des satellites = défaut 24h (`DIGEST_TTL_HOURS`).
+
 ### Gouvernance données fixes — `data_contract_breach` (POC 2026-06-30)
 Greffe la gouvernance des données de référence sur le pipeline trigger/action sans nouveau service. Cf. ADR `decisions.md` 2026-06-30 + `docs/audit/gouvernance-donnees-regles-2026-06-29.md`.
 - **Détection** (dbt) : `dashboard_quality.dash_governance_contracts` = 1 ligne/violation de contrat sur les snapshots DWH Feed (POC : onglet Appartements — clé dupliquée, format code, chambres/surface illisibles, snapshot périmé). Scalable : 1 domaine = 1 bloc UNION.
