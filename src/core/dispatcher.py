@@ -341,22 +341,38 @@ class TriggerDispatcher:
 
     # ── Point d'entrée ───────────────────────────────────────────────────────
 
+    def _buckets_for_freq(self, freq: str) -> list[str]:
+        """Bucket homonyme + buckets satellites déclarés `flush_with: <freq>`.
+
+        ⚠ Sans flush_with, un bucket custom (destinataires dédiés) est bufferisé
+        puis JETÉ en fin de run — aucun job ne le flushe jamais (bug silencieux
+        découvert 2026-07-17 : data_quality n'avait envoyé 0 mail depuis sa
+        création, triggers gouvernance/tests dbt/finance perdus sans erreur).
+        """
+        satellites = [
+            b for b, conf in self.routing.get("digest_buckets", {}).items()
+            if (conf or {}).get("flush_with") == freq and b != freq
+        ]
+        return [freq] + satellites
+
     def run(self, freq: str | None = None):
         """
         Exécute un cycle complet de dispatch.
 
         Args:
             freq: '4h' | 'daily' | None
-                  Détermine quels buckets de digest sont flushés à la fin.
+                  Détermine quels buckets de digest sont flushés à la fin :
+                  le bucket homonyme + les buckets `flush_with: <freq>`.
                   Les autres actions (asana_task, breezeway_task) sont exécutées
                   indépendamment de freq.
         """
         logger.info(f"=== TriggerDispatcher start (freq={freq}) ===")
+        flush_buckets = self._buckets_for_freq(freq) if freq else []
 
         # 1. Résolutions
         self._resolve_completed_breezeway()
-        if freq:
-            self._resolve_expired_digests(freq)
+        for bucket in flush_buckets:
+            self._resolve_expired_digests(bucket)
 
         # 2. Charger l'état
         triggers = self._load_triggers()
@@ -366,8 +382,8 @@ class TriggerDispatcher:
         for trigger in triggers:
             self._dispatch_trigger(trigger, open_keys)
 
-        # 4. Flush digests pour le bucket courant
-        if freq:
-            self._flush_digest(freq)
+        # 4. Flush digests : bucket courant + satellites flush_with
+        for bucket in flush_buckets:
+            self._flush_digest(bucket)
 
         logger.info(f"=== TriggerDispatcher done ===")

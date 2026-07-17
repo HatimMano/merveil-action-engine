@@ -47,10 +47,24 @@ digest_buckets:
     # ⚠ POC : route vers Hatim le temps de la validation. Pour passer en prod, basculer
     # default_recipients sur l'owner (emilia@archides.fr), ou implémenter le routage
     # dynamique depuis gouvernance_ownership.alert_email (évolution handler — Phase 2).
+    # flush_with: daily = flushé par le job daily 7h (fix 2026-07-17 : sans ce champ,
+    # le bucket était bufferisé puis jeté — 0 mail envoyé depuis sa création).
+    flush_with: daily
     send_if_empty: false
     subject_prefix: "[Merveil Gouvernance]"
     default_recipients:
       - hatim@archides.fr
+
+  beyond:
+    # Push auto Beyond (gaps 1N) — succès de vente sous fenêtre DWH.
+    # Destinataires dédiés (décision Hatim 17/07). Flushé par le job daily 7h.
+    flush_with: daily
+    send_if_empty: false
+    subject_prefix: "[Merveil Beyond]"
+    default_recipients:
+      - hatim@archides.fr
+      - raphael@archides.fr
+      - mickael@archides.fr
 
 # ============================================================================
 # Triggers
@@ -193,7 +207,7 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
+        bucket: beyond
 
   # Atterrissage budget : mois courant projeté < 90% du budget (dès le 10 du mois)
   # + M+1 avec OTB < 50% (dès le 15). Source : trigger_budget_landing_gap
