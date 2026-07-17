@@ -187,6 +187,14 @@ triggers:
       - type: email_digest
         bucket: daily
 
+  # 🎉 Gap 1N vendu alors qu'une fenêtre DWH était poussée (job beyond_push).
+  # Signal de succès du push auto — volume faible, digest daily suffit.
+  beyond_gap_filled:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
   # Atterrissage budget : mois courant projeté < 90% du budget (dès le 10 du mois)
   # + M+1 avec OTB < 50% (dès le 15). Source : trigger_budget_landing_gap
   # sur dash_ventes_budget (édition la plus récente).
