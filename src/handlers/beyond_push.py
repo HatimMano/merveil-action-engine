@@ -24,9 +24,11 @@ plancher annuel Beyond, cf. finding POC #3).
 
 Garde-fous :
   - fenêtres uniquement sur les listings du seed beyond_push_whitelist
-  - si une fenêtre voulue chevauche une règle équipe : min relevé au plancher
-    équipe (max(min_dwh, min_equipe)) — on ne casse jamais un plancher posé par
-    l'équipe ; si min relevé ≥ max → fenêtre skippée (loggée skip_team_floor)
+  - règle Hatim 17/07 : min = ménage + ops + coussin, JAMAIS en dessous (« mieux
+    vaut ne pas vendre que vendre sous coussin »). Si une règle équipe chevauche
+    avec un plancher PLUS HAUT → min relevé (on ne casse jamais un plancher
+    équipe) ; un plancher équipe plus bas est bypassé. Le max suit toujours le
+    min (max(max, min)) → aucune fenêtre skippée.
   - min ≥ 5 (contrainte API), min < max, dates futures, ≤ MAX_WINDOWS/listing
   - BEYOND_SHADOW_MODE=true → log "would patch" sans écrire
   - toute erreur → mail récap (infra Gmail DWD), crash → mail + exit non-zero
@@ -227,18 +229,16 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
                     for w in current if (w["start-date"], w["end-date"]) in owned_keys}
     team_rules = [w for w in current if (w["start-date"], w["end-date"]) not in owned_keys]
 
-    # Fenêtres voulues, ajustées aux planchers équipe qui les chevauchent
+    # Fenêtres voulues. Un plancher équipe plus HAUT relève notre min (on ne
+    # casse jamais une règle équipe) ; plus bas → bypassé (règle coussin).
+    # Le max suit le min → jamais de fenêtre incohérente, jamais de skip.
     final_desired: dict[tuple, dict] = {}
     for (start, end), t in sorted(desired.items()):
         mn, mx = t["min"], t["max"]
         for rule in team_rules:
             if rule.get("min-price") and _overlaps(start, end, rule):
                 mn = max(mn, float(rule["min-price"]))
-        if mn >= mx:
-            log("skip_team_floor", "ok", start, end, mn, mx,
-                ctx="plancher équipe ≥ max DWH — fenêtre non poussée")
-            continue
-        final_desired[(start, end)] = {"min": mn, "max": mx}
+        final_desired[(start, end)] = {"min": mn, "max": max(mx, mn)}
 
     if len(final_desired) > MAX_WINDOWS_PER_LISTING:
         errs.append(f"{apartment_code}: {len(final_desired)} fenêtres > cap "
