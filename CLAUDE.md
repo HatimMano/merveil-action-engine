@@ -216,6 +216,7 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 | client_risk | email_digest@daily | ❌ disabled | ~18 |
 | inspection_overdue | asana_task | ❌ disabled (POC) | ~41 |
 | data_contract_breach | email_digest@data_quality | ✅ (POC) | ~1 |
+| finance_flow_stale | email_digest@data_quality | ✅ | 0 (tout frais) — 6 flux finance surveillés (exports Mews, ledger/factures Pennylane, payments API, écritures OTAs), seuils 30h→216h, CRITICAL à 2× |
 
 ### Gouvernance données fixes — `data_contract_breach` (POC 2026-06-30)
 Greffe la gouvernance des données de référence sur le pipeline trigger/action sans nouveau service. Cf. ADR `decisions.md` 2026-06-30 + `docs/audit/gouvernance-donnees-regles-2026-06-29.md`.
