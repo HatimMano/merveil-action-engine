@@ -58,8 +58,11 @@ logger = logging.getLogger(__name__)
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "merveil-data-warehouse")
 TARGETS_TABLE = os.environ.get(
     "BEYOND_TARGETS_TABLE", "merveil-data-warehouse.dashboard_ventes.dash_beyond_push_targets")
+# Vue de validation sur la table ÉDITABLE dwh_inputs.beyond_push_whitelist
+# (dashboard → /api/rules/*, POC rules-edition 2026-07-18) — résout le listing,
+# exclut les codes invalides, fallback seed si la table est vidée par erreur.
 WHITELIST_TABLE = os.environ.get(
-    "BEYOND_WHITELIST_TABLE", "merveil-data-warehouse.staging.beyond_push_whitelist")
+    "BEYOND_WHITELIST_TABLE", "merveil-data-warehouse.staging.stg_inputs__beyond_push_whitelist")
 LOG_TABLE = os.environ.get(
     "BEYOND_LOG_TABLE", "merveil-data-warehouse.beyond_raw.price_pushes_log")
 
