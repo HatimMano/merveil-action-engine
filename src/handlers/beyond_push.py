@@ -339,8 +339,21 @@ def _run_inner() -> None:
         all_logs.extend(logs)
         all_errs.extend(errs)
 
+    # Heartbeat : 1 ligne par run, même sans écart — permet au dashboard
+    # d'afficher « vérifié pour la dernière fois à HH:MM » (l'absence d'action
+    # au 10h45 signifie "vérifié, aucun écart", pas "pas tourné").
+    all_logs.append({
+        "run_id": run_id, "pushed_at": datetime.now(timezone.utc).isoformat(),
+        "listing_id": None, "apartment_code": None, "start_date": None,
+        "end_date": None, "min_price": None, "max_price": None,
+        "action": "check", "status": "ok", "http_status": None, "error": None,
+        "context": f"{len(whitelist)} listings · "
+                   f"{sum(len(v) for v in targets.values())} fenêtres voulues · "
+                   f"{len(all_logs)} action(s) · {len(all_errs)} erreur(s)",
+    })
+
     _log_rows(all_logs)
-    logger.info(f"DONE — {len(all_logs)} action(s) loggée(s), {len(all_errs)} erreur(s)")
+    logger.info(f"DONE — {len(all_logs) - 1} action(s) loggée(s), {len(all_errs)} erreur(s)")
     if all_errs:
         _send_alert(
             f"⚠️ Beyond gap push — {len(all_errs)} erreur(s)",
