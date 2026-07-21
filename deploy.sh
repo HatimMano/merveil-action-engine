@@ -99,5 +99,22 @@ gcloud run jobs deploy merveil-action-engine-beyond \
   --project $PROJECT \
   --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",BEYOND_ALERT_TO="hatim@archides.fr",BEYOND_SHADOW_MODE="false",FREQ="beyond_push"
 
+echo "🚀 Déploiement du job confluence-rules-sync (pages vivantes Confluence, daily 7h40)..."
+# Notes :
+#   - Régénère les pages « Règle — … » des spaces métier merveil.atlassian.net depuis
+#     l'état réel BQ (whitelist push Beyond, audit dwh_inputs, dernière activité).
+#     Upsert only, jamais de suppression. Prose des règles = RULES dans utils/confluence_sync.py.
+#   - Pas de --set-secrets : token Confluence (confluence-api-token) + clé Gmail
+#     (alerts-gmail-sa-key) lus via l'API Secret Manager au runtime (SA secretAccessor).
+gcloud run jobs deploy confluence-rules-sync \
+  --image $IMAGE \
+  --region $REGION \
+  --memory 512Mi --cpu 1 --task-timeout 300 --max-retries 1 \
+  --command python \
+  --args="-m,utils.confluence_sync" \
+  --service-account $SA \
+  --project $PROJECT \
+  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",CONFLUENCE_ALERT_TO="hatim@archides.fr"
+
 echo ""
-echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-3) + beyond (10h45)"
+echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-3) + beyond (10h45) + confluence-rules-sync (7h40)"

@@ -6,4 +6,7 @@ venv/
 *.egg-info/
 .DS_Store
 
-utils/
+# utils/ = scripts locaux non versionnés, SAUF les modules exécutés en prod
+# (gcloud builds submit respecte ce fichier → un module ignoré = absent de l'image)
+utils/*
+!utils/confluence_sync.py
