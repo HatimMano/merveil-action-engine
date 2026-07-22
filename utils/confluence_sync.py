@@ -204,12 +204,12 @@ def _collect_beyond_push(bq) -> dict:
         WHERE rn = 1 AND action != 'remove' AND end_date >= CURRENT_DATE('Europe/Paris')
         ORDER BY start_date, apartment_code""").result()]
 
-    row = next(iter(bq.query(f"""
+    edits = []
+    for row in bq.query(f"""
         SELECT action, row_before, row_after, edited_by, edited_at
         FROM `{PROJECT}.dwh_inputs.rules_audit_log`
         WHERE rule_table = 'beyond_push_whitelist'
-        ORDER BY edited_at DESC LIMIT 1""").result()), None)
-    if row:
+        ORDER BY edited_at DESC LIMIT 5""").result():
         code = None
         for raw in (row.row_after, row.row_before):
             if raw:
@@ -223,9 +223,10 @@ def _collect_beyond_push(bq) -> dict:
                  "migrate": "initialisation (migration seed)"}.get(row.action, row.action)
         qui = (row.edited_by or "?").split("@")[0]
         if row.action == "migrate":
-            live["last_edit"] = f"{verbe} le {fmt_ts(row.edited_at)}"
+            edits.append(f"{verbe} le {fmt_ts(row.edited_at)}")
         else:
-            live["last_edit"] = f"{verbe} {code or '?'} le {fmt_ts(row.edited_at)} par {qui}"
+            edits.append(f"{verbe} {code or '?'} le {fmt_ts(row.edited_at)} par {qui}")
+    live["last_edits"] = edits
 
     live["last_run"] = fmt_ts(next(iter(bq.query(f"""
         SELECT MAX(pushed_at) AS ts
@@ -260,8 +261,9 @@ def live_section(live: dict) -> str:
                      f"à {fmt_d(max(w['end'] for w in wins))})")
     else:
         items.append("<strong>Fenêtres de prix actives dans Beyond</strong> : aucune actuellement")
-    if live.get("last_edit"):
-        items.append(f"<strong>Dernière modification de la liste</strong> : {esc(live['last_edit'])}")
+    if live.get("last_edits"):
+        subs = "".join(f"<li>{esc(e)}</li>" for e in live["last_edits"])
+        items.append(f"<strong>Dernières modifications de la liste</strong> :<ul>{subs}</ul>")
     if live.get("last_run"):
         items.append(f"<strong>Dernier run du job vérifié</strong> : {esc(live['last_run'])} ✓")
     items.append("<strong>Dernière nuit seule vendue via push</strong> : "
