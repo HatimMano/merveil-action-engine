@@ -66,6 +66,8 @@ PIN_CACHE_TABLE = os.environ.get(
     "ISEO_PIN_CACHE_TABLE", "merveil-data-warehouse.iseo_raw.merveil_pin_cache")
 RAW_DUVE_CHECKIN_TABLE = os.environ.get(
     "RAW_DUVE_CHECKIN_TABLE", "merveil-data-warehouse.raw_duve.checkin_events")
+DUVE_CHECKIN_STG_TABLE = os.environ.get(
+    "DUVE_CHECKIN_STG_TABLE", "merveil-data-warehouse.staging.stg_duve__checkin_events")
 MEWS_FCT_TABLE = os.environ.get(
     "MEWS_FCT_TABLE", "merveil-data-warehouse.marts.fct_reservations")
 MEWS_PAYMENTS_TABLE = os.environ.get(
@@ -164,6 +166,21 @@ def _duve_push(duve_resa_id: str, code: str, link: str) -> tuple[bool, Optional[
     return False, f"Duve HTTP {r.status_code}: {r.text[:200]}"
 
 
+def _duve_push_all(duve_ids, code: str, link: str) -> tuple[bool, Optional[str]]:
+    """Pousse le même code + lien à TOUS les duve du stay (back-to-back → chaque résa
+    Duve reçoit le code, quel que soit le message auto qui se déclenche). Succès =
+    tous OK ; sinon renvoie la 1re erreur (le retry re-tentera l'ensemble)."""
+    ids = [d for d in (duve_ids or []) if d]
+    if not ids:
+        return False, "aucun duve_id à pousser"
+    errs = []
+    for d in ids:
+        ok, err = _duve_push(d, code, link)
+        if not ok:
+            errs.append(f"{d}: {err}")
+    return (not errs), ("; ".join(errs) if errs else None)
+
+
 def _send_alert(subject: str, body: str) -> None:
     """Envoie un mail d'alerte (best-effort — ne fait jamais planter le job)."""
     try:
@@ -227,63 +244,123 @@ _PAYMENTS_CTE = f"""
       WHERE reservation_id IS NOT NULL GROUP BY reservation_id
     )"""
 
-
-def _resa_to_provision() -> list[dict]:
-    """Résas à provisionner : CI dans [today, today+LOOKAHEAD], CO futur, non annulée,
-    PAS déjà couverte par une row de cache active (archived_at IS NULL). Résout
-    lock_id / lock_tag_id de l'appart par JOIN (le guest tag = user dédié créé au provision)."""
-    q = f"""
-    WITH {_DUVE_LATEST_CTE},
+# CTE "stay" = unité d'accès physique = occupation CONTINUE d'un guest sur une serrure.
+# Un stay regroupe les résas Mews non annulées d'un même (customer_id, resource_id) dont
+# les intervalles [CI,CO] sont contigus ou chevauchants (gaps-and-islands). Résout le bug
+# de collision quand un client a ≥2 résas sur le même appart (back-to-back → 1 seul code,
+# fenêtre fusionnée min(CI)→max(CO) ; un TROU entre 2 périodes → 2 stays = 2 codes).
+# Pivot = `canonical_duve` = duve de la résa la plus tôt du groupe. Pour une résa unique
+# (99% des cas) : stay = 1 membre, canonical = son duve, fenêtre = sa fenêtre → strictement
+# identique à l'ancien comportement (zéro migration). `member_duve_ids` = tous les duve du
+# stay (le code est poussé à chacun côté Duve). Résolution duve↔résa par date de CI exacte
+# (déterministe, ≠ ancien join (customer,property) ambigu). Réutilise _LOCKS_CTE/_PAYMENTS_CTE.
+_STAYS_CTE = f"""
     {_LOCKS_CTE},
     {_PAYMENTS_CTE},
-    mews AS (
-      SELECT customer_id, resource_id, customer_name,
-             reservation_id     AS mews_reservation_id,
-             reservation_number AS mews_reservation_number,
-             is_cancelled, checkin_date, checkout_date,
-             earliest_checkin_hour, latest_checkout_hour
-      FROM `{MEWS_FCT_TABLE}`
+    duve_stay AS (
+      SELECT duve_reservation_id, duve_property_id,
+             primary_guest_external_id AS mews_customer_id, checkin_date AS duve_ci
+      FROM `{DUVE_CHECKIN_STG_TABLE}`
+      WHERE primary_guest_external_id IS NOT NULL
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY duve_reservation_id ORDER BY received_at DESC) = 1
     ),
-    active_state AS (
+    member_resas AS (
+      SELECT m.reservation_id, m.reservation_number, m.customer_id, m.customer_name,
+             m.resource_id, m.checkin_date, m.checkout_date,
+             m.earliest_checkin_hour, m.latest_checkout_hour,
+             lk.lock_id, lk.lock_tag_id, lk.apartment_code,
+             (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid
+      FROM `{MEWS_FCT_TABLE}` m
+      LEFT JOIN locks lk    ON lk.duve_property_id = m.resource_id
+      LEFT JOIN payments pay ON pay.reservation_id = m.reservation_id
+      WHERE COALESCE(m.is_cancelled, FALSE) = FALSE
+        AND m.checkout_date >= CURRENT_DATE()
+    ),
+    prev_co AS (
+      SELECT *, MAX(checkout_date) OVER (
+        PARTITION BY customer_id, resource_id
+        ORDER BY checkin_date, reservation_id
+        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_checkout
+      FROM member_resas
+    ),
+    islands AS (
+      SELECT *, SUM(CAST(prev_checkout IS NULL OR checkin_date > prev_checkout AS INT64)) OVER (
+        PARTITION BY customer_id, resource_id
+        ORDER BY checkin_date, reservation_id) AS island_id
+      FROM prev_co
+    ),
+    -- Champs stay-level agrégés depuis les membres AVANT d'attacher les duve (l'attache
+    -- multiplie les lignes). 1 ligne par (customer, resource, island).
+    stay_base AS (
+      SELECT customer_id, resource_id, island_id,
+        ANY_VALUE(customer_name)  AS customer_name,
+        ANY_VALUE(apartment_code) AS apartment_code,
+        ANY_VALUE(lock_id)        AS lock_id,
+        ANY_VALUE(lock_tag_id)    AS lock_tag_id,
+        MIN(checkin_date)         AS stay_ci,
+        MAX(checkout_date)        AS stay_co,
+        ARRAY_AGG(earliest_checkin_hour ORDER BY checkin_date)[SAFE_OFFSET(0)]       AS earliest_checkin_hour,
+        ARRAY_AGG(latest_checkout_hour  ORDER BY checkout_date DESC)[SAFE_OFFSET(0)] AS latest_checkout_hour,
+        CAST(ARRAY_AGG(reservation_number ORDER BY checkin_date)[SAFE_OFFSET(0)] AS STRING) AS mews_reservation_number,
+        ARRAY_AGG(payment_unpaid ORDER BY checkin_date)[SAFE_OFFSET(0)]              AS payment_unpaid
+      FROM islands
+      GROUP BY customer_id, resource_id, island_id
+    ),
+    -- Attache les duve du (customer, resource) dont le CI tombe dans la fenêtre du stay,
+    -- avec tolérance -14j (drift de dates post-pré-checkin : les dates Mews peuvent bouger
+    -- après que le guest a rempli Duve → un match par date EXACTE raterait le duve et
+    -- archiverait à tort le code actif). La tolérance ≪ écart entre 2 stays d'un même
+    -- (customer, resource) → pas de contamination inter-stays.
+    stay_duve AS (
+      SELECT sb.*, d.duve_reservation_id, d.duve_ci
+      FROM stay_base sb
+      LEFT JOIN duve_stay d
+        ON d.mews_customer_id  = sb.customer_id
+       AND d.duve_property_id  = sb.resource_id
+       AND d.duve_ci BETWEEN DATE_SUB(sb.stay_ci, INTERVAL 14 DAY) AND sb.stay_co
+    ),
+    stays AS (
+      SELECT
+        resource_id            AS duve_property_id,
+        customer_name, apartment_code, lock_id, lock_tag_id,
+        stay_ci, stay_co, earliest_checkin_hour, latest_checkout_hour,
+        mews_reservation_number, payment_unpaid,
+        ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)                 AS member_duve_ids,
+        ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)[SAFE_OFFSET(0)] AS canonical_duve
+      FROM stay_duve
+      GROUP BY customer_id, resource_id, island_id, duve_property_id, customer_name,
+               apartment_code, lock_id, lock_tag_id, stay_ci, stay_co,
+               earliest_checkin_hour, latest_checkout_hour, mews_reservation_number, payment_unpaid
+    )"""
+
+
+def _resa_to_provision() -> list[dict]:
+    """Stays à provisionner : fenêtre CI dans [today, today+LOOKAHEAD], CO futur,
+    canonical_duve résolu, PAS déjà couvert par une row de cache active — ni par le
+    canonical, ni par un member duve (évite un 2e device sur le même stay). Le
+    `duve_reservation_id` renvoyé = le canonical (= identité Sofia du stay)."""
+    q = f"""
+    WITH {_STAYS_CTE},
+    active AS (
       SELECT DISTINCT duve_reservation_id
       FROM `{PIN_CACHE_TABLE}` WHERE archived_at IS NULL
-    ),
-    -- Résas Mews déjà couvertes par une row active (via un AUTRE duve_id). Une résa
-    -- Mews (cancel+recreate) peut avoir 2 reservations Duve ; le JOIN Duve↔Mews sur
-    -- (customer_id, resource_id) n'est pas unique → sans ça chaque duve_id provisionne
-    -- un device = doublon sur la même serrure (cf. churn RUIQING/CLE7-0D).
-    active_by_mews AS (
-      SELECT DISTINCT mews_reservation_number
-      FROM `{PIN_CACHE_TABLE}`
-      WHERE archived_at IS NULL AND mews_reservation_number IS NOT NULL
-    ),
-    joined AS (
-      SELECT
-        d.duve_reservation_id, d.duve_property_id,
-        lk.lock_id, lk.lock_tag_id, lk.apartment_code,
-        m.customer_name,
-        m.mews_reservation_id, m.mews_reservation_number,
-        m.checkin_date, m.checkout_date,
-        m.earliest_checkin_hour, m.latest_checkout_hour,
-        (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid
-      FROM mews m
-      JOIN duve_latest d ON d.mews_customer_id = m.customer_id
-                        AND d.duve_property_id = m.resource_id
-      LEFT JOIN locks lk ON lk.duve_property_id = m.resource_id
-      LEFT JOIN payments pay  ON pay.reservation_id = m.mews_reservation_id
-      LEFT JOIN active_state s ON s.duve_reservation_id = d.duve_reservation_id
-      LEFT JOIN active_by_mews am
-        ON am.mews_reservation_number = CAST(m.mews_reservation_number AS STRING)
-      WHERE m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
-        AND m.checkout_date >= CURRENT_DATE()
-        AND COALESCE(m.is_cancelled, FALSE) = FALSE
-        AND s.duve_reservation_id IS NULL
-        AND am.mews_reservation_number IS NULL
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY CAST(m.mews_reservation_number AS STRING)
-        ORDER BY d.duve_reservation_id) = 1
     )
-    SELECT * FROM joined ORDER BY checkin_date
+    SELECT
+      s.canonical_duve AS duve_reservation_id,
+      s.duve_property_id, s.lock_id, s.lock_tag_id, s.apartment_code,
+      s.customer_name, s.mews_reservation_number,
+      s.stay_ci AS checkin_date, s.stay_co AS checkout_date,
+      s.earliest_checkin_hour, s.latest_checkout_hour,
+      s.payment_unpaid, s.member_duve_ids
+    FROM stays s
+    WHERE s.canonical_duve IS NOT NULL
+      AND s.stay_ci <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
+      AND s.stay_co >= CURRENT_DATE()
+      AND NOT EXISTS (SELECT 1 FROM active a WHERE a.duve_reservation_id = s.canonical_duve)
+      AND NOT EXISTS (SELECT 1 FROM UNNEST(s.member_duve_ids) md
+                      JOIN active a ON a.duve_reservation_id = md)
+    ORDER BY s.stay_ci
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
@@ -335,78 +412,49 @@ def _whitelisted_gaps() -> list[dict]:
 
 
 def _resa_to_archive() -> list[dict]:
-    """Rows actives à archiver : CO passé OU résa annulée (cross-check Mews).
-    DELETE Sofia device (par extId) + DELETE invitation (par id stocké)."""
+    """Rows actives à archiver : plus aucun stay live ne contient le duve du cache.
+    `member_resas` exclut les annulées et les CO < today → un duve absent de TOUT stay
+    = stay fini (CO passé) ou annulé → à archiver. DELETE device + invitation + user.
+    Match par appartenance (member_duve_ids) : robuste au décalage de canonical si la
+    résa la plus tôt d'un stay est annulée."""
     q = f"""
-    WITH {_DUVE_LATEST_CTE},
-    cache AS (
-      SELECT duve_reservation_id, iseo_invitation_id, checkout_date, shadow_mode
-      FROM `{PIN_CACHE_TABLE}` WHERE archived_at IS NULL
-    ),
-    mews AS (
-      SELECT customer_id, resource_id, is_cancelled, checkin_date AS mews_checkin_date
-      FROM `{MEWS_FCT_TABLE}`
-    ),
-    joined AS (
-      SELECT c.duve_reservation_id, c.iseo_invitation_id, c.checkout_date, c.shadow_mode,
-             COALESCE(m.is_cancelled, FALSE) AS is_cancelled
-      FROM cache c
-      LEFT JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
-      LEFT JOIN mews m ON m.customer_id = d.mews_customer_id
-                      AND m.resource_id = d.duve_property_id
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY c.duve_reservation_id
-        ORDER BY COALESCE(m.is_cancelled, FALSE) ASC,
-                 ABS(DATE_DIFF(m.mews_checkin_date, c.checkout_date, DAY)) ASC NULLS LAST) = 1
+    WITH {_STAYS_CTE},
+    stay_members AS (
+      SELECT md AS duve_reservation_id FROM stays, UNNEST(member_duve_ids) md
     )
-    SELECT duve_reservation_id, iseo_invitation_id, shadow_mode,
-           CASE WHEN is_cancelled THEN 'cancelled' ELSE 'checkout_passed' END AS archive_reason
-    FROM joined
-    WHERE checkout_date < CURRENT_DATE() OR is_cancelled
+    SELECT c.duve_reservation_id, c.iseo_invitation_id, c.shadow_mode
+    FROM `{PIN_CACHE_TABLE}` c
+    LEFT JOIN stay_members sm ON sm.duve_reservation_id = c.duve_reservation_id
+    WHERE c.archived_at IS NULL AND sm.duve_reservation_id IS NULL
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
 
 def _resa_to_resync() -> list[dict]:
-    """Rows actives dont la window cache ≠ dates live Mews = drift de dates post-
-    provision (extension / raccourcissement / décalage du séjour). À resync Sofia
-    pour que la fenêtre du PIN colle au séjour réel. Annulations → _resa_to_archive."""
+    """Rows actives dont la fenêtre cache ≠ fenêtre live du stay = drift post-provision
+    (extension / raccourcissement / décalage OU fusion back-to-back : une nouvelle résa
+    contiguë étend le stay) OU invitation manquante. Recrée device (même PIN) + invitation
+    sur la fenêtre live. Match cache↔stay par canonical_duve (déterministe, 1:1)."""
     q = f"""
-    WITH {_DUVE_LATEST_CTE},
+    WITH {_STAYS_CTE},
     cache AS (
       SELECT duve_reservation_id, pin_value, iseo_device_id, iseo_invitation_id,
              iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id,
              checkin_date AS cache_ci, checkout_date AS cache_co
       FROM `{PIN_CACHE_TABLE}`
       WHERE archived_at IS NULL AND provisioned_at IS NOT NULL
-    ),
-    mews AS (
-      SELECT customer_id, resource_id, customer_name, is_cancelled,
-             checkin_date, checkout_date, earliest_checkin_hour, latest_checkout_hour
-      FROM `{MEWS_FCT_TABLE}`
-    ),
-    joined AS (
-      SELECT c.duve_reservation_id, c.pin_value, c.iseo_device_id, c.iseo_invitation_id,
-             c.iseo_guest_tag_id, c.iseo_lock_id, c.iseo_lock_tag_id,
-             c.cache_ci, c.cache_co,
-             d.duve_property_id, m.customer_name,
-             m.checkin_date AS live_ci, m.checkout_date AS live_co,
-             m.earliest_checkin_hour, m.latest_checkout_hour
-      FROM cache c
-      JOIN duve_latest d ON d.duve_reservation_id = c.duve_reservation_id
-      JOIN mews m ON m.customer_id = d.mews_customer_id
-                 AND m.resource_id = d.duve_property_id
-      WHERE COALESCE(m.is_cancelled, FALSE) = FALSE
-        AND m.checkout_date >= CURRENT_DATE()
-        -- drift de dates OU invitation manquante (échec au provision) : le resync
-        -- recrée device (même PIN) + invitation → guest récupère son lien remote-open.
-        AND (m.checkin_date != c.cache_ci OR m.checkout_date != c.cache_co
-             OR c.iseo_invitation_id IS NULL)
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY c.duve_reservation_id
-        ORDER BY ABS(DATE_DIFF(m.checkin_date, c.cache_ci, DAY))) = 1
     )
-    SELECT * FROM joined ORDER BY live_ci
+    SELECT
+      c.duve_reservation_id, c.pin_value, c.iseo_device_id, c.iseo_invitation_id,
+      c.iseo_guest_tag_id, c.iseo_lock_id, c.iseo_lock_tag_id,
+      c.cache_ci, c.cache_co,
+      s.duve_property_id, s.customer_name,
+      s.stay_ci AS live_ci, s.stay_co AS live_co,
+      s.earliest_checkin_hour, s.latest_checkout_hour, s.member_duve_ids
+    FROM cache c
+    JOIN stays s ON s.canonical_duve = c.duve_reservation_id
+    WHERE s.stay_ci != c.cache_ci OR s.stay_co != c.cache_co OR c.iseo_invitation_id IS NULL
+    ORDER BY s.stay_ci
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
@@ -415,17 +463,18 @@ def _resa_to_resync() -> list[dict]:
 
 def _save_provisioned(row: dict, pin_value: str, device_id: int,
                       inv_id: Optional[int], inv_code: Optional[str],
-                      link: Optional[str], duve_ok: bool) -> None:
+                      link: Optional[str], duve_ok: bool,
+                      member_csv: Optional[str] = None) -> None:
     q = f"""
     INSERT INTO `{PIN_CACHE_TABLE}` (
       duve_reservation_id, mews_reservation_number, apartment_code, pin_value,
       iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id, iseo_device_id,
       iseo_invitation_id, invitation_code, invitation_link,
       checkin_date, checkout_date, cached_at, provisioned_at, duve_pushed_at,
-      shadow_mode)
+      shadow_mode, stay_member_duve_ids)
     VALUES (@duve, @num, @apt, @pin, @gtag, @lock, @ltag, @dev,
             @inv, @code, @link, @ci, @co, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(),
-            {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'}, FALSE)
+            {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'}, FALSE, @members)
     """
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ScalarQueryParameter("duve", "STRING", row["duve_reservation_id"]),
@@ -441,19 +490,22 @@ def _save_provisioned(row: dict, pin_value: str, device_id: int,
         bigquery.ScalarQueryParameter("link", "STRING", link),
         bigquery.ScalarQueryParameter("ci", "DATE", str(row["checkin_date"])),
         bigquery.ScalarQueryParameter("co", "DATE", str(row["checkout_date"])),
+        bigquery.ScalarQueryParameter("members", "STRING", member_csv),
     ])
     _bq().query(q, job_config=cfg).result()
 
 
 def _save_resynced(duve_resa_id: str, ci: str, co: str, device_id: object,
                    inv_id: Optional[int], inv_code: Optional[str],
-                   link: Optional[str], duve_ok: bool) -> None:
+                   link: Optional[str], duve_ok: bool,
+                   member_csv: Optional[str] = None) -> None:
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
     SET checkin_date = @ci, checkout_date = @co, iseo_device_id = @dev,
         iseo_invitation_id = @inv, invitation_code = @code, invitation_link = @link,
         provisioned_at = CURRENT_TIMESTAMP(),
         duve_pushed_at = {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'},
+        stay_member_duve_ids = @members,
         last_error = NULL
     WHERE duve_reservation_id = @id AND archived_at IS NULL
     """
@@ -465,6 +517,7 @@ def _save_resynced(duve_resa_id: str, ci: str, co: str, device_id: object,
         bigquery.ScalarQueryParameter("inv", "INT64", inv_id),
         bigquery.ScalarQueryParameter("code", "STRING", inv_code),
         bigquery.ScalarQueryParameter("link", "STRING", link),
+        bigquery.ScalarQueryParameter("members", "STRING", member_csv),
     ])
     _bq().query(q, job_config=cfg).result()
 
@@ -473,7 +526,7 @@ def _resa_duve_retry() -> list[dict]:
     """Rows provisionnées côté Sofia mais dont le push Duve a échoué
     (`duve_pushed_at IS NULL`) → à re-pousser (code + lien déjà en cache)."""
     q = f"""
-    SELECT duve_reservation_id, pin_value, invitation_link
+    SELECT duve_reservation_id, pin_value, invitation_link, stay_member_duve_ids
     FROM `{PIN_CACHE_TABLE}`
     WHERE archived_at IS NULL AND provisioned_at IS NOT NULL AND duve_pushed_at IS NULL
     """
@@ -645,13 +698,15 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
     link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
 
-    # D. Duve push (code clavier + lien)
-    duve_ok, duve_err = _duve_push(duve_resa_id, pin_value, link or "")
+    # D. Duve push (code clavier + lien) — à TOUS les duve du stay (back-to-back).
+    members = row.get("member_duve_ids") or [duve_resa_id]
+    duve_ok, duve_err = _duve_push_all(members, pin_value, link or "")
     if not duve_ok:
         logger.warning(f"⚠️ Duve push failed for {duve_resa_id}: {duve_err}")
 
     # E. état
-    _save_provisioned(row, pin_value, device_id, inv_id, inv_code, link, duve_ok)
+    _save_provisioned(row, pin_value, device_id, inv_id, inv_code, link, duve_ok,
+                      member_csv=",".join(members))
     if not duve_ok:
         return False, f"Sofia OK mais Duve KO: {duve_err}"
     return True, None
@@ -776,7 +831,7 @@ def _archive(row: dict) -> tuple[bool, Optional[str]]:
         errs.append(f"user GET {gu.status_code}")
     if errs:
         return False, "; ".join(errs)
-    logger.info(f"🗑️ archived {duve_resa_id} ({row.get('archive_reason')})")
+    logger.info(f"🗑️ archived {duve_resa_id} (stay terminé / annulé)")
     return True, None
 
 
@@ -847,11 +902,13 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
     link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
 
-    # 3. Duve push (code identique, lien neuf)
-    duve_ok, duve_err = _duve_push(duve_resa_id, pin_value, link or "")
+    # 3. Duve push (code identique, lien neuf) — à tous les duve du stay.
+    members = row.get("member_duve_ids") or [duve_resa_id]
+    duve_ok, duve_err = _duve_push_all(members, pin_value, link or "")
 
     # 4. état
-    _save_resynced(duve_resa_id, ci_str, co_str, device_id, inv_id, inv_code, link, duve_ok)
+    _save_resynced(duve_resa_id, ci_str, co_str, device_id, inv_id, inv_code, link, duve_ok,
+                   member_csv=",".join(members))
     if not duve_ok:
         return False, f"resync Sofia OK mais Duve KO: {duve_err}"
     logger.info(f"🔄 resync {duve_resa_id} window → {ci_str}→{co_str}")
@@ -1026,8 +1083,9 @@ def _run_inner() -> None:
     retry = 0
     if not ISEO_SHADOW_MODE:
         for row in _resa_duve_retry():
-            done, err = _duve_push(row["duve_reservation_id"], row.get("pin_value") or "",
-                                   row.get("invitation_link") or "")
+            members = (row.get("stay_member_duve_ids") or row["duve_reservation_id"]).split(",")
+            done, err = _duve_push_all(members, row.get("pin_value") or "",
+                                       row.get("invitation_link") or "")
             if done:
                 _mark_duve_pushed(row["duve_reservation_id"])
                 retry += 1
