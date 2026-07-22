@@ -16,6 +16,12 @@ V1 (2026-07-21) : blocs vivants scopés à la règle « Push automatique des pri
 (whitelist Beyond éditable depuis le dash — rules-edition 18/07). Brancher une
 autre règle = lui donner un champ `live` + le gérer dans collect_live().
 
+V2 (2026-07-22) : multi-spaces. Chaque règle porte un champ `space` (défaut VD) ;
+1 page racine « 🤖 Automatisations (DWH) — <domaine> » par space (VD Ventes, GDA
+Opérations, TRAN Serrures & accès) + index global cross-spaces dans EN
+(00. Entreprise, report CQL label=regle-dwh). Ajouter un domaine = 1 entrée
+SPACES + des règles avec ce `space`. Bloc vivant serrures : collector `iseo`.
+
 Local : `python3 -m utils.confluence_sync` (token via gcloud CLI, BQ via ADC).
 """
 import base64
@@ -39,13 +45,30 @@ SITE      = "merveil"
 EMAIL     = "hatim@archides.fr"
 SECRET    = "confluence-api-token"
 BASE      = f"https://{SITE}.atlassian.net"
-SPACE_KEY = "VD"   # 4. Ventes - Distribution - Marketing
 PARIS     = ZoneInfo("Europe/Paris")
+
+# Spaces métier cibles — 1 page racine « 🤖 Automatisations (DWH) — <domaine> »
+# par space, posée en sibling des sections existantes (on ne touche jamais au
+# contenu préexistant). Chaque règle porte un champ `space` (défaut VD).
+# NB : COR (0. Finance et Stratégie) est archivé → le futur lot finance ira
+# dans CXSXJ (2. Comptabilité x Social x Juridique).
+SPACES = {
+    "VD":   dict(domaine="Ventes",
+                 root="🤖 Automatisations (DWH) — Ventes",
+                 label="domaine-ventes"),
+    "GDA":  dict(domaine="Opérations",
+                 root="🤖 Automatisations (DWH) — Opérations",
+                 label="domaine-operations"),
+    "TRAN": dict(domaine="Serrures & accès",
+                 root="🤖 Automatisations (DWH) — Serrures & accès",
+                 label="domaine-serrures"),
+}
+# Index global cross-spaces (vue CEO), dans 00. Entreprise.
+INDEX_SPACE = "EN"
+INDEX_TITLE = "🤖 Tout ce que fait la machine"
 
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@archides.fr")
 ALERT_TO     = os.getenv("CONFLUENCE_ALERT_TO", "hatim@archides.fr")
-
-SPACE_ID = None  # résolu au run
 
 
 # ── Auth / clients ────────────────────────────────────────────────────────────
@@ -148,16 +171,17 @@ def fmt_d(d):
 
 # ── upsert ────────────────────────────────────────────────────────────────────
 
-def find_page(title):
+def find_page(title, space_id):
     # Lookup direct par titre (API v2) — la recherche CQL est indexée avec du
     # retard et rate les pages tout juste créées (doublon au re-run).
     q = urllib.request.quote(title)
-    res = req("GET", f"/wiki/api/v2/pages?space-id={SPACE_ID}&title={q}&limit=1")
+    res = req("GET", f"/wiki/api/v2/pages?space-id={space_id}&title={q}&limit=1")
     return res["results"][0]["id"] if res["results"] else None
 
 
-def upsert(title, parent_id, body, labels):
-    pid = find_page(title)
+def upsert(title, parent_id, body, labels, space):
+    """space = {'id': …, 'key': …} résolu au run."""
+    pid = find_page(title, space["id"])
     if pid:
         cur = req("GET", f"/wiki/api/v2/pages/{pid}?body-format=storage")
         req("PUT", f"/wiki/api/v2/pages/{pid}", {
@@ -167,7 +191,7 @@ def upsert(title, parent_id, body, labels):
         action = "maj"
     else:
         res = req("POST", "/wiki/api/v2/pages", {
-            "spaceId": SPACE_ID, "status": "current", "title": title,
+            "spaceId": space["id"], "status": "current", "title": title,
             "parentId": str(parent_id),
             "body": {"representation": "storage", "value": body}})
         pid = res["id"]
@@ -175,7 +199,7 @@ def upsert(title, parent_id, body, labels):
     if labels:
         req("POST", f"/wiki/rest/api/content/{pid}/label",
             [{"prefix": "global", "name": l} for l in labels])
-    logger.info(f"{action} : {title}  ({BASE}/wiki/spaces/{SPACE_KEY}/pages/{pid})")
+    logger.info(f"{action} : {title}  ({BASE}/wiki/spaces/{space['key']}/pages/{pid})")
     return pid
 
 
@@ -185,13 +209,13 @@ def _collect_beyond_push(bq) -> dict:
     """État réel du push Beyond : whitelist, fenêtres actives, audit, activité."""
     live = {"generated_at": datetime.now(PARIS).strftime("%d/%m/%Y à %Hh%M")}
 
-    live["whitelist"] = [r.apartment_code for r in bq.query(f"""
+    whitelist = [r.apartment_code for r in bq.query(f"""
         SELECT apartment_code FROM `{PROJECT}.dwh_inputs.beyond_push_whitelist`
         ORDER BY apartment_code""").result()]
 
-    live["windows"] = [dict(apartment_code=r.apartment_code, start=r.start_date,
-                            end=r.end_date, min=r.min_price, max=r.max_price)
-                       for r in bq.query(f"""
+    windows = [dict(apartment_code=r.apartment_code, start=r.start_date,
+                    end=r.end_date, min=r.min_price, max=r.max_price)
+               for r in bq.query(f"""
         WITH last_state AS (
           SELECT apartment_code, start_date, end_date, min_price, max_price, action,
                  ROW_NUMBER() OVER (PARTITION BY listing_id, start_date, end_date
@@ -226,21 +250,74 @@ def _collect_beyond_push(bq) -> dict:
             edits.append(f"{verbe} le {fmt_ts(row.edited_at)}")
         else:
             edits.append(f"{verbe} {code or '?'} le {fmt_ts(row.edited_at)} par {qui}")
-    live["last_edits"] = edits
 
     live["last_run"] = fmt_ts(next(iter(bq.query(f"""
         SELECT MAX(pushed_at) AS ts
         FROM `{PROJECT}.beyond_raw.price_pushes_log`""").result())).ts)
 
-    live["last_gap_filled"] = fmt_ts(next(iter(bq.query(f"""
+    last_gap_filled = fmt_ts(next(iter(bq.query(f"""
         SELECT MAX(dispatched_at) AS ts
         FROM `{PROJECT}.action_engine.dispatched_actions`
         WHERE trigger_name = 'beyond_gap_filled'""").result())).ts)
 
+    items = [f"<strong>Appartements du pilote ({len(whitelist)})</strong> : "
+             + ", ".join(f"<code>{esc(c)}</code>" for c in whitelist)]
+    if windows:
+        nights = sum((w["end"] - w["start"]).days + 1 for w in windows)
+        items.append(f"<strong>Fenêtres de prix actives dans Beyond</strong> : {len(windows)} "
+                     f"({nights} nuit(s), de {fmt_d(min(w['start'] for w in windows))} "
+                     f"à {fmt_d(max(w['end'] for w in windows))})")
+    else:
+        items.append("<strong>Fenêtres de prix actives dans Beyond</strong> : aucune actuellement")
+    if edits:
+        subs = "".join(f"<li>{esc(e)}</li>" for e in edits)
+        items.append(f"<strong>Dernières modifications de la liste</strong> :<ul>{subs}</ul>")
+    if live["last_run"]:
+        items.append(f"<strong>Dernier run du job vérifié</strong> : {esc(live['last_run'])} ✓")
+    items.append("<strong>Dernière nuit seule vendue via push</strong> : "
+                 + (esc(last_gap_filled) if last_gap_filled else "aucune pour l'instant"))
+    live["items"] = items
     return live
 
 
-LIVE_COLLECTORS = {"beyond_push": _collect_beyond_push}
+def _collect_iseo(bq) -> dict:
+    """État réel de l'orchestrateur serrures : whitelist, codes actifs, activité."""
+    live = {"generated_at": datetime.now(PARIS).strftime("%d/%m/%Y à %Hh%M")}
+
+    whitelist = [r.apartment_code for r in bq.query(f"""
+        SELECT apartment_code FROM `{PROJECT}.staging.iseo_whitelisted_apartments`
+        ORDER BY apartment_code""").result()]
+
+    counts = next(iter(bq.query(f"""
+        SELECT
+          COUNTIF(archived_at IS NULL AND provisioned_at IS NOT NULL)  AS actifs,
+          COUNTIF(archived_at IS NULL AND provisioned_at IS NOT NULL
+                  AND checkin_date > CURRENT_DATE('Europe/Paris'))     AS a_venir,
+          COUNTIF(provisioned_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),
+                                                  INTERVAL 7 DAY))     AS sem,
+          MAX(provisioned_at)                                          AS last_ts
+        FROM `{PROJECT}.iseo_raw.merveil_pin_cache`""").result()))
+    live["last_run"] = fmt_ts(counts.last_ts)
+
+    recon = next(iter(bq.query(f"""
+        SELECT COUNT(*) AS n, COUNTIF(severity = 'CRITICAL') AS crit
+        FROM `{PROJECT}.dashboard_ops.dash_ops_pin_reconciliation`""").result()))
+
+    items = [f"<strong>Appartements basculés ({len(whitelist)})</strong> : "
+             + ", ".join(f"<code>{esc(c)}</code>" for c in whitelist)]
+    items.append(f"<strong>Codes actifs posés sur les serrures</strong> : {counts.actifs} "
+                 f"(dont {counts.a_venir} séjour(s) à venir)")
+    items.append(f"<strong>Codes créés sur les 7 derniers jours</strong> : {counts.sem}")
+    if live["last_run"]:
+        items.append(f"<strong>Dernier code posé</strong> : {esc(live['last_run'])} ✓")
+    items.append("<strong>Réconciliation interne ↔ serrures Sofia</strong> : "
+                 + ("aucun écart détecté ✅" if recon.n == 0 else
+                    f"{recon.n} écart(s) dont {recon.crit} critique(s) — voir le dashboard 7.8"))
+    live["items"] = items
+    return live
+
+
+LIVE_COLLECTORS = {"beyond_push": _collect_beyond_push, "iseo": _collect_iseo}
 
 
 def collect_live(rule: dict, bq) -> dict | None:
@@ -249,27 +326,7 @@ def collect_live(rule: dict, bq) -> dict | None:
 
 
 def live_section(live: dict) -> str:
-    items = []
-    wl = live.get("whitelist") or []
-    items.append(f"<strong>Appartements du pilote ({len(wl)})</strong> : "
-                 + ", ".join(f"<code>{esc(c)}</code>" for c in wl))
-    wins = live.get("windows") or []
-    if wins:
-        nights = sum((w["end"] - w["start"]).days + 1 for w in wins)
-        items.append(f"<strong>Fenêtres de prix actives dans Beyond</strong> : {len(wins)} "
-                     f"({nights} nuit(s), de {fmt_d(min(w['start'] for w in wins))} "
-                     f"à {fmt_d(max(w['end'] for w in wins))})")
-    else:
-        items.append("<strong>Fenêtres de prix actives dans Beyond</strong> : aucune actuellement")
-    if live.get("last_edits"):
-        subs = "".join(f"<li>{esc(e)}</li>" for e in live["last_edits"])
-        items.append(f"<strong>Dernières modifications de la liste</strong> :<ul>{subs}</ul>")
-    if live.get("last_run"):
-        items.append(f"<strong>Dernier run du job vérifié</strong> : {esc(live['last_run'])} ✓")
-    items.append("<strong>Dernière nuit seule vendue via push</strong> : "
-                 + (esc(live["last_gap_filled"]) if live.get("last_gap_filled")
-                    else "aucune pour l'instant"))
-    body = "<ul>" + "".join(f"<li>{i}</li>" for i in items) + "</ul>"
+    body = "<ul>" + "".join(f"<li>{i}</li>" for i in live["items"]) + "</ul>"
     return panel("info", body,
                  title=f"📊 État actuel — généré automatiquement le {live['generated_at']}")
 
@@ -428,43 +485,232 @@ RULES = [
             "Fourchettes, seuils et arrêt de la règle restent gérés dans le DWH — demande à Hatim.",
         ],
     ),
+
+    # ── GDA — 5. Opérations ──────────────────────────────────────────────────
+    dict(
+        space="GDA",
+        titre="Digest arrivées & disponibilités du jour",
+        slug="digest-dispo",
+        domaine="Opérations — Front office",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        frequence="Quotidien 7h",
+        canal="Mail digest [Merveil Daily] → alerte_ventes@archides.fr",
+        owner="Mickael (à confirmer)",
+        depuis="17 mai 2026",
+        source="trigger_dispo_daily_summary → dash_ops_dispo_daily",
+        dashboard_url="https://direction.archides.fr/ops-front?tab=dispo&view=matin",
+        quoi=[
+            "Chaque matin, la machine compte les appartements <strong>réellement disponibles</strong> et le "
+            "résume en 3 lignes dans le mail quotidien :",
+            "• <strong>Dès le matin</strong> : vides depuis au moins la veille (vendables immédiatement).<br/>"
+            "• <strong>Cet après-midi</strong> : check-out aujourd'hui, sans late checkout.<br/>"
+            "• <strong>Today + 2 jours minimum</strong> : libres sur une fenêtre d'au moins 3 nuits.",
+            "Les appartements <strong>bloqués</strong> (travaux, usage interne) sont exclus automatiquement — "
+            "le chiffre est directement exploitable pour pousser des ventes last-minute.",
+        ],
+    ),
+    dict(
+        space="GDA",
+        titre="Annulations — brief quotidien 11h & alertes ciblées",
+        slug="annulations",
+        domaine="Opérations — Réservations",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        frequence="Brief à 11h · alertes ciblées dans le digest de 7h",
+        canal="Mail [Merveil] → alerte_ventes@archides.fr + emilia@archides.fr",
+        owner="Emilia",
+        depuis="23 mai 2026",
+        source="cancellations_brief → dash_ops_cancellations_recent · trigger_cancellation_vip / trigger_cancellation_large_apt",
+        dashboard_url="https://direction.archides.fr/ops-front?tab=cancellations&preset=24h",
+        quoi=[
+            "<strong>Brief de 11h</strong> : toutes les annulations des dernières 24h en un mail (montant, "
+            "canal, dates, client), avec le bouton vers le détail dashboard. Zéro annulation = pas de mail.",
+            "<strong>Alertes ciblées</strong> (digest de 7h) : les annulations qui méritent une action "
+            "immédiate — client <strong>Gold/Silver</strong> (fidèle ou gros panier) et <strong>grands "
+            "appartements</strong> avec check-in proche (nuits chères difficiles à revendre à court terme).",
+            "Filtre anti-bruit : si le client a une autre réservation active à ±7 jours (changement de dates "
+            "ou d'appartement), ce n'est pas une vraie perte → pas d'alerte.",
+        ],
+    ),
+    dict(
+        space="GDA",
+        titre="Alertes séjour (last-minute, double booking, sans appartement)",
+        slug="alertes-sejour",
+        domaine="Opérations — Front office",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        frequence="Quotidien 7h",
+        canal="Mail digest [Merveil Daily] → alerte_ventes@archides.fr",
+        owner="Mickael (à confirmer)",
+        depuis="mai 2026",
+        source="trigger_last_minute_checkin · trigger_double_booking · trigger_checkin_no_apartment",
+        dashboard_url="https://direction.archides.fr/ops-front",
+        quoi=[
+            "Trois surveillances qui ne se manifestent <strong>que lorsqu'il y a un cas</strong> (la plupart "
+            "des jours : rien) :",
+            "• <strong>Check-in last-minute</strong> : réservation prise très peu de temps avant l'arrivée → "
+            "vérifier que ménage, code d'accès et accueil suivent.<br/>"
+            "• <strong>Double booking</strong> : deux réservations actives qui se chevauchent sur le même "
+            "appartement → à résoudre avant l'arrivée.<br/>"
+            "• <strong>Check-in sans appartement</strong> : arrivée imminente sans espace assigné dans Mews.",
+        ],
+    ),
+    dict(
+        space="GDA",
+        titre="Suivi des avis — mauvais avis & risque Superhost",
+        slug="suivi-avis",
+        domaine="Opérations — Qualité",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        frequence="Quotidien 7h",
+        canal="Mail digest [Merveil Daily] → alerte_ventes@archides.fr",
+        owner="Emilia",
+        depuis="mai 2026",
+        source="trigger_satisfaction_low_review · trigger_superhost_risk → fct_reviews (Reva)",
+        dashboard_url="https://direction.archides.fr/qualite?tab=appartements",
+        quoi=[
+            "<strong>Mauvais avis</strong> : chaque nouvel avis ≤ 3★ déclenche une alerte individuelle "
+            "(appartement, note, canal) → traiter à chaud (réponse publique, geste commercial, tâche "
+            "correctrice).",
+            "<strong>Risque Superhost</strong> : appartements dont la note moyenne sur les <strong>3 derniers "
+            "mois</strong> passe sous 4,5★ (avec au moins 3 avis) → 🟡 ; sous 4,0★ → 🔴. Regroupés en une "
+            "case unique dans le mail, triés par volume d'avis puis pire note.",
+            "C'est le radar avancé de la note publique : la moyenne 3 mois bouge des semaines avant la note "
+            "affichée sur les OTAs.",
+        ],
+    ),
+
+    # ── TRAN — 6. Opérations N2 (serrures) ───────────────────────────────────
+    dict(
+        space="TRAN",
+        titre="Codes d'accès automatiques par séjour (serrures connectées)",
+        slug="codes-acces-auto",
+        live="iseo",
+        domaine="Serrures & accès",
+        niveau="N4", niveau_desc="la machine agit seule, l'humain audite a posteriori",
+        frequence="Toutes les 2 heures (à :45)",
+        canal="Silencieux quand tout va bien — mail d'erreur si un code n'a pas pu être posé",
+        owner="Sylvain / Mickael (à confirmer)",
+        depuis="juin 2026 (élargissement progressif du parc)",
+        source="merveil-action-engine-iseo → API Sofia/ISEO + Duve → iseo_raw.merveil_pin_cache",
+        dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
+        quoi=[
+            "Sur les appartements basculés (liste dans le bloc « État actuel »), la machine gère "
+            "<strong>seule</strong> tout le cycle de vie du code de la porte — à la place du code fixe "
+            "permanent partagé entre tous les clients.",
+            "<strong>3 jours avant l'arrivée</strong> (réservation payée, pre-checkin Duve complété), elle "
+            "génère un code 4 chiffres unique, le pose sur la serrure <strong>au nom du client</strong>, "
+            "valable uniquement du check-in au check-out (aux horaires de la politique de l'appartement), "
+            "crée un <strong>lien d'ouverture à distance</strong> de secours, et pousse le tout dans Duve — "
+            "les messages automatiques Duve envoient donc le bon code sans aucune intervention.",
+            "Séjour <strong>prolongé, raccourci ou décalé</strong> → le code est reposé sur les nouvelles "
+            "dates (même code, le client ne voit rien). <strong>Départ ou annulation</strong> → le code est "
+            "supprimé de la serrure.",
+            "Le code fixe historique reste en place en parallèle pendant la phase pilote (décision du "
+            "13/07) — filet de sécurité, à purger appartement par appartement plus tard.",
+        ],
+        exemple=[
+            "Réservation arrivant vendredi sur un appartement basculé : mardi, la machine pose un code unique "
+            "valable du vendredi 15h au lundi 11h. Le client le reçoit dans son message Duve habituel. "
+            "S'il prolonge d'une nuit dans Mews, le code est étendu automatiquement au run suivant.",
+        ],
+        modifier=[
+            "La liste des appartements basculés est un référentiel DWH : l'élargissement se fait par lots "
+            "après période d'observation — demande à Hatim.",
+            "⚠️ Basculer un appartement ne supprime pas son code fixe (conservés en doublon pour l'instant, "
+            "décision du 13/07).",
+        ],
+    ),
+    dict(
+        space="TRAN",
+        titre="Surveillance des serrures & des codes",
+        slug="surveillance-serrures",
+        domaine="Serrures & accès",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        frequence="Toutes les 2 heures",
+        canal="Mail [Merveil Serrures] → alerte_ventes@archides.fr",
+        owner="Sylvain / Mickael (à confirmer)",
+        depuis="13 juin 2026",
+        source="trigger_iseo_pin_missing · trigger_iseo_reconciliation · trigger_iseo_etl_stale → dash_ops_pin_reconciliation",
+        dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
+        quoi=[
+            "Le filet de sécurité de la règle « Codes d'accès automatiques » — trois surveillances toutes "
+            "les 2 heures :",
+            "• <strong>Code manquant</strong> : une arrivée approche sur un appartement basculé et aucun code "
+            "n'est posé (pre-checkin non fait, erreur de création…) → alerte <strong>avant</strong> que le "
+            "client soit devant la porte.<br/>"
+            "• <strong>Réconciliation</strong> : l'état interne est comparé à l'état réel des serrures Sofia. "
+            "Code supprimé à la main dans l'interface, code orphelin, code encore actif après le départ → "
+            "chaque écart est signalé (l'incident fondateur : un code effacé par erreur dans l'UI, client "
+            "bloqué dehors).<br/>"
+            "• <strong>Données en retard</strong> : si la collecte ISEO ne remonte plus, alerte — on ne "
+            "surveille jamais à l'aveugle.",
+            "Un même problème n'est signalé qu'une fois tant qu'il n'est pas résolu (déduplication 4h).",
+        ],
+    ),
 ]
 
-ROOT_TITLE = "🤖 Automatisations (DWH) — Ventes"
 
-
-def root_body():
-    b = panel("info",
-              p("Cette rubrique documente <strong>ce que la machine (DWH) fait automatiquement</strong> pour le "
-                "domaine Ventes : surveillances, alertes, et bientôt propositions d'action. Une page par règle, "
-                "toujours à jour avec ce qui tourne réellement en production — on n'y documente <strong>que "
-                "l'actif</strong> (le backlog vit dans la roadmap)."))
-    b += p("Grille de lecture des niveaux : <strong>N2</strong> = la machine surveille et alerte · "
+NIVEAUX = ("Grille de lecture des niveaux : <strong>N2</strong> = la machine surveille et alerte · "
            "<strong>N3</strong> = la machine <em>propose</em> une action, l'humain valide · "
            "<strong>N4</strong> = la machine agit, l'humain audite · <strong>N5</strong> = autonome.")
+
+FOOTER = ('<em>Contact : Hatim (hatim@archides.fr) — pages générées automatiquement chaque matin, '
+          'commentaires bienvenus, édition manuelle déconseillée.</em>')
+
+
+def root_body(space_key, meta):
+    b = panel("info",
+              p(f"Cette rubrique documente <strong>ce que la machine (DWH) fait automatiquement</strong> pour le "
+                f"domaine {esc(meta['domaine'])} : surveillances, alertes, et bientôt propositions d'action. Une "
+                "page par règle, toujours à jour avec ce qui tourne réellement en production — on n'y documente "
+                "<strong>que l'actif</strong> (le backlog vit dans la roadmap)."))
+    b += p(NIVEAUX)
     b += h2("Les règles actives")
-    b += report(f'space = "{SPACE_KEY}" and label = "regle-dwh"', HEADINGS, "Règle")
-    b += p(f'<em>Contact : Hatim (hatim@archides.fr) — pages générées automatiquement chaque matin, '
-           f'commentaires bienvenus, édition manuelle déconseillée.</em>')
+    b += report(f'space = "{space_key}" and label = "regle-dwh"', HEADINGS, "Règle")
+    b += p(FOOTER)
+    return b
+
+
+def index_body(roots):
+    """Index global 00. Entreprise — vue CEO cross-spaces, zéro maintenance."""
+    b = panel("info",
+              p("Vue d'ensemble de <strong>toutes les automatisations du DWH</strong>, tous domaines confondus. "
+                "Chaque règle est documentée dans le space de son équipe (une rubrique 🤖 par space) ; ce "
+                "tableau est alimenté automatiquement depuis ces pages."))
+    b += p(NIVEAUX)
+    b += h2("Les rubriques par domaine")
+    b += "<ul>" + "".join(
+        f'<li>{link(f"{BASE}/wiki/spaces/{key}/pages/{pid}", SPACES[key]["root"])}</li>'
+        for key, pid in roots.items()) + "</ul>"
+    b += h2("Toutes les règles actives")
+    b += report('label = "regle-dwh"', HEADINGS, "Règle")
+    b += p(FOOTER)
     return b
 
 
 def run() -> None:
-    global TOKEN, AUTH, SPACE_ID
+    global TOKEN, AUTH
     TOKEN = _secret(SECRET)
     AUTH = base64.b64encode(f"{EMAIL}:{TOKEN}".encode()).decode()
 
     bq = _bq()
-    space = req("GET", f"/wiki/api/v2/spaces?keys={SPACE_KEY}")["results"][0]
-    SPACE_ID = space["id"]
-    logger.info(f"Space {SPACE_KEY} id={SPACE_ID} homepage={space['homepageId']}")
+    keys = ",".join(list(SPACES) + [INDEX_SPACE])
+    by_key = {s["key"]: s for s in
+              req("GET", f"/wiki/api/v2/spaces?keys={keys}&limit=25")["results"]}
 
-    root_id = upsert(ROOT_TITLE, space["homepageId"], root_body(),
-                     ["regle-dwh-index", "domaine-ventes"])
-    for r in RULES:
-        live = collect_live(r, bq)
-        upsert(f"Règle — {r['titre']}", root_id, rule_body(r, live),
-               ["regle-dwh", "domaine-ventes", f"niveau-{r['niveau'].lower()}"])
+    roots = {}
+    for key, meta in SPACES.items():
+        sp = by_key[key]
+        space = {"id": sp["id"], "key": key}
+        logger.info(f"Space {key} id={sp['id']} homepage={sp['homepageId']}")
+        roots[key] = upsert(meta["root"], sp["homepageId"], root_body(key, meta),
+                            ["regle-dwh-index", meta["label"]], space)
+        for r in [r for r in RULES if r.get("space", "VD") == key]:
+            live = collect_live(r, bq)
+            upsert(f"Règle — {r['titre']}", roots[key], rule_body(r, live),
+                   ["regle-dwh", meta["label"], f"niveau-{r['niveau'].lower()}"], space)
+
+    sp = by_key[INDEX_SPACE]
+    upsert(INDEX_TITLE, sp["homepageId"], index_body(roots),
+           ["regle-dwh-index"], {"id": sp["id"], "key": INDEX_SPACE})
     logger.info("Done.")
 
 
