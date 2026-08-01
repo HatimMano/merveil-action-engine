@@ -29,7 +29,12 @@ Garde-fous :
     avec un plancher PLUS HAUT → min relevé (on ne casse jamais un plancher
     équipe) ; un plancher équipe plus bas est bypassé. Le max suit toujours le
     min (max(max, min)) → aucune fenêtre skippée.
-  - min ≥ 5 (contrainte API), min < max, dates futures, ≤ MAX_WINDOWS/listing
+  - bornes de sécurité AVANT tout PATCH : PRICE_FLOOR ≤ min ≤ max ≤ PRICE_CEILING
+    (défaut 50..5000 €, mêmes bornes que le test dbt ADR). Fenêtre hors bornes →
+    écartée de l'état voulu (donc retirée de Beyond si possédée) + erreur mail.
+    Couvre aussi bien un target dbt aberrant (coussin cassé par le référentiel
+    Sheets) qu'une règle équipe extrême. min ≤ max garanti par construction.
+  - dates futures, ≤ MAX_WINDOWS/listing
   - BEYOND_SHADOW_MODE=true → log "would patch" sans écrire
   - toute erreur → mail récap (infra Gmail DWD), crash → mail + exit non-zero
 
@@ -71,6 +76,11 @@ BEYOND_PAT = (os.environ.get("BEYOND_PAT") or "").strip()
 
 SHADOW_MODE = os.environ.get("BEYOND_SHADOW_MODE", "false").lower() == "true"
 MAX_WINDOWS_PER_LISTING = int(os.environ.get("BEYOND_MAX_WINDOWS", "20"))
+
+# Bornes de sécurité prix (€/nuit HT) — dernier filet avant PATCH, indépendant du
+# SQL amont. Alignées sur le test dbt ADR (50..5000). Fenêtre hors bornes = skip.
+PRICE_FLOOR = float(os.environ.get("BEYOND_PRICE_FLOOR", "50"))
+PRICE_CEILING = float(os.environ.get("BEYOND_PRICE_CEILING", "5000"))
 
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@archides.fr")
 ALERT_TO = os.getenv("BEYOND_ALERT_TO", "hatim@archides.fr")
@@ -151,7 +161,9 @@ def _load_targets() -> dict[int, dict[tuple, dict]]:
     for r in rows:
         key = (r["d"], r["d"])
         targets.setdefault(r["listing_id"], {})[key] = {
-            "min": float(r["min_price"]), "max": float(r["max_price"]),
+            # NULL/0 → -1 : recalé par le garde-fou bornes (skip + mail) au lieu
+            # de crasher le run entier sur float(None).
+            "min": float(r["min_price"] or -1), "max": float(r["max_price"] or -1),
             "apartment_code": r["apartment_code"],
         }
     return targets
@@ -242,6 +254,19 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
             if rule.get("min-price") and _overlaps(start, end, rule):
                 mn = max(mn, float(rule["min-price"]))
         final_desired[(start, end)] = {"min": mn, "max": max(mx, mn)}
+
+    # Garde-fou bornes prix : jamais de PATCH avec une fenêtre aberrante, quelle
+    # que soit son origine (target dbt corrompu, plancher équipe extrême). Fenêtre
+    # hors bornes → écartée de l'état voulu (si possédée, le diff la retire de
+    # Beyond : mieux vaut aucune fenêtre qu'une fenêtre fausse) + erreur mail.
+    for k in list(final_desired):
+        v = final_desired[k]
+        if not (PRICE_FLOOR <= v["min"] <= v["max"] <= PRICE_CEILING):
+            errs.append(f"{apartment_code} {k[0]}: fenêtre [{v['min']}, {v['max']}] "
+                        f"hors bornes [{PRICE_FLOOR}, {PRICE_CEILING}] — écartée, pas de push")
+            log("skip", "error", k[0], k[1], v["min"], v["max"],
+                error=f"hors bornes [{PRICE_FLOOR}, {PRICE_CEILING}]")
+            del final_desired[k]
 
     if len(final_desired) > MAX_WINDOWS_PER_LISTING:
         errs.append(f"{apartment_code}: {len(final_desired)} fenêtres > cap "
