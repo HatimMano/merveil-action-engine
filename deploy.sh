@@ -97,7 +97,7 @@ gcloud run jobs deploy merveil-action-engine-beyond \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest,BEYOND_PAT=beyond-pat-dwh:latest \
   --service-account $SA \
   --project $PROJECT \
-  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",BEYOND_ALERT_TO="hatim@archides.fr",BEYOND_SHADOW_MODE="false",FREQ="beyond_push"
+  --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",BEYOND_ALERT_TO="hatim@archides.fr",BEYOND_SHADOW_MODE="false",BEYOND_PRICE_FLOOR="150",BEYOND_PRICE_CEILING="4000",FREQ="beyond_push"
 
 echo "🚀 Déploiement du job confluence-rules-sync (pages vivantes Confluence, daily 7h40)..."
 # Notes :
