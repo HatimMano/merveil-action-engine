@@ -155,7 +155,11 @@ def _load_targets() -> dict[int, dict[tuple, dict]]:
         SELECT beyond_listing_id AS listing_id, apartment_code,
                CAST(gap_date AS STRING) AS d, min_price, max_price
         FROM `{TARGETS_TABLE}`
-        WHERE gap_date > CURRENT_DATE('Europe/Paris')
+        -- >= : la fenêtre tient jusqu'au jour J inclus (retrait à J+1) — sinon
+        -- le run du matin du gap la retirait et Beyond repassait en pricing
+        -- libre (min-stay 1 + prix cassé) sur les dernières heures, en
+        -- contradiction avec la règle « jamais sous coussin » (décision 04/08).
+        WHERE gap_date >= CURRENT_DATE('Europe/Paris')
     """).result()
     targets: dict[int, dict[tuple, dict]] = {}
     for r in rows:
