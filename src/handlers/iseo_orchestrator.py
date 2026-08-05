@@ -181,7 +181,7 @@ def _duve_push_all(duve_ids, code: str, link: str) -> tuple[bool, Optional[str]]
     return (not errs), ("; ".join(errs) if errs else None)
 
 
-def _send_alert(subject: str, body: str) -> None:
+def _send_alert(subject: str, body: str, html: bool = False) -> None:
     """Envoie un mail d'alerte (best-effort — ne fait jamais planter le job)."""
     try:
         name = f"projects/{PROJECT_ID}/secrets/alerts-gmail-sa-key/versions/latest"
@@ -192,7 +192,7 @@ def _send_alert(subject: str, body: str) -> None:
             _json.loads(sa_info), scopes=["https://www.googleapis.com/auth/gmail.send"]
         ).with_subject(GMAIL_SENDER)
         svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        msg = MIMEText(body, "plain", "utf-8")
+        msg = MIMEText(body, "html" if html else "plain", "utf-8")
         msg["From"], msg["To"], msg["Subject"] = GMAIL_SENDER, ISEO_ALERT_TO, subject
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         svc.users().messages().send(userId=GMAIL_SENDER, body={"raw": raw}).execute()
@@ -366,28 +366,41 @@ def _resa_to_provision() -> list[dict]:
 
 
 def _whitelisted_gaps() -> list[dict]:
-    """Trous silencieux : résas whitelistées à provisionner bientôt (CI ≤ J-lookahead,
-    CO ≥ today, non annulées, pas déjà couvertes par une row cache active) mais NON
-    provisionnables faute de mapping Duve (webhook checkin absent) OU de lock résolue.
-    Sans ça une résa sans mapping Duve est effacée par le INNER JOIN de _resa_to_provision
-    (ni skip ni erreur) → guest potentiellement sans code sans aucun signal."""
+    """Trous silencieux : résas whitelistées à provisionner (CI ≤ J-lookahead, CO ≥
+    today, non annulées) SANS row cache active, classées par cause :
+      - lock       : serrure non résolue (anormal sur whitelist, tout horizon)
+      - precheckin : pas de mapping Duve = formulaire pas rempli (bruit auto-résolu
+                     avant J-1 → n'alerte qu'à CI ≤ J+1)
+      - paiement   : gate volontaire — tous les paiements Failed, aucun Charged
+      - autre      : provisionnable en apparence mais toujours pas de code = le vrai
+                     signal « aurait dû être généré », à investiguer
+    Sans ce filet une résa sans mapping Duve est effacée par le INNER JOIN de
+    _resa_to_provision (ni skip ni erreur) → guest sans code sans aucun signal."""
     if not ALLOWED_PROPERTY_IDS:
         return []
     q = f"""
     WITH {_DUVE_LATEST_CTE},
     {_LOCKS_CTE},
+    {_PAYMENTS_CTE},
     active_by_mews AS (
       SELECT DISTINCT mews_reservation_number
       FROM `{PIN_CACHE_TABLE}`
       WHERE archived_at IS NULL AND mews_reservation_number IS NOT NULL
     )
     SELECT m.reservation_number, m.resource_id, m.customer_name, m.checkin_date,
-           (d.duve_reservation_id IS NULL) AS no_duve,
-           (lk.lock_id IS NULL)            AS no_lock
+           m.checkout_date, lk.apartment_code,
+           CASE
+             WHEN lk.lock_id IS NULL THEN 'lock'
+             WHEN d.duve_reservation_id IS NULL THEN 'precheckin'
+             WHEN COALESCE(pay.n_failed, 0) > 0
+              AND COALESCE(pay.n_charged, 0) = 0 THEN 'paiement'
+             ELSE 'autre'
+           END AS reason
     FROM `{MEWS_FCT_TABLE}` m
     LEFT JOIN duve_latest d ON d.mews_customer_id = m.customer_id
                            AND d.duve_property_id = m.resource_id
     LEFT JOIN locks lk       ON lk.duve_property_id = m.resource_id
+    LEFT JOIN payments pay   ON pay.reservation_id = m.reservation_id
     LEFT JOIN active_by_mews am
       ON am.mews_reservation_number = CAST(m.reservation_number AS STRING)
     WHERE LOWER(m.resource_id) IN UNNEST(@wl)
@@ -395,20 +408,123 @@ def _whitelisted_gaps() -> list[dict]:
       AND m.checkout_date >= CURRENT_DATE()
       AND COALESCE(m.is_cancelled, FALSE) = FALSE
       AND am.mews_reservation_number IS NULL
-      -- lock manquante = anormal sur whitelist (alerte à tout horizon). Mapping Duve
-      -- manquant = un guest qui n'a pas rempli son pré-checkin (vérifié 15/07 : les 4
-      -- gaps du mail étaient tous ce cas, aucun event à recevoir) → n'alerter qu'à
-      -- J-1 du CI, avant c'est du bruit qui se résout tout seul.
-      AND (lk.lock_id IS NULL
-           OR (d.duve_reservation_id IS NULL
-               AND m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY)))
+      -- precheckin avant J-1 = bruit qui se résout tout seul (vérifié 15/07) →
+      -- exclu du mail. Les 3 autres causes alertent à tout horizon ≤ lookahead.
+      AND NOT (lk.lock_id IS NOT NULL
+               AND d.duve_reservation_id IS NULL
+               AND m.checkin_date > DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY))
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY CAST(m.reservation_number AS STRING)
       ORDER BY m.checkin_date) = 1
+    ORDER BY CASE reason WHEN 'autre' THEN 0 WHEN 'lock' THEN 1
+                         WHEN 'paiement' THEN 2 ELSE 3 END, m.checkin_date
     """
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ArrayQueryParameter("wl", "STRING", sorted(ALLOWED_PROPERTY_IDS))])
     return [dict(r.items()) for r in _bq().query(q, job_config=cfg).result()]
+
+
+# Mail quotidien « résas sans code » — 1 section par cause, style aligné sur le
+# brief annulations (cancellations_brief.py). Destinataire = ISEO_ALERT_TO.
+_GAP_REASONS = {
+    "autre": {
+        "label": "⚠ Aurait dû être généré — à investiguer",
+        "hint":  "Whitelisté, pre-checkin fait, paiement OK, serrure OK… mais aucun code. "
+                 "Vérifier le tab 7.8 et les logs de l'orchestrateur.",
+        "bg": "#fef2f2", "fg": "#dc2626",
+    },
+    "lock": {
+        "label": "Serrure non résolue",
+        "hint":  "Appart whitelisté sans lock/lockTag mappé — anormal, à corriger côté Sofia.",
+        "bg": "#fef2f2", "fg": "#dc2626",
+    },
+    "paiement": {
+        "label": "Paiement échoué — provision retenue",
+        "hint":  "Tous les paiements Mews en Failed, aucun Charged (gate volontaire, "
+                 "souvent VCC Expedia/VRBO pas encore chargeable). Le code fixe couvre.",
+        "bg": "#fffbeb", "fg": "#b45309",
+    },
+    "precheckin": {
+        "label": "Pre-checkin non rempli (CI ≤ J+1)",
+        "hint":  "Pas de mapping Duve sans formulaire → relancer le guest. "
+                 "Le code fixe couvre en attendant.",
+        "bg": "#fffbeb", "fg": "#b45309",
+    },
+}
+
+
+def _build_gaps_html(gaps: list[dict], paris_today: str) -> str:
+    counts = {k: sum(1 for g in gaps if g["reason"] == k) for k in _GAP_REASONS}
+    kpis = "".join(
+        f'<div style="display:inline-block;background:#fff;border:1px solid #e2e8f0;'
+        f'border-radius:6px;padding:10px 16px;margin:0 8px 8px 0">'
+        f'<div style="font-size:11px;color:#64748b;text-transform:uppercase">{cfg["label"]}</div>'
+        f'<div style="font-size:22px;font-weight:700;color:{cfg["fg"] if counts[k] else "#059669"}">{counts[k]}</div>'
+        f'</div>'
+        for k, cfg in _GAP_REASONS.items()
+    )
+
+    sections = ""
+    for k, cfg in _GAP_REASONS.items():
+        items = [g for g in gaps if g["reason"] == k]
+        if not items:
+            continue
+        rows_html = "".join(
+            f'<tr style="border-bottom:1px solid #f1f5f9">'
+            f'<td style="padding:8px 12px;font-size:13px;color:#334155"><strong>{g.get("customer_name") or "—"}</strong></td>'
+            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;font-family:monospace">{g.get("apartment_code") or g.get("resource_id") or "—"}</td>'
+            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;white-space:nowrap">{g.get("checkin_date")} → {g.get("checkout_date")}</td>'
+            f'<td style="padding:8px 12px;font-size:12px;color:#64748b">{g.get("reservation_number")}</td>'
+            f'</tr>'
+            for g in items
+        )
+        sections += (
+            f'<div style="margin-top:20px">'
+            f'<div style="display:inline-block;background:{cfg["bg"]};color:{cfg["fg"]};'
+            f'padding:3px 10px;border-radius:4px;font-size:13px;font-weight:600">'
+            f'{cfg["label"]} · {len(items)}</div>'
+            f'<p style="font-size:12px;color:#94a3b8;margin:6px 0 8px">{cfg["hint"]}</p>'
+            f'<table style="width:100%;border-collapse:collapse;background:white;'
+            f'border:1px solid #e2e8f0;border-radius:6px;overflow:hidden">'
+            f'<thead><tr style="background:#f8fafc;text-align:left">'
+            f'<th style="padding:8px 12px;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600">Guest</th>'
+            f'<th style="padding:8px 12px;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600">Appart</th>'
+            f'<th style="padding:8px 12px;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600">Séjour</th>'
+            f'<th style="padding:8px 12px;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600">Résa</th>'
+            f'</tr></thead><tbody>{rows_html}</tbody></table>'
+            f'</div>'
+        )
+
+    return f"""
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="background:#f8fafc;padding:24px;font-family:-apple-system,Segoe UI,sans-serif;color:#0f172a">
+  <div style="max-width:820px;margin:0 auto">
+    <h1 style="font-size:22px;margin:0 0 4px">Codes d'accès ISEO — {paris_today}</h1>
+    <p style="color:#64748b;font-size:14px;margin:0 0 20px">
+      Résas whitelistées à provisionner (CI ≤ J+{LOOKAHEAD_DAYS}) toujours sans code, par cause.
+    </p>
+    <div style="margin-bottom:12px">{kpis}</div>
+    {sections}
+    <div style="margin-top:24px">
+      <a href="https://direction.archides.fr/ops-front?tab=arrivals"
+         style="background:#4f46e5;color:white;padding:10px 20px;border-radius:6px;
+                text-decoration:none;font-size:14px;font-weight:600;display:inline-block">
+        Voir les arrivées (6.1) →
+      </a>
+      <a href="https://direction.archides.fr/ops-back?tab=pin_pipeline"
+         style="margin-left:8px;color:#4f46e5;padding:10px 12px;font-size:14px;
+                text-decoration:none;font-weight:600;display:inline-block">
+        Pipeline PIN (7.8)
+      </a>
+    </div>
+    <p style="font-size:11px;color:#94a3b8;margin-top:32px">
+      Mail généré automatiquement (run orchestrateur ~08:45 Paris, 1×/jour) ·
+      merveil-action-engine-iseo · les états par arrivée sont aussi dans 6.1 (« Code d'accès ISEO »).
+    </p>
+  </div>
+</body></html>
+"""
 
 
 def _resa_to_archive() -> list[dict]:
@@ -1051,17 +1167,16 @@ def _run_inner() -> None:
             logger.warning(f"⚠️ provision failed {row['duve_reservation_id']}: {err}")
             errors.append(f"provision {row['duve_reservation_id']} ({row.get('apartment_code')}): {err}")
 
-    # 1a. Trous silencieux : résas whitelistées à provisionner sans mapping Duve / lock.
-    # Loggés à CHAQUE run mais mail 1×/jour seulement (run ~08:45 Paris) — un no_duve se
-    # résout souvent seul quand le guest fait son pré-checkin, inutile de spammer toutes les 2h.
-    gaps: list[str] = []
-    for g in _whitelisted_gaps():
-        reason = ("pré-checkin Duve pas rempli (CI ≤ J+1) — relancer le guest, "
-                  "le code fixe couvre en attendant") if g.get("no_duve") else "lock non résolue"
-        msg = (f"résa {g.get('reservation_number')} "
-               f"({g.get('customer_name')}, CI {g.get('checkin_date')}) : {reason}")
-        logger.warning("⚠️ gap provision " + msg)
-        gaps.append(msg)
+    # 1a. Trous silencieux : résas whitelistées à provisionner toujours sans code,
+    # classées par cause (lock / precheckin / paiement / autre). Loggés à CHAQUE run
+    # mais mail 1×/jour seulement (run ~08:45 Paris) — un precheckin se résout souvent
+    # seul quand le guest fait son formulaire, inutile de spammer toutes les 2h.
+    gaps = _whitelisted_gaps()
+    for g in gaps:
+        logger.warning(
+            f"⚠️ gap provision [{g['reason']}] résa {g.get('reservation_number')} "
+            f"({g.get('customer_name')}, {g.get('apartment_code') or g.get('resource_id')}, "
+            f"CI {g.get('checkin_date')})")
 
     # 1b. Resync drift de dates (window cache ≠ dates live Mews)
     to_resync = _resa_to_resync()
@@ -1141,8 +1256,8 @@ def _run_inner() -> None:
     # Gaps : mail 1×/jour (run du matin ~08:45 Paris), séparé des erreurs dures qui,
     # elles, alertent à chaque run. Évite le spam sur un gap qui se résout tout seul.
     if gaps and datetime.now(PARIS_TZ).hour == 8:
-        _send_alert(
-            f"ℹ️ ISEO — {len(gaps)} résa(s) whitelistée(s) sans code à surveiller",
-            "Résas à provisionner bientôt mais sans mapping Duve (pré-checkin guest pas "
-            "encore fait — souvent auto-résolu) ou sans lock résolue (à investiguer) :\n\n"
-            + "\n".join(f"• {g}" for g in gaps[:50]))
+        n_urgent = sum(1 for g in gaps if g["reason"] in ("autre", "lock"))
+        subject = (f"{'🔴' if n_urgent else 'ℹ️'} ISEO — {len(gaps)} résa(s) sans code"
+                   + (f" dont {n_urgent} à investiguer" if n_urgent else ""))
+        paris_today = datetime.now(PARIS_TZ).strftime("%A %d %B %Y")
+        _send_alert(subject, _build_gaps_html(gaps[:50], paris_today), html=True)
