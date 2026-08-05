@@ -624,18 +624,17 @@ RULES = [
         slug="surveillance-serrures",
         domaine="Serrures & accès",
         niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
-        frequence="Toutes les 2 heures",
-        canal="Mail [Merveil Serrures] → alerte_ventes@archides.fr",
+        frequence="Toutes les 2 heures + un récapitulatif quotidien (~8h45)",
+        canal="Mail [Merveil Serrures] → alerte_ventes@archides.fr (2h) · mail quotidien « résas sans code » → hatim@archides.fr",
         owner="Sylvain / Mickael (à confirmer)",
-        depuis="13 juin 2026",
-        source="trigger_iseo_pin_missing · trigger_iseo_reconciliation · trigger_iseo_etl_stale → dash_ops_pin_reconciliation",
+        depuis="13 juin 2026 (récap quotidien par cause : 5 août 2026)",
+        source="trigger_iseo_pin_missing · trigger_iseo_reconciliation · trigger_iseo_etl_stale → dash_ops_pin_reconciliation · gaps orchestrateur",
         dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
         quoi=[
             "Le filet de sécurité de la règle « Codes d'accès automatiques » — trois surveillances toutes "
             "les 2 heures :",
-            "• <strong>Code manquant</strong> : une arrivée approche sur un appartement basculé et aucun code "
-            "n'est posé (pre-checkin non fait, erreur de création…) → alerte <strong>avant</strong> que le "
-            "client soit devant la porte.<br/>"
+            "• <strong>Porte dormante</strong> : un client est censé séjourner sur un appartement basculé, "
+            "aucun code n'est posé ET la porte n'a pas été ouverte depuis 48h → vrai risque d'accès.<br/>"
             "• <strong>Réconciliation</strong> : l'état interne est comparé à l'état réel des serrures Sofia. "
             "Code supprimé à la main dans l'interface, code orphelin, code encore actif après le départ → "
             "chaque écart est signalé (l'incident fondateur : un code effacé par erreur dans l'UI, client "
@@ -643,6 +642,11 @@ RULES = [
             "• <strong>Données en retard</strong> : si la collecte ISEO ne remonte plus, alerte — on ne "
             "surveille jamais à l'aveugle.",
             "Un même problème n'est signalé qu'une fois tant qu'il n'est pas résolu (déduplication 4h).",
+            "En complément, un <strong>récapitulatif quotidien</strong> (~8h45) liste les arrivées ≤ J+3 "
+            "toujours sans code, <strong>classées par cause</strong> : formulaire pre-checkin non rempli, "
+            "paiement en échec (le code est volontairement retenu), serrure non résolue, ou anomalie à "
+            "investiguer. Le même état est visible arrivée par arrivée sur la page Arrivées (6.1, "
+            "« Code d'accès ISEO »).",
         ],
     ),
 ]
