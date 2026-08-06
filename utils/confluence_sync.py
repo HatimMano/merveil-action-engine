@@ -473,7 +473,9 @@ RULES = [
             "par nuit divisé par 2 (les coûts fixes s'amortissent sur le séjour — Beyond impose un séjour "
             "minimum de 2 nuits sur ces trous, donc jamais de vente d'1 nuit au plancher réduit) ; et les "
             "<strong>nuits orphelines</strong> (fin de trou : la nuit de ce soir est libre, quelqu'un arrive "
-            "demain, la veille est déjà passée) : plancher plein posé pour la journée dès le run de 6h45.",
+            "demain, la veille est déjà passée) : plancher plein posé pour la journée dès le run de 6h45 — "
+            "sur <strong>l'ensemble du parc</strong>, pas seulement la whitelist (pure protection plancher, "
+            "aucune surcote à retirer : le clamp s'applique après les réglages Beyond).",
             "Si les nuits voisines vendent sous notre plancher (fréquent sur les petits appartements), la "
             "fourchette devient un <strong>prix fixe rentable</strong> — mieux que le prix surcoté, jamais à perte.",
             "Les <strong>règles saisonnières posées par l'équipe dans Beyond sont préservées</strong> (un plancher "
