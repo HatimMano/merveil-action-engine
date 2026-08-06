@@ -29,7 +29,10 @@ Le déclaratif nettoie tout seul : gap comblé → fenêtre absente de l'état v
 plancher annuel Beyond, cf. finding POC #3).
 
 Garde-fous :
-  - fenêtres uniquement sur les listings du seed beyond_push_whitelist
+  - fenêtres GAP (1N/2N) uniquement sur les listings whitelistés (gate côté
+    dash_beyond_push_targets) ; les nuits ORPHELINES couvrent le parc entier
+    (pure protection plancher, décision 06/08). Le job visite whitelist ∪
+    listings avec cible ∪ listings possédant une fenêtre (retrait J+1 garanti)
   - règle Hatim 17/07 : min = ménage + ops + coussin, JAMAIS en dessous (« mieux
     vaut ne pas vendre que vendre sous coussin »). Si une règle équipe chevauche
     avec un plancher PLUS HAUT → min relevé (on ne casse jamais un plancher
@@ -186,10 +189,15 @@ def _load_targets() -> dict[int, dict[tuple, dict]]:
     return targets
 
 
-def _load_owned() -> dict[int, set[tuple]]:
-    """Fenêtres possédées par le DWH : dernière action loggée != remove/skip/error."""
+def _load_owned() -> tuple[dict[int, set[tuple]], dict[int, str]]:
+    """Fenêtres possédées par le DWH : dernière action loggée != remove/skip/error.
+
+    Retourne aussi listing_id → apartment_code (pour visiter les listings hors
+    whitelist qui portent encore une fenêtre à retirer — cas nuit orpheline
+    parc entier de la veille)."""
     rows = _bq().query(f"""
-        SELECT listing_id, CAST(start_date AS STRING) AS s, CAST(end_date AS STRING) AS e
+        SELECT listing_id, apartment_code,
+               CAST(start_date AS STRING) AS s, CAST(end_date AS STRING) AS e
         FROM `{LOG_TABLE}`
         WHERE status = 'ok'
         QUALIFY ROW_NUMBER() OVER (
@@ -197,9 +205,12 @@ def _load_owned() -> dict[int, set[tuple]]:
         ) = 1 AND action IN ('add', 'update')
     """).result()
     owned: dict[int, set[tuple]] = {}
+    apt_by_listing: dict[int, str] = {}
     for r in rows:
         owned.setdefault(r["listing_id"], set()).add((r["s"], r["e"]))
-    return owned
+        if r["apartment_code"]:
+            apt_by_listing.setdefault(r["listing_id"], r["apartment_code"])
+    return owned, apt_by_listing
 
 
 def _get_current(listing_id: int) -> tuple[Optional[list[dict]], Optional[str]]:
@@ -365,17 +376,28 @@ def _run_inner() -> None:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     whitelist = _load_whitelist()
     targets = _load_targets()
-    owned = _load_owned()
+    owned, owned_apt = _load_owned()
+
+    # Listings à visiter = whitelist ∪ listings avec cible ∪ listings possédant
+    # encore une fenêtre. Depuis le 06/08 les nuits orphelines couvrent le PARC
+    # ENTIER (cibles hors whitelist) — et leur fenêtre de la veille doit être
+    # retirée même si le listing n'a plus aucune cible aujourd'hui.
+    visit: dict[int, str] = {w["listing_id"]: w["apartment_code"] for w in whitelist}
+    for lid, wins in targets.items():
+        if lid not in visit:
+            visit[lid] = next(iter(wins.values()))["apartment_code"]
+    for lid in owned:
+        visit.setdefault(lid, owned_apt.get(lid, "?"))
+
     logger.info("=" * 70)
     logger.info(f"🚀 Beyond gap push (shadow={SHADOW_MODE}, "
-                f"{len(whitelist)} listings whitelistés, "
+                f"{len(whitelist)} whitelistés, {len(visit)} listings visités, "
                 f"{sum(len(v) for v in targets.values())} fenêtres voulues)")
     logger.info("=" * 70)
 
     all_logs: list[dict] = []
     all_errs: list[str] = []
-    for wl in whitelist:
-        lid, apt = wl["listing_id"], wl["apartment_code"]
+    for lid, apt in sorted(visit.items()):
         logs, errs = _reconcile_listing(
             lid, apt, targets.get(lid, {}), owned.get(lid, set()), run_id)
         all_logs.extend(logs)
