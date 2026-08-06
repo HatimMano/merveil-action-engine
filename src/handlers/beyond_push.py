@@ -1,10 +1,16 @@
 """
-Beyond Gap Push — job daily déclaratif de push des fenêtres de prix gaps 1N.
+Beyond Gap Push — job déclaratif de push des fenêtres de prix sur les gaps.
 
 Décision call Raphael/Arnaud 07/07/2026 (remplissage gaps 1N = 2,5%) : le DWH
 pousse une fenêtre de prix [point mort, ADR voisin ÷ markup] sur chaque nuit de
 gap 1N des apparts whitelistés, via les seasonal-prices Beyond (override
 officiellement supporté, confirmation écrite support 09/07).
+
+Extensions call 04/08 (livrées 06/08) : gaps 2N (fenêtre start ≠ end, plancher
+par nuit ÷ 2, scope 1N/2N/BOTH dans la whitelist), nuits orphelines (fin de
+trou : nuit du jour libre + arrivée demain + veille passée → plancher plein
+poussé pour la journée, run additionnel 6h45). Le détail des cibles vit dans
+dash_beyond_push_targets — ce job ne connaît que des fenêtres (start, end).
 
 Déclaratif : l'état VOULU vit dans dashboard_ventes.dash_beyond_push_targets
 (recalculé à chaque run dbt). Pour chaque listing whitelisté :
@@ -150,20 +156,27 @@ def _load_whitelist() -> list[dict]:
 
 
 def _load_targets() -> dict[int, dict[tuple, dict]]:
-    """État voulu par listing : {(start, end): {min, max}} — fenêtres 1N (start=end)."""
+    """État voulu par listing : {(start, end): {min, max}}.
+
+    Fenêtres 1N (gaps 1N + nuits orphelines : start = end) et 2N
+    (gaps 2N : end = start + 1, plancher par nuit ÷ 2 — décisions 04/08)."""
     rows = _bq().query(f"""
         SELECT beyond_listing_id AS listing_id, apartment_code,
-               CAST(gap_date AS STRING) AS d, min_price, max_price
+               CAST(window_start AS STRING) AS s, CAST(window_end AS STRING) AS e,
+               min_price, max_price
         FROM `{TARGETS_TABLE}`
-        -- >= : la fenêtre tient jusqu'au jour J inclus (retrait à J+1) — sinon
-        -- le run du matin du gap la retirait et Beyond repassait en pricing
-        -- libre (min-stay 1 + prix cassé) sur les dernières heures, en
-        -- contradiction avec la règle « jamais sous coussin » (décision 04/08).
-        WHERE gap_date >= CURRENT_DATE('Europe/Paris')
+        -- >= sur la FIN de fenêtre : elle tient jusqu'au soir de sa dernière
+        -- nuit (retrait au run suivant) — sinon le run du matin du gap la
+        -- retirait et Beyond repassait en pricing libre (min-stay 1 + prix
+        -- cassé) sur les dernières heures, en contradiction avec la règle
+        -- « jamais sous coussin » (décision 04/08). Un gap 2N dont la 1re nuit
+        -- est passée sort de lui-même de l'état voulu au refresh dbt (la nuit
+        -- restante devient orpheline, plancher plein).
+        WHERE window_end >= CURRENT_DATE('Europe/Paris')
     """).result()
     targets: dict[int, dict[tuple, dict]] = {}
     for r in rows:
-        key = (r["d"], r["d"])
+        key = (r["s"], r["e"])
         targets.setdefault(r["listing_id"], {})[key] = {
             # NULL/0 → -1 : recalé par le garde-fou bornes (skip + mail) au lieu
             # de crasher le run entier sur float(None).

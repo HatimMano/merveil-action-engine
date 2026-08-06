@@ -209,8 +209,9 @@ def _collect_beyond_push(bq) -> dict:
     """État réel du push Beyond : whitelist, fenêtres actives, audit, activité."""
     live = {"generated_at": datetime.now(PARIS).strftime("%d/%m/%Y à %Hh%M")}
 
-    whitelist = [r.apartment_code for r in bq.query(f"""
-        SELECT apartment_code FROM `{PROJECT}.dwh_inputs.beyond_push_whitelist`
+    whitelist = [r.apartment_code + ("" if (r.scope or "1N") == "1N" else f" ({r.scope})")
+                 for r in bq.query(f"""
+        SELECT apartment_code, scope FROM `{PROJECT}.dwh_inputs.beyond_push_whitelist`
         ORDER BY apartment_code""").result()]
 
     windows = [dict(apartment_code=r.apartment_code, start=r.start_date,
@@ -446,15 +447,15 @@ RULES = [
         ],
     ),
     dict(
-        titre="Push automatique des prix sur les nuits seules (gaps 1N)",
+        titre="Push automatique des prix sur les nuits seules (gaps 1N/2N)",
         slug="beyond-push-gaps-1n",
         live="beyond_push",
         domaine="Ventes — Pricing Beyond",
         niveau="N4", niveau_desc="la machine agit seule, l'humain audite a posteriori",
-        frequence="Quotidien 10h45",
+        frequence="Quotidien 6h45 + 10h45",
         canal="Mail [Merveil Beyond] à chaque nuit vendue → Hatim, Raphael, Mickael",
         owner="Raphael / Mickael",
-        depuis="17 juillet 2026 (pilote — bilan meeting Beyond du 04/08)",
+        depuis="17 juillet 2026 (pilote — élargi le 06/08 : 31 appartements, gaps 2N, nuits orphelines)",
         source="merveil-action-engine-beyond → dash_beyond_push_targets → API Beyond (seasonal-prices) → beyond_raw.price_pushes_log",
         dashboard_url="https://direction.archides.fr/ventes?tab=controle&view=push_auto",
         quoi=[
@@ -465,6 +466,12 @@ RULES = [
             "<strong>plancher</strong> = ménage + frais ops + coussin de marge (on ne brade jamais) · "
             "<strong>plafond</strong> = ce que les nuits voisines ont réellement vendu. Beyond continue son "
             "pricing normalement à l'intérieur de la fourchette.",
+            "Depuis le 06/08 (décisions meeting Beyond 04/08), la même mécanique couvre les <strong>trous de "
+            "2 nuits</strong> sur les appartements marqués « 2N » : fourchette posée sur les 2 nuits, plancher "
+            "par nuit divisé par 2 (les coûts fixes s'amortissent sur le séjour — Beyond impose un séjour "
+            "minimum de 2 nuits sur ces trous, donc jamais de vente d'1 nuit au plancher réduit) ; et les "
+            "<strong>nuits orphelines</strong> (fin de trou : la nuit de ce soir est libre, quelqu'un arrive "
+            "demain, la veille est déjà passée) : plancher plein posé pour la journée dès le run de 6h45.",
             "Si les nuits voisines vendent sous notre plancher (fréquent sur les petits appartements), la "
             "fourchette devient un <strong>prix fixe rentable</strong> — mieux que le prix surcoté, jamais à perte.",
             "Les <strong>règles saisonnières posées par l'équipe dans Beyond sont préservées</strong> (un plancher "
