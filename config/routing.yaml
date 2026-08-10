@@ -282,6 +282,17 @@ triggers:
       - type: email_digest
         bucket: 2h
 
+  # HyperGate ISEO sans connexion depuis > 7j (stg_iseo__gateways). Les serrures
+  # qu'elle dessert ne remontent plus d'events et ne sont plus pilotables à
+  # distance — panne silencieuse jusqu'à l'arrivée du guest. Bucket daily : une
+  # gateway tombée est un déplacement terrain, pas une urgence des 2 prochaines
+  # heures, et le snapshot ne bouge que 12×/jour.
+  iseo_gateway_offline:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
   # ── Trésorerie ────────────────────────────────────────────────────────────
   # Compte bancaire sous son seuil (seed treasury_thresholds). Le message propose
   # le montant à virer. Bucket daily (snapshot bancaire daily). N2 → N3.
