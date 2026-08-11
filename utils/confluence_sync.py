@@ -34,7 +34,6 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import datetime
-from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -108,26 +107,10 @@ def _bq():
     return bigquery.Client(project=PROJECT)
 
 
-def _send_alert(subject: str, body: str) -> None:
-    """Mail d'alerte best-effort (même infra que iseo_orchestrator)."""
-    try:
-        from google.cloud import secretmanager
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-        name = f"projects/{PROJECT}/secrets/alerts-gmail-sa-key/versions/latest"
-        sa_info = secretmanager.SecretManagerServiceClient().access_secret_version(
-            name=name).payload.data.decode()
-        creds = service_account.Credentials.from_service_account_info(
-            json.loads(sa_info), scopes=["https://www.googleapis.com/auth/gmail.send"]
-        ).with_subject(GMAIL_SENDER)
-        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["From"], msg["To"], msg["Subject"] = GMAIL_SENDER, ALERT_TO, subject
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        svc.users().messages().send(userId=GMAIL_SENDER, body={"raw": raw}).execute()
-        logger.info(f"📧 alerte envoyée à {ALERT_TO}: {subject}")
-    except Exception as e:
-        logger.error(f"⚠️ envoi alerte échoué: {e}")
+def _send_alert(subject: str, body: str, html_body: bool = False) -> None:
+    """Mail d'alerte best-effort (infra commune src/core/mailer)."""
+    from src.core.mailer import send_mail
+    send_mail(subject, body, ALERT_TO, html=html_body, sender=GMAIL_SENDER)
 
 
 # ── storage XHTML ─────────────────────────────────────────────────────────────
@@ -734,6 +717,17 @@ if __name__ == "__main__":
         run()
     except Exception as e:
         logger.exception("💥 confluence-rules-sync CRASH")
-        _send_alert("🔴 confluence-rules-sync — CRASH",
-                    f"Le sync Confluence des règles a planté.\n\nException : {e}")
+        from src.core.mailer import build_email
+        _send_alert(
+            "🔴 confluence-rules-sync — CRASH",
+            build_email(
+                "confluence-rules-sync — CRASH", severity="critical",
+                subtitle=datetime.now(ZoneInfo("Europe/Paris")).strftime("%d/%m/%Y %H:%M"),
+                intro="Le sync Confluence des règles a planté — pages vivantes non "
+                      "régénérées (prochain essai au daily 7h40).<br><br>"
+                      f'<pre style="background:#f8fafc;border:1px solid #e2e8f0;'
+                      f'border-radius:6px;padding:12px;font-size:12px;color:#dc2626;'
+                      f'white-space:pre-wrap">{esc(str(e))}</pre>',
+            ),
+            html_body=True)
         sys.exit(1)

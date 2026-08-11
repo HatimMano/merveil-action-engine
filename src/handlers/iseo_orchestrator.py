@@ -41,20 +41,18 @@ Modes :
 Trigger : Cloud Run Job `merveil-action-engine-iseo` (scheduler 2h à :45).
 """
 
-import base64
 import logging
 import os
 import secrets
 import time
 from datetime import datetime, timezone
-from email.mime.text import MIMEText
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
-from google.cloud import bigquery, secretmanager
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from google.cloud import bigquery
+
+from src.core.mailer import build_email, esc, send_mail
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 logger = logging.getLogger(__name__)
@@ -182,23 +180,8 @@ def _duve_push_all(duve_ids, code: str, link: str) -> tuple[bool, Optional[str]]
 
 
 def _send_alert(subject: str, body: str, html: bool = False) -> None:
-    """Envoie un mail d'alerte (best-effort — ne fait jamais planter le job)."""
-    try:
-        name = f"projects/{PROJECT_ID}/secrets/alerts-gmail-sa-key/versions/latest"
-        sa_info = secretmanager.SecretManagerServiceClient().access_secret_version(
-            name=name).payload.data.decode()
-        import json as _json
-        creds = service_account.Credentials.from_service_account_info(
-            _json.loads(sa_info), scopes=["https://www.googleapis.com/auth/gmail.send"]
-        ).with_subject(GMAIL_SENDER)
-        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        msg = MIMEText(body, "html" if html else "plain", "utf-8")
-        msg["From"], msg["To"], msg["Subject"] = GMAIL_SENDER, ISEO_ALERT_TO, subject
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        svc.users().messages().send(userId=GMAIL_SENDER, body={"raw": raw}).execute()
-        logger.info(f"📧 alerte envoyée à {ISEO_ALERT_TO}: {subject}")
-    except Exception as e:
-        logger.error(f"⚠️ envoi alerte échoué: {e}")
+    """Mail d'alerte best-effort (infra commune src/core/mailer)."""
+    send_mail(subject, body, ISEO_ALERT_TO, html=html, sender=GMAIL_SENDER)
 
 
 # ── BigQuery ──────────────────────────────────────────────────────────────────
@@ -1137,7 +1120,18 @@ def run() -> None:
         _run_inner()
     except Exception as e:
         logger.critical(f"🔴 ISEO orchestrator CRASH: {e}")
-        _send_alert("🔴 ISEO orchestrator — CRASH", f"Le job a planté.\n\nException : {e}")
+        _send_alert(
+            "🔴 ISEO orchestrator — CRASH",
+            build_email(
+                "ISEO orchestrator — CRASH", severity="critical",
+                subtitle=datetime.now(PARIS_TZ).strftime("%d/%m/%Y %H:%M"),
+                intro="Le job a planté avant la fin — provisions/archives non "
+                      "traitées sur ce run (retentées au prochain run 2h).<br><br>"
+                      f'<pre style="background:#f8fafc;border:1px solid #e2e8f0;'
+                      f'border-radius:6px;padding:12px;font-size:12px;color:#dc2626;'
+                      f'white-space:pre-wrap">{esc(e)}</pre>',
+            ),
+            html=True)
         raise
 
 
@@ -1248,10 +1242,24 @@ def _run_inner() -> None:
     logger.info("=" * 70)
 
     if errors:
-        body = (f"{len(errors)} erreur(s) sur le run ISEO orchestrator "
-                f"(provision ok={ok}, resync={resynced}, duve-retry={retry}, archived={archived}, purged={purged}) :\n\n"
-                + "\n".join(f"• {e}" for e in errors[:50]))
-        _send_alert(f"⚠️ ISEO orchestrator — {len(errors)} erreur(s)", body)
+        body = build_email(
+            "ISEO orchestrator — erreurs",
+            subtitle=datetime.now(PARIS_TZ).strftime("%d/%m/%Y %H:%M"),
+            severity="critical",
+            kpis=[
+                {"label": "Erreurs", "value": len(errors), "color": "#dc2626"},
+                {"label": "Provisions ok", "value": ok},
+                {"label": "Resync", "value": resynced},
+                {"label": "Archivées", "value": archived},
+            ],
+            intro="Chaque ligne = une résa dont le cycle PIN a échoué sur ce run "
+                  "(retenté automatiquement au prochain run 2h).",
+            table={"headers": ["Erreur"],
+                   "rows": [[esc(e)] for e in errors[:50]]},
+            button=("Ops · 7.8 Pipeline PIN",
+                    "https://direction.archides.fr/ops-back?tab=pin_pipeline"),
+        )
+        _send_alert(f"⚠️ ISEO orchestrator — {len(errors)} erreur(s)", body, html=True)
 
     # Gaps : mail 1×/jour (run du matin ~08:45 Paris), séparé des erreurs dures qui,
     # elles, alertent à chaque run. Évite le spam sur un gap qui se résout tout seul.

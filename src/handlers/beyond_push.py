@@ -17,7 +17,12 @@ Déclaratif : l'état VOULU vit dans dashboard_ventes.dash_beyond_push_targets
   1. GET /listings/<id>/customizations/min-max-prices/ → liste actuelle
   2. Sépare NOS fenêtres (reconnues via beyond_raw.price_pushes_log par
      (listing, start, end), dernière action != remove — Beyond n'a pas de champ
-     label) des règles ÉQUIPE (préservées telles quelles, rollover inclus)
+     label) des règles ÉQUIPE (préservées telles quelles, rollover inclus).
+     ⚠ Beyond TRONQUE le start des fenêtres au jour courant (une 2N 10→11/08
+     est servie 11→11/08 le lendemain matin) → le matching accepte aussi la
+     clé effective (start clampé à aujourd'hui), sinon notre propre fenêtre
+     tronquée passe pour une règle équipe et entre en collision de plage
+     exacte avec l'orpheline du jour (400, incident ROY15-6D 11/08)
   3. Diff état voulu vs nos fenêtres actuelles → PATCH la liste complète
      (règles équipe + fenêtres voulues) SEULEMENT si écart. Le support a
      confirmé qu'un envoi suffit (l'algo ne ré-écrase pas) → jamais de re-push
@@ -51,19 +56,17 @@ Trigger : Cloud Run Job `merveil-action-engine-beyond` (scheduler daily 10:45
 Paris, après le run dbt de 10:15 → targets frais).
 """
 
-import base64
-import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
-from email.mime.text import MIMEText
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
-from google.cloud import bigquery, secretmanager
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from google.cloud import bigquery
+
+from src.core.mailer import build_email, esc, mono, send_mail
 
 logger = logging.getLogger(__name__)
 
@@ -112,23 +115,7 @@ def _bq() -> bigquery.Client:
     return _bq_client
 
 
-def _send_alert(subject: str, body: str) -> None:
-    """Mail d'alerte best-effort (même infra Gmail DWD que l'orchestrateur ISEO)."""
-    try:
-        name = f"projects/{PROJECT_ID}/secrets/alerts-gmail-sa-key/versions/latest"
-        sa_info = secretmanager.SecretManagerServiceClient().access_secret_version(
-            name=name).payload.data.decode()
-        creds = service_account.Credentials.from_service_account_info(
-            json.loads(sa_info), scopes=["https://www.googleapis.com/auth/gmail.send"]
-        ).with_subject(GMAIL_SENDER)
-        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["From"], msg["To"], msg["Subject"] = GMAIL_SENDER, ALERT_TO, subject
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        svc.users().messages().send(userId=GMAIL_SENDER, body={"raw": raw}).execute()
-        logger.info(f"📧 alerte envoyée à {ALERT_TO}: {subject}")
-    except Exception as e:
-        logger.error(f"⚠️ envoi alerte échoué: {e}")
+DASHBOARD_PUSH_URL = "https://direction.archides.fr/ventes?tab=controle&view=push_auto"
 
 
 def _beyond(method: str, path: str, payload: Optional[dict] = None) -> requests.Response:
@@ -264,13 +251,28 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
 
     current, err = _get_current(listing_id)
     if err:
-        errs.append(f"{apartment_code} ({listing_id}): {err}")
+        errs.append({"where": f"{apartment_code} ({listing_id})", "what": err})
         log("get", "error", error=err)
         return logs, errs
 
+    # ⚠ Beyond TRONQUE le start des fenêtres au jour courant : une fenêtre 2N
+    # 10→11/08 poussée la veille est servie 11→11/08 le lendemain matin. Le
+    # matching par clé exacte classait alors NOTRE fenêtre tronquée en règle
+    # équipe → doublon de plage exact avec l'orpheline du jour dans le PATCH →
+    # 400 "Cannot have overlapping date ranges" → la nuit restait protégée au
+    # plancher ÷ 2 au lieu du plancher plein (incident ROY15-6D 11/08). On
+    # matche donc sur la clé EFFECTIVE (start clampé à aujourd'hui) ; une
+    # fenêtre possédée entièrement passée disparaît du GET et son entrée
+    # registre devient inerte.
+    today = datetime.now(ZoneInfo("Europe/Paris")).date().isoformat()
+    eff_owned = set()
+    for s, e in owned_keys:
+        k = (max(s, today), e)
+        if k[0] <= k[1]:
+            eff_owned.add(k)
     ours_current = {(w["start-date"], w["end-date"]): w
-                    for w in current if (w["start-date"], w["end-date"]) in owned_keys}
-    team_rules = [w for w in current if (w["start-date"], w["end-date"]) not in owned_keys]
+                    for w in current if (w["start-date"], w["end-date"]) in eff_owned}
+    team_rules = [w for w in current if (w["start-date"], w["end-date"]) not in eff_owned]
 
     # Fenêtres voulues. Un plancher équipe plus HAUT relève notre min (on ne
     # casse jamais une règle équipe) ; plus bas → bypassé (règle coussin).
@@ -290,15 +292,26 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
     for k in list(final_desired):
         v = final_desired[k]
         if not (PRICE_FLOOR <= v["min"] <= v["max"] <= PRICE_CEILING):
-            errs.append(f"{apartment_code} {k[0]}: fenêtre [{v['min']}, {v['max']}] "
-                        f"hors bornes [{PRICE_FLOOR}, {PRICE_CEILING}] — écartée, pas de push")
+            errs.append({"where": f"{apartment_code} {k[0]}",
+                         "what": f"fenêtre [{v['min']}, {v['max']}] hors bornes "
+                                 f"[{PRICE_FLOOR}, {PRICE_CEILING}] — écartée, pas de push"})
             log("skip", "error", k[0], k[1], v["min"], v["max"],
                 error=f"hors bornes [{PRICE_FLOOR}, {PRICE_CEILING}]")
             del final_desired[k]
 
+    # Beyond rejette deux plages identiques dans une même liste : une règle
+    # équipe posée EXACTEMENT sur une fenêtre voulue serait dupliquée dans le
+    # PATCH (400 global → aucune protection poussée sur le listing). On
+    # l'absorbe : la boucle min-bump ci-dessus a déjà relevé notre min au sien,
+    # la retirer de la liste ne baisse aucun plancher. (Après le garde-fou
+    # bornes : une fenêtre voulue écartée ne doit pas emporter la règle équipe.)
+    team_rules = [r for r in team_rules
+                  if (r["start-date"], r["end-date"]) not in final_desired]
+
     if len(final_desired) > MAX_WINDOWS_PER_LISTING:
-        errs.append(f"{apartment_code}: {len(final_desired)} fenêtres > cap "
-                    f"{MAX_WINDOWS_PER_LISTING} — run skippé pour ce listing")
+        errs.append({"where": apartment_code,
+                     "what": f"{len(final_desired)} fenêtres > cap "
+                             f"{MAX_WINDOWS_PER_LISTING} — run skippé pour ce listing"})
         log("cap_exceeded", "error", error=f"{len(final_desired)} fenêtres")
         return logs, errs
 
@@ -339,7 +352,7 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
     ok = resp.status_code == 200
     if not ok:
         err = f"PATCH {resp.status_code}: {resp.text[:300]}"
-        errs.append(f"{apartment_code} ({listing_id}): {err}")
+        errs.append({"where": f"{apartment_code} ({listing_id})", "what": err})
 
     for k in to_add:
         v = final_desired[k]
@@ -368,7 +381,18 @@ def run() -> None:
         _run_inner()
     except Exception as e:
         logger.critical(f"🔴 Beyond push CRASH: {e}")
-        _send_alert("🔴 Beyond gap push — CRASH", f"Le job a planté.\n\nException : {e}")
+        send_mail(
+            "🔴 Beyond gap push — CRASH",
+            build_email(
+                "Beyond gap push — CRASH", severity="critical",
+                subtitle=datetime.now(ZoneInfo("Europe/Paris")).strftime("%d/%m/%Y %H:%M"),
+                intro=f"Le job a planté avant la fin — aucune fenêtre n'a pu être "
+                      f"réconciliée après ce point.<br><br>"
+                      f'<pre style="background:#f8fafc;border:1px solid #e2e8f0;'
+                      f'border-radius:6px;padding:12px;font-size:12px;color:#dc2626;'
+                      f'white-space:pre-wrap">{esc(e)}</pre>',
+            ),
+            ALERT_TO, html=True)
         raise
 
 
@@ -419,7 +443,25 @@ def _run_inner() -> None:
     _log_rows(all_logs)
     logger.info(f"DONE — {len(all_logs) - 1} action(s) loggée(s), {len(all_errs)} erreur(s)")
     if all_errs:
-        _send_alert(
+        send_mail(
             f"⚠️ Beyond gap push — {len(all_errs)} erreur(s)",
-            "Erreurs du run " + run_id + " :\n\n- " + "\n- ".join(all_errs)
-            + f"\n\nLog : beyond_raw.price_pushes_log (run_id={run_id})")
+            build_email(
+                "Beyond gap push — erreurs",
+                subtitle=f"Run {run_id} · "
+                         + datetime.now(ZoneInfo("Europe/Paris")).strftime("%d/%m/%Y %H:%M"),
+                severity="critical",
+                kpis=[
+                    {"label": "Erreurs", "value": len(all_errs), "color": "#dc2626"},
+                    {"label": "Listings visités", "value": len(visit)},
+                    {"label": "Fenêtres voulues",
+                     "value": sum(len(v) for v in targets.values())},
+                ],
+                intro="Les listings en erreur n'ont <b>aucune protection plancher "
+                      "poussée</b> sur ce run (PATCH atomique par listing). "
+                      "Log détaillé : <code>beyond_raw.price_pushes_log</code> "
+                      f"(run_id={run_id}).",
+                table={"headers": ["Listing", "Erreur"],
+                       "rows": [[mono(e["where"]), esc(e["what"])] for e in all_errs]},
+                button=("Ventes 1.4 · Push auto", DASHBOARD_PUSH_URL),
+            ),
+            ALERT_TO, html=True)
