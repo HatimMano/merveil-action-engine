@@ -10,3 +10,4 @@ venv/
 # (gcloud builds submit respecte ce fichier → un module ignoré = absent de l'image)
 utils/*
 !utils/confluence_sync.py
+!utils/confluence_rules.py
