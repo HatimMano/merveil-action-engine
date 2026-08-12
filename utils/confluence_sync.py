@@ -438,8 +438,8 @@ RULES = [
         frequence="Quotidien 6h45 + 10h45",
         canal="Mail [Merveil Beyond] à chaque nuit vendue → Hatim, Raphael, Mickael",
         owner="Raphael / Mickael",
-        depuis="17 juillet 2026 (pilote 8 appartements — mécanique gaps 2N + nuits orphelines livrée le 06/08 ; "
-               "élargissement à 31 appartements et activation 2N en attente du retrait des surcotes Beyond)",
+        depuis="17 juillet 2026 (pilote 8 appartements — élargi à 31 appartements le 07/08, "
+               "nuits orphelines sur tout le parc le 06/08, trous de 2 nuits activés le 10/08)",
         source="merveil-action-engine-beyond → dash_beyond_push_targets → API Beyond (seasonal-prices) → beyond_raw.price_pushes_log",
         dashboard_url="https://direction.archides.fr/ventes?tab=controle&view=push_auto",
         quoi=[
@@ -450,11 +450,13 @@ RULES = [
             "<strong>plancher</strong> = ménage + frais ops + coussin de marge (on ne brade jamais) · "
             "<strong>plafond</strong> = ce que les nuits voisines ont réellement vendu. Beyond continue son "
             "pricing normalement à l'intérieur de la fourchette.",
-            "Depuis le 06/08 (décisions meeting Beyond 04/08), la même mécanique sait couvrir les <strong>trous "
-            "de 2 nuits</strong> sur les appartements marqués « 2N » (aucun actif tant que la config Beyond "
-            "n'est pas ajustée — cf. bloc État actuel) : fourchette posée sur les 2 nuits, plancher "
+            "Depuis le 10/08 (décisions meeting Beyond 04/08), la même mécanique couvre les <strong>trous "
+            "de 2 nuits</strong> sur les appartements marqués « 2N » (cf. bloc État actuel) : fourchette posée "
+            "sur les 2 nuits, plancher "
             "par nuit divisé par 2 (les coûts fixes s'amortissent sur le séjour — Beyond impose un séjour "
-            "minimum de 2 nuits sur ces trous, donc jamais de vente d'1 nuit au plancher réduit) ; et les "
+            "minimum de 2 nuits sur ces trous, donc jamais de vente d'1 nuit au plancher réduit ; quand la "
+            "première nuit est passée, la nuit restante repasse automatiquement au plancher plein le lendemain "
+            "matin) ; et les "
             "<strong>nuits orphelines</strong> (fin de trou : la nuit de ce soir est libre, quelqu'un arrive "
             "demain, la veille est déjà passée) : plancher plein posé pour la journée dès le run de 6h45 — "
             "sur <strong>l'ensemble du parc</strong>, pas seulement la whitelist (pure protection plancher, "
@@ -477,6 +479,46 @@ RULES = [
             "⚠️ En ajoutant un appartement, demander à Beyond la <strong>suppression de sa surcote 1 nuit</strong> "
             "(elle s'applique après notre fourchette et la rendrait inopérante — réglé le 21/07 sur le pilote).",
             "Fourchettes, seuils et arrêt de la règle restent gérés dans le DWH — demande à Hatim.",
+        ],
+    ),
+
+    dict(
+        titre="Séquences relationnelles automatiques (customers.io)",
+        slug="sequences-crm",
+        domaine="Ventes — CRM",
+        niveau="N4", niveau_desc="la machine agit seule, l'humain audite a posteriori",
+        frequence="customers.io va chercher les données du DWH plusieurs fois par jour",
+        canal="E-mails envoyés directement au client par customers.io",
+        owner="à confirmer",
+        depuis="2026",
+        source="marts.cio_customers · marts.cio_events → intégration native customers.io (pull BigQuery)",
+        dashboard_url="https://direction.archides.fr/clients",
+        quoi=[
+            "C'est la seule règle où la machine <strong>écrit au client</strong>, sans validation humaine "
+            "préalable. Le DWH ne fait qu'exposer la donnée ; c'est customers.io qui envoie.",
+            "Le DWH tient à jour une <strong>fiche client</strong> (nombre de séjours, chiffre d'affaires à "
+            "vie, segment Gold/Silver/Bronze, canal de réservation, date du dernier avis satisfait, "
+            "anniversaire) et publie <strong>5 événements</strong> : réservation confirmée · séjour terminé · "
+            "réservation annulée · panier abandonné · avis reçu.",
+            "customers.io vient lire ces deux tables plusieurs fois par jour et déclenche ses séquences. "
+            "<strong>Actives aujourd'hui</strong> : séquence post-séjour (satisfaction puis relance pour une "
+            "nouvelle réservation) et séquence post-annulation (récupération du client annulé).",
+            "<strong>Garde-fous côté DWH</strong> : seuls les clients avec une adresse e-mail réelle sont "
+            "exposés (les adresses relais des OTAs sont exclues) — un client qui n'a jamais rempli son "
+            "formulaire Duve n'est donc jamais contacté. Chaque événement est envoyé <strong>une seule fois "
+            "par réservation</strong>, à vie.",
+            "⚠️ <strong>Point de vigilance connu</strong> : un changement d'appartement se traduit dans Mews "
+            "par une annulation suivie d'une nouvelle réservation. Un événement « annulation » part donc pour "
+            "un client qui vient quand même — à filtrer côté ciblage de la campagne.",
+        ],
+        modifier=[
+            "Le <strong>contenu des e-mails et les conditions de déclenchement</strong> se règlent dans "
+            "customers.io, pas dans le DWH.",
+            "Ce que le DWH contrôle : les données envoyées (fiche client et événements) — demande à Hatim.",
+            "⚠️ <strong>Ce qui n'est pas mesurable ici</strong> : envois, ouvertures, clics et désinscriptions "
+            "restent dans customers.io. Les faire redescendre dans le DWH suppose un abonnement customers.io "
+            "supérieur, que nous n'avons pas — aucun chiffre de performance CRM n'est donc disponible dans le "
+            "dashboard aujourd'hui.",
         ],
     ),
 
@@ -513,7 +555,7 @@ RULES = [
         canal="Mail [Merveil] → alerte_ventes@archides.fr + emilia@archides.fr",
         owner="Emilia",
         depuis="23 mai 2026",
-        source="cancellations_brief → dash_ops_cancellations_recent · trigger_cancellation_vip / trigger_cancellation_large_apt",
+        source="cancellations_brief → dash_ops_cancellations_recent · trigger_cancellation_vip / trigger_cancellation_large_apt / trigger_high_cancellations_daily",
         dashboard_url="https://direction.archides.fr/ops-front?tab=cancellations&preset=24h",
         quoi=[
             "<strong>Brief de 11h</strong> : toutes les annulations des dernières 24h en un mail (montant, "
@@ -521,6 +563,9 @@ RULES = [
             "<strong>Alertes ciblées</strong> (digest de 7h) : les annulations qui méritent une action "
             "immédiate — client <strong>Gold/Silver</strong> (fidèle ou gros panier) et <strong>grands "
             "appartements</strong> avec check-in proche (nuits chères difficiles à revendre à court terme).",
+            "<strong>Pic d'annulations</strong> : dès qu'une journée dépasse <strong>30 annulations</strong>, "
+            "une alerte le signale avec le montant total annulé. Un pic de cette ampleur est rarement un "
+            "hasard (incident sur un canal, sur un appartement, ou erreur de manipulation).",
             "Filtre anti-bruit : si le client a une autre réservation active à ±7 jours (changement de dates "
             "ou d'appartement), ce n'est pas une vraie perte → pas d'alerte.",
         ],
@@ -621,8 +666,8 @@ RULES = [
         frequence="Toutes les 2 heures + un récapitulatif quotidien (~8h45)",
         canal="Mail [Merveil Serrures] → alerte_ventes@archides.fr (2h) · mail quotidien « résas sans code » → hatim@archides.fr",
         owner="Sylvain / Mickael (à confirmer)",
-        depuis="13 juin 2026 (récap quotidien par cause : 5 août 2026)",
-        source="trigger_iseo_pin_missing · trigger_iseo_reconciliation · trigger_iseo_etl_stale → dash_ops_pin_reconciliation · gaps orchestrateur",
+        depuis="13 juin 2026 (récap quotidien par cause : 5 août 2026 · surveillance des HyperGates : 10 août 2026)",
+        source="trigger_iseo_pin_missing · trigger_iseo_reconciliation · trigger_iseo_etl_stale · trigger_iseo_gateway_offline → dash_ops_pin_reconciliation · stg_iseo__gateways · gaps orchestrateur",
         dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
         quoi=[
             "Le filet de sécurité de la règle « Codes d'accès automatiques » — trois surveillances toutes "
@@ -636,6 +681,13 @@ RULES = [
             "• <strong>Données en retard</strong> : si la collecte ISEO ne remonte plus, alerte — on ne "
             "surveille jamais à l'aveugle.",
             "Un même problème n'est signalé qu'une fois tant qu'il n'est pas résolu (déduplication 4h).",
+            "S'y ajoute depuis le <strong>10 août 2026</strong> la surveillance des <strong>HyperGates</strong> "
+            "(les boîtiers qui relient les serrures au réseau) : une passerelle qui n'a plus donné signe de vie "
+            "depuis <strong>plus de 7 jours</strong> est signalée dans le mail quotidien, avec la liste des "
+            "serrures qu'elle dessert. Sans passerelle, la serrure fonctionne toujours au clavier mais on ne "
+            "peut plus ni poser un code à distance, ni ouvrir la porte à distance, ni voir les ouvertures — "
+            "c'est une panne à traiter sur place. Cette surveillance rend <strong>redondant</strong> le rapport "
+            "horaire envoyé par ISEO : la même information est désormais dans le DWH.",
             "En complément, un <strong>récapitulatif quotidien</strong> (~8h45) liste les arrivées ≤ J+3 "
             "toujours sans code, <strong>classées par cause</strong> : formulaire pre-checkin non rempli, "
             "paiement en échec (le code est volontairement retenu), serrure non résolue, ou anomalie à "
