@@ -47,6 +47,49 @@ SPACES = {
 INDEX_SPACE = "EN"
 INDEX_TITLE = "🤖 Tout ce que fait la machine"
 
+# ── Cross-links : pages process de l'équipe → règles machine ─────────────────
+# La doc des règles vit dans une branche « 🤖 Automatisations (DWH) » parallèle
+# aux process. Sans passerelle depuis la procédure humaine, personne ne la
+# trouve. On pose donc un encart dans les pages process concernées — et on ne
+# touche à RIEN d'autre : le bloc est délimité, réécrit à l'identique à chaque
+# run, jamais dupliqué.
+#
+# ⚠️ Ne cibler qu'une page dont le contenu décrit VRAIMENT le geste automatisé.
+# Un encart hors sujet dans la page d'une autre équipe = du bruit chez eux.
+
+CROSSLINK_TITRE = "🤖 Assisté par la machine (DWH)"
+
+# Marqueur de délimitation du bloc, cherché tel quel dans le storage au run
+# suivant. ⚠️ Il DOIT être ASCII pur : Confluence réécrit le storage et échappe
+# les accents (`é` → `&eacute;`), donc un marqueur accentué n'est plus
+# retrouvable → l'encart serait ré-ajouté à chaque run (constaté le 12/08).
+# On le planque dans l'URL des liens : invisible pour le lecteur, jamais touché.
+CROSSLINK_MARK = "?src=dwh-crosslink"
+
+CROSSLINKS = [
+    dict(
+        page_id="378077185",
+        space="VD",
+        titre="1.0. Ventes - Vérifications Quotidiennes",
+        rules=["beyond-push-gaps-1n", "gaps-pricing", "surcote-1n-inefficace"],
+        intro="Les étapes « gaps de 1 et 2 nuits au prix minimum » de cette procédure sont "
+              "désormais <strong>faites par la machine</strong> sur les appartements du pilote : elle pose "
+              "elle-même la fourchette de prix dans Beyond chaque matin, et signale dans le mail quotidien "
+              "les gaps qu'elle ne couvre pas encore. La vérification manuelle reste utile hors pilote.",
+    ),
+    dict(
+        page_id="98830694",
+        space="TRAN",
+        titre="2. Gestion des clés",
+        rules=["codes-acces-auto", "surveillance-serrures"],
+        intro="Aux trousseaux physiques décrits ci-dessus s'ajoutent les <strong>serrures connectées</strong> : "
+              "sur les appartements basculés, le code de la porte est généré, posé et retiré automatiquement "
+              "pour chaque séjour, et une surveillance signale les codes manquants ou les passerelles hors "
+              "ligne.",
+    ),
+]
+
+
 RULES = [
     dict(
         titre="Atterrissage budget sous cible (mensuel)",

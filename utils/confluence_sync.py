@@ -37,6 +37,7 @@ import html
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -45,8 +46,9 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from utils.confluence_rules import (FOOTER, INDEX_SPACE, INDEX_TITLE, NIVEAUX,
-                                    RULES, SPACES)
+from utils.confluence_rules import (CROSSLINK_MARK, CROSSLINK_TITRE, CROSSLINKS, FOOTER,
+                                    INDEX_SPACE, INDEX_TITLE, NIVEAUX, RULES,
+                                    SPACES)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("confluence_sync")
@@ -437,6 +439,78 @@ def rule_body(r, live=None, facts=None):
     return body
 
 
+# ── cross-links dans les pages process de l'équipe ────────────────────────────
+
+def _norm(s: str) -> str:
+    """Storage comparable : Confluence échappe les accents et ajoute ses propres
+    attributs de macro (`ac:macro-id`, `ac:schema-version`) au premier
+    enregistrement. Sans ça, le bloc régénéré diffère toujours du bloc stocké et
+    on repousse une version par jour dans une page qui n'est pas la nôtre."""
+    s = re.sub(r'\s+ac:(macro-id|schema-version)="[^"]*"', "", s)
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
+def _splice(body: str, mark: str, block: str):
+    """Remplace le bloc marqué s'il existe, sinon l'ajoute en fin de page.
+
+    On délimite par la macro qui PORTE le marqueur : Confluence réécrit le
+    storage à chaque édition humaine (un commentaire HTML n'y survit pas).
+    """
+    i = body.find(mark)
+    if i == -1:
+        return body + block, "ajouté"
+    start = body.rfind("<ac:structured-macro", 0, i)
+    end = body.find("</ac:structured-macro>", i) + len("</ac:structured-macro>")
+    if start == -1 or end <= i:                       # marqueur hors macro → on n'écrase rien
+        return body + block, "ajouté (marqueur orphelin)"
+    return body[:start] + block + body[end:], "mis à jour"
+
+
+def crosslink_body(cl: dict, rule_pages: dict) -> str:
+    items = []
+    for slug in cl["rules"]:
+        page = rule_pages.get(slug)
+        if not page:
+            logger.warning(f"cross-link {cl['page_id']} : règle '{slug}' sans page — ignorée")
+            continue
+        items.append(f'<li>{link(page["url"] + CROSSLINK_MARK, page["titre"])}</li>')
+    if not items:
+        return ""
+    inner = (p(f"<strong>{esc(CROSSLINK_TITRE)}</strong>")
+             + p(cl["intro"])
+             + "<ul>" + "".join(items) + "</ul>"
+             + p(esc("Ces pages sont régénérées chaque matin depuis ce qui tourne réellement. "
+                     "Cet encart est posé automatiquement : le reste de la page n'est jamais modifié.")))
+    return panel("info", inner)
+
+
+def sync_crosslinks(rule_pages: dict, dry_run: bool = False) -> None:
+    for cl in CROSSLINKS:
+        block = crosslink_body(cl, rule_pages)
+        if not block:
+            continue
+        cur = req("GET", f"/wiki/api/v2/pages/{cl['page_id']}?body-format=storage")
+        body = cur["body"]["storage"]["value"]
+        new, how = _splice(body, CROSSLINK_MARK, block)
+        # Confluence réécrit le storage (accents → entités) : comparer brut
+        # ferait un PUT à chaque run, soit une version par jour dans
+        # l'historique d'une page qui n'est pas la nôtre.
+        if _norm(new) == _norm(body):
+            logger.info(f"cross-link inchangé : {cl['titre']}")
+            continue
+        if dry_run:
+            logger.info(f"[dry-run] cross-link {how} → {cl['titre']} "
+                        f"({len(body)} → {len(new)} chars)")
+            continue
+        req("PUT", f"/wiki/api/v2/pages/{cl['page_id']}", {
+            "id": str(cl["page_id"]), "status": "current", "title": cur["title"],
+            "body": {"representation": "storage", "value": new},
+            "version": {"number": cur["version"]["number"] + 1,
+                        "message": "confluence-rules-sync (encart automatisations)"}})
+        logger.info(f"cross-link {how} : {cl['titre']} "
+                    f"({BASE}/wiki/spaces/{cl['space']}/pages/{cl['page_id']})")
+
+
 def root_body(space_key, meta):
     b = panel("info",
               p(f"Cette rubrique documente <strong>ce que la machine (DWH) fait automatiquement</strong> pour le "
@@ -478,7 +552,7 @@ def run() -> None:
     by_key = {s["key"]: s for s in
               req("GET", f"/wiki/api/v2/spaces?keys={keys}&limit=25")["results"]}
 
-    roots = {}
+    roots, rule_pages = {}, {}
     for key, meta in SPACES.items():
         sp = by_key[key]
         space = {"id": sp["id"], "key": key}
@@ -491,12 +565,17 @@ def run() -> None:
             if facts["unknown"]:
                 logger.warning(f"{r['slug']} : trigger(s) absent(s) du routing → "
                                f"{', '.join(facts['unknown'])}")
-            upsert(f"Règle — {r['titre']}", roots[key], rule_body(r, live, facts),
-                   ["regle-dwh", meta["label"], f"niveau-{r['niveau'].lower()}"], space)
+            pid = upsert(f"Règle — {r['titre']}", roots[key], rule_body(r, live, facts),
+                         ["regle-dwh", meta["label"], f"niveau-{r['niveau'].lower()}"], space)
+            rule_pages[r["slug"]] = dict(
+                titre=f"Règle — {r['titre']}",
+                url=f"{BASE}/wiki/spaces/{key}/pages/{pid}")
 
     sp = by_key[INDEX_SPACE]
     upsert(INDEX_TITLE, sp["homepageId"], index_body(roots),
            ["regle-dwh-index"], {"id": sp["id"], "key": INDEX_SPACE})
+
+    sync_crosslinks(rule_pages, dry_run=os.getenv("CROSSLINK_DRY_RUN") == "1")
 
     gap = coverage_gap(routing)
     if gap:
