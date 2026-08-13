@@ -99,6 +99,17 @@ triggers:
       - type: email_digest
         bucket: data_quality
 
+  # ── Continuité des enrichissements GenAI (2026-08-13) ─────────────────────
+  # Depuis le fix BatchStillRunning (un batch Vertex lent sort en SUCCÈS, sans
+  # retry ni re-soumission payée), le statut Cloud Run ne détecte plus un
+  # pipeline genai bloqué → on surveille la fraîcheur des tables genai.* .
+  # Seuils calés sur les trous réels observés (cf. trigger_genai_stale.sql).
+  genai_stale:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: data_quality
+
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
   # 6 fois/jour → 1 mail/jour). Le scheduler merveil-action-engine-4h est
