@@ -378,7 +378,9 @@ RULES = [
             "permanent partagé entre tous les clients.",
             "<strong>3 jours avant l'arrivée</strong> (réservation payée, pre-checkin Duve complété), elle "
             "génère un code 4 chiffres unique, le pose sur la serrure <strong>au nom du client</strong>, "
-            "valable uniquement du check-in au check-out (aux horaires de la politique de l'appartement), "
+            "valable uniquement du check-in au check-out — de l'heure d'arrivée jusqu'à "
+            "<strong>19h le jour du départ</strong> (marge volontaire après l'heure de départ officielle, "
+            "pour ne pas enfermer dehors un client qui repasse chercher ses bagages), "
             "crée un <strong>lien d'ouverture à distance</strong> de secours, et pousse le tout dans Duve — "
             "les messages automatiques Duve envoient donc le bon code sans aucune intervention.",
             "Séjour <strong>prolongé, raccourci ou décalé</strong> → le code est reposé sur les nouvelles "
@@ -389,7 +391,7 @@ RULES = [
         ],
         exemple=[
             "Réservation arrivant vendredi sur un appartement basculé : mardi, la machine pose un code unique "
-            "valable du vendredi 15h au lundi 11h. Le client le reçoit dans son message Duve habituel. "
+            "valable du vendredi 15h au lundi 19h. Le client le reçoit dans son message Duve habituel. "
             "S'il prolonge d'une nuit dans Mews, le code est étendu automatiquement au run suivant.",
         ],
         modifier=[
