@@ -281,7 +281,14 @@ _PAYMENTS_CTE = f"""
       SELECT account_id,
              SUM(IF(state = 'Charged', -amount_gross, 0)) AS charged
       FROM `{MEWS_PAYMENTS_TABLE}`
-      WHERE account_id IS NOT NULL GROUP BY account_id
+      -- ⚠ Comptes CLIENT uniquement : les comptes `Company` sont les comptes OTA
+      -- (Airbnb, Booking…), qui agrègent TOUS les versements — 5,2 M€ sur le compte
+      -- Airbnb. Les inclure ferait passer chaque résa OTA pour massivement créditrice.
+      -- Une résa dont l'OTA est le payeur n'a donc aucun encaissement ici : c'est
+      -- voulu (elle est payée à l'OTA), et le gate ne se déclenche que s'il y a en
+      -- plus une carte refusée — cas VCC Expedia/VRBO, qu'on veut continuer à bloquer.
+      WHERE account_id IS NOT NULL AND account_type = 'Customer'
+      GROUP BY account_id
     ),
     resa_failed AS (
       SELECT reservation_id, COUNTIF(state = 'Failed') AS n_failed
