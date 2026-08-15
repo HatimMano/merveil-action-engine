@@ -11,3 +11,5 @@ venv/
 utils/*
 !utils/confluence_sync.py
 !utils/confluence_rules.py
+.claude/
+logs/
