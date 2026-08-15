@@ -66,6 +66,19 @@ digest_buckets:
       - raphael@archides.fr
       - mickael@archides.fr
 
+  fraude:
+    # Chargebacks et doubles sorties. Destinataires : Emilia (dossiers de preuve,
+    # relation OTA) + Hatim. Philippe à ajouter quand la compta s'en saisit.
+    # ⚠ flush_with OBLIGATOIRE sur tout bucket satellite : sans lui le bucket est
+    # bufferisé puis JETÉ sans erreur (incident data_quality, 2026-07-17).
+    # Flushé par le job 2h : `trigger_new_chargeback` a 48 h pour agir, le daily
+    # perdrait la moitié de la fenêtre.
+    flush_with: 2h
+    send_if_empty: false
+    subject_prefix: "[Merveil Fraude]"
+    default_recipients:
+      - hatim@archides.fr
+
 # ============================================================================
 # Triggers
 # ============================================================================
@@ -109,6 +122,23 @@ triggers:
     actions:
       - type: email_digest
         bucket: data_quality
+
+  # ── Fraude / chargebacks (2026-08-15) ─────────────────────────────────────
+  # Un litige non contesté est perdu d'office et on a 48 h pour les preuves :
+  # sur 19 chargebacks 2026 (40 033 €), un seul a été récupéré.
+  new_chargeback:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: fraude
+
+  # On a remboursé ET subi le chargeback : le même litige payé deux fois.
+  # 3 cas trouvés en reprenant 2026 (2 831,50 €), aucun repéré à l'époque.
+  payment_double_exit:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: fraude
 
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
