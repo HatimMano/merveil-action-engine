@@ -76,6 +76,8 @@ STD_DEVICES_TABLE = os.environ.get(
     "STD_DEVICES_TABLE", "merveil-data-warehouse.staging.stg_iseo__standard_devices")
 WHITELIST_TABLE = os.environ.get(
     "ISEO_WHITELIST_TABLE", "merveil-data-warehouse.staging.iseo_whitelisted_apartments")
+HOLD_DECISIONS_TABLE = os.environ.get(
+    "ISEO_HOLD_DECISIONS_TABLE", "merveil-data-warehouse.iseo_raw.hold_decisions")
 
 ISEO_BASE_URL = os.environ.get("ISEO_BASE_URL", "https://api-archides.jago.cloud")
 ISEO_USERNAME = (os.environ.get("ISEO_MANAGER_USERNAME") or "").strip()
@@ -841,6 +843,59 @@ def _evaluate_hold(row: dict) -> Optional[str]:
     return " + ".join(motifs) if motifs else None
 
 
+def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
+    """Journalise UNE décision de la porte dans `iseo_raw.hold_decisions` (append-only).
+
+    ⚠ Pourquoi une table à part et pas `hold_reason` dans le cache : en mode `observe`
+    le cache ne porte PAS de `hold_reason` (« retenu » y garde un sens strict), et on ne
+    peut pas l'y écrire sans casser `_resa_duve_retry`, qui filtre précisément dessus —
+    un push Duve réellement raté ne serait alors plus jamais retenté. Cette table capture
+    donc ce que le cache ne peut pas dire : les décisions en `observe`, et celles dont la
+    résa est ensuite skippée (whitelist/lock/paiement) et qui n'envoient aucun mail.
+
+    Best-effort : une écriture ratée ne doit jamais faire échouer un provisioning.
+    """
+    try:
+        q = f"""
+        INSERT INTO `{HOLD_DECISIONS_TABLE}` (
+          evaluated_at, phase, hold_mode, outcome,
+          duve_reservation_id, duve_property_id, apartment_code, customer_name,
+          mews_reservation_number, checkin_date, checkout_date,
+          hold_reason, direct_last_minute, direct_unpaid, min_lead_hours,
+          hold_lead_hours_setting)
+        VALUES (CURRENT_TIMESTAMP(), @phase, @mode, @outcome,
+          @duve, @pid, @apt, @name, @resa,
+          SAFE_CAST(@ci AS DATE), SAFE_CAST(@co AS DATE),
+          @reason, @dlm, @du, @lead, @setting)
+        """
+        params = [
+            bigquery.ScalarQueryParameter("phase", "STRING", phase),
+            bigquery.ScalarQueryParameter("mode", "STRING", ISEO_HOLD_MODE),
+            bigquery.ScalarQueryParameter("outcome", "STRING", outcome),
+            bigquery.ScalarQueryParameter("duve", "STRING", row.get("duve_reservation_id")),
+            bigquery.ScalarQueryParameter("pid", "STRING", row.get("duve_property_id")),
+            bigquery.ScalarQueryParameter("apt", "STRING", row.get("apartment_code")),
+            bigquery.ScalarQueryParameter("name", "STRING", row.get("customer_name")),
+            bigquery.ScalarQueryParameter("resa", "STRING",
+                                          row.get("mews_reservation_number")),
+            # provision porte checkin_date/checkout_date, resync live_ci/live_co
+            bigquery.ScalarQueryParameter(
+                "ci", "STRING", str(row.get("checkin_date") or row.get("live_ci") or "") or None),
+            bigquery.ScalarQueryParameter(
+                "co", "STRING", str(row.get("checkout_date") or row.get("live_co") or "") or None),
+            bigquery.ScalarQueryParameter("reason", "STRING", motif),
+            bigquery.ScalarQueryParameter("dlm", "BOOL", bool(row.get("direct_last_minute"))),
+            bigquery.ScalarQueryParameter("du", "BOOL", bool(row.get("direct_unpaid"))),
+            bigquery.ScalarQueryParameter(
+                "lead", "INT64",
+                int(row["min_lead_hours"]) if row.get("min_lead_hours") is not None else None),
+            bigquery.ScalarQueryParameter("setting", "INT64", ISEO_HOLD_LEAD_HOURS),
+        ]
+        _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+    except Exception as e:
+        logger.warning(f"⚠️ hold_decisions : écriture échouée — {type(e).__name__}: {e}")
+
+
 def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
     """Prévient la RC qu'une résa est jugée à risque par la porte.
 
@@ -1172,6 +1227,9 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     _save_resynced(duve_resa_id, ci_str, co_str, device_id, inv_id, inv_code, link, duve_ok,
                    member_csv=",".join(members),
                    hold_reason=hold if ISEO_HOLD_MODE == "on" else None)
+    if hold:
+        _log_hold_decision(row, hold, "resync",
+                           "held" if ISEO_HOLD_MODE == "on" else "pushed_observe")
     if hold and not row.get("cache_hold"):  # nouvelle rétention née du changement de dates
         _notify_hold(row, hold, suffix=" — après modification des dates")
     if hold and ISEO_HOLD_MODE == "on":
@@ -1333,6 +1391,20 @@ def _run_inner() -> None:
             success, err = _provision(row)
         except Exception as e:
             success, err = False, f"exception: {e}"
+        # Journal de la porte — APRÈS le provision, pour enregistrer ce qui est
+        # réellement arrivé au code (retenu / parti quand même / skippé avant la
+        # porte / erreur). C'est la seule trace des décisions qui n'envoient pas de
+        # mail, cf. `_log_hold_decision`.
+        if row["hold_reason"]:
+            if err and str(err).startswith("skipped"):
+                outcome = str(err)
+            elif not success:
+                outcome = f"error: {err}"
+            elif ISEO_HOLD_MODE == "on":
+                outcome = "held"
+            else:
+                outcome = "pushed_observe"
+            _log_hold_decision(row, row["hold_reason"], "provision", outcome)
         if success:
             ok += 1
         elif str(err).startswith("skipped"):
