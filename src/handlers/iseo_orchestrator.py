@@ -253,8 +253,9 @@ _LOCKS_CTE = f"""
       WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
     )"""
 
-# Ce que le client doit vs ce qu'il a réellement payé — calculé au COMPTE PAYEUR,
-# pas à la réservation.
+# Ce que le client doit vs ce qu'il a réellement payé — reconstitué, parce que l'API
+# Mews n'expose AUCUN champ solde / « to be paid » (vérifié sur `raw_reservations`).
+#
 # ⚠⚠ Le piège qui a coûté deux guests sans code (15/08) : Mews attache la tentative
 # REFUSÉE à la réservation, mais le paiement RÉUSSI au bill / au compte payeur, avec
 # `reservation_id` NULL. Et ce compte payeur n'est même pas `customer_id` : Mews
@@ -263,11 +264,14 @@ _LOCKS_CTE = f"""
 # faisait donc voir « impayé » une résa intégralement encaissée : 4 faux positifs sur
 # 9 mesurés le 15/08, dont 2 apparts whitelistés laissés SANS code généré (Jack
 # Spence, encaissé 4 672 € le 02/08 ; Ray Javier, 3 946 € le 06/08).
-# Le seul chemin fiable est donc : items de la résa → compte payeur → paiements du
-# compte. Il n'existe aucun champ « solde / to be paid » dans l'API Mews (vérifié sur
-# `raw_reservations`), il faut bien le reconstituer.
+#
+# D'où les DEUX chemins ci-dessous, réunis et dédupliqués : par réservation (paiements
+# externes OTA) ET par compte payeur (encaissements carte). Mesuré sur 1 976 séjours en
+# cours ou à venir : l'union voit 129 séjours soldés, la lecture par réservation seule
+# 119, la lecture par compte seule 116 — aucune des deux ne suffit.
+#
 # ⚠ `amount_charged` est le total encaissé sur le COMPTE (il peut couvrir plusieurs
-# séjours) → un `balance` négatif veut simplement dire « rien à devoir ».
+# séjours) → un `balance` négatif veut dire « rien à devoir », pas un avoir.
 _PAYMENTS_CTE = f"""
     resa_accounts AS (
       SELECT reservation_id,
@@ -277,18 +281,38 @@ _PAYMENTS_CTE = f"""
       WHERE NOT is_canceled AND reservation_id IS NOT NULL
       GROUP BY reservation_id, account_id
     ),
-    account_charged AS (
-      SELECT account_id,
-             SUM(IF(state = 'Charged', -amount_gross, 0)) AS charged
+    charged AS (
+      SELECT payment_id, account_id, account_type, reservation_id, amount_gross
       FROM `{MEWS_PAYMENTS_TABLE}`
-      -- ⚠ Comptes CLIENT uniquement : les comptes `Company` sont les comptes OTA
-      -- (Airbnb, Booking…), qui agrègent TOUS les versements — 5,2 M€ sur le compte
-      -- Airbnb. Les inclure ferait passer chaque résa OTA pour massivement créditrice.
-      -- Une résa dont l'OTA est le payeur n'a donc aucun encaissement ici : c'est
-      -- voulu (elle est payée à l'OTA), et le gate ne se déclenche que s'il y a en
-      -- plus une carte refusée — cas VCC Expedia/VRBO, qu'on veut continuer à bloquer.
-      WHERE account_id IS NOT NULL AND account_type = 'Customer'
-      GROUP BY account_id
+      WHERE state = 'Charged' AND type <> 'GhostPayment'
+    ),
+    -- Chemin 1 : le paiement porte la réservation. C'est le cas des `ExternalPayment`
+    -- OTA (Booking/Airbnb encaissent et Mews trace le règlement sur le compte Company).
+    charged_by_reservation AS (
+      SELECT ra.reservation_id, c.payment_id, c.amount_gross
+      FROM (SELECT DISTINCT reservation_id FROM resa_accounts) ra
+      JOIN charged c ON c.reservation_id = ra.reservation_id
+    ),
+    -- Chemin 2 : le paiement porte le COMPTE payeur. C'est le cas de tous les
+    -- encaissements carte réussis — ils n'ont PAS de reservation_id. Restreint aux
+    -- comptes `Customer` : les comptes `Company` sont les comptes OTA, qui agrègent
+    -- TOUS les versements (5,2 M€ côté Airbnb) et rendraient chaque résa créditrice.
+    charged_by_account AS (
+      SELECT ra.reservation_id, c.payment_id, c.amount_gross
+      FROM resa_accounts ra
+      JOIN charged c ON c.account_id = ra.account_id AND c.account_type = 'Customer'
+    ),
+    -- Union DÉDUPLIQUÉE par payment_id : un paiement peut porter les deux clés,
+    -- sommer les deux agrégats doublerait le montant encaissé.
+    charged_union AS (
+      SELECT DISTINCT * FROM (
+        SELECT * FROM charged_by_reservation
+        UNION ALL
+        SELECT * FROM charged_by_account)
+    ),
+    charged_total AS (
+      SELECT reservation_id, SUM(-amount_gross) AS amount_charged
+      FROM charged_union GROUP BY reservation_id
     ),
     resa_failed AS (
       SELECT reservation_id, COUNTIF(state = 'Failed') AS n_failed
@@ -296,16 +320,17 @@ _PAYMENTS_CTE = f"""
       WHERE reservation_id IS NOT NULL GROUP BY reservation_id
     ),
     payments AS (
-      SELECT ra.reservation_id,
-             SUM(ra.due)                                AS amount_due,
-             SUM(COALESCE(ac.charged, 0))               AS amount_charged,
-             SUM(ra.due) - SUM(COALESCE(ac.charged, 0)) AS balance,
-             MAX(COALESCE(rf.n_failed, 0))              AS n_failed
-      FROM resa_accounts ra
-      LEFT JOIN account_charged ac USING (account_id)
-      LEFT JOIN resa_failed rf ON rf.reservation_id = ra.reservation_id
-      GROUP BY ra.reservation_id
+      SELECT d.reservation_id,
+             d.amount_due,
+             COALESCE(ct.amount_charged, 0)                  AS amount_charged,
+             d.amount_due - COALESCE(ct.amount_charged, 0)   AS balance,
+             COALESCE(f.n_failed, 0)                         AS n_failed
+      FROM (SELECT reservation_id, SUM(due) AS amount_due
+            FROM resa_accounts GROUP BY reservation_id) d
+      LEFT JOIN charged_total ct USING (reservation_id)
+      LEFT JOIN resa_failed   f  USING (reservation_id)
     )"""
+
 
 # CTE "stay" = unité d'accès physique = occupation CONTINUE d'un guest sur une serrure.
 # Un stay regroupe les résas Mews non annulées d'un même (customer_id, resource_id) dont
