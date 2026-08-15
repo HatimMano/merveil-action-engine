@@ -119,8 +119,8 @@ LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "3"))
 # quand même. Elle mord donc progressivement, appartement par appartement, au
 # rythme des suppressions côté ops — c'est voulu, ça rend l'activation sans risque.
 ISEO_HOLD_MODE = os.environ.get("ISEO_HOLD_MODE", "observe").lower()
-# Seuil last-minute, tous canaux (mesuré : ~24 résas/mois).
-ISEO_HOLD_LEAD_HOURS = int(os.environ.get("ISEO_HOLD_LEAD_HOURS", "24"))
+# Seuil « réservé peu avant l'arrivée », appliqué au canal DIRECT seul (cf. _evaluate_hold).
+ISEO_HOLD_LEAD_HOURS = int(os.environ.get("ISEO_HOLD_LEAD_HOURS", "72"))
 # Destinataire de la notification « code retenu » (défaut = alerte ISEO).
 ISEO_HOLD_ALERT_TO = os.getenv("ISEO_HOLD_ALERT_TO", "") or ISEO_ALERT_TO
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "13:00")
@@ -273,8 +273,15 @@ _STAYS_CTE = f"""
              -- Signaux de la PORTE (hold). Délai réservation→arrivée en heures, calé sur
              -- 15h le jour du CI (même convention que la mesure du 15/08). Négatif =
              -- réservé après l'heure d'arrivée théorique (cas Defalque, 21h02 pour le soir).
+             -- Conservé tel quel pour l'affichage du motif dans le mail de rétention.
              TIMESTAMP_DIFF(TIMESTAMP(DATETIME(m.checkin_date, TIME '15:00:00')),
                             m.created_at, HOUR)                          AS lead_hours,
+             -- Les DEUX critères de la porte sont restreints au canal DIRECT (cf.
+             -- _evaluate_hold) : les 4 fraudes d'août y sont, et une résa OTA est payée
+             -- à l'OTA (moyen de paiement vérifié, recours possible).
+             (m.ota_source = 'Site direct'
+              AND TIMESTAMP_DIFF(TIMESTAMP(DATETIME(m.checkin_date, TIME '15:00:00')),
+                                 m.created_at, HOUR) <= {ISEO_HOLD_LEAD_HOURS}) AS direct_last_minute,
              -- « Rien d'encaissé » n'a de sens que sur les canaux où NOUS prenons la carte :
              -- une résa Booking/Airbnb est payée à l'OTA et n'a AUCUN paiement dans Mews →
              -- appliqué à tous les canaux, ce critère retiendrait 69 % des arrivées.
@@ -317,6 +324,7 @@ _STAYS_CTE = f"""
         -- retient si l'un des membres est impayé. Conservateur par choix — sur un stay
         -- back-to-back, une seule résa suspecte suffit à demander une validation.
         MIN(lead_hours)                                                              AS min_lead_hours,
+        LOGICAL_OR(direct_last_minute)                                               AS direct_last_minute,
         LOGICAL_OR(direct_unpaid)                                                    AS direct_unpaid
       FROM islands
       GROUP BY customer_id, resource_id, island_id
@@ -339,14 +347,15 @@ _STAYS_CTE = f"""
         resource_id            AS duve_property_id,
         customer_name, apartment_code, lock_id, lock_tag_id,
         stay_ci, stay_co, earliest_checkin_hour, latest_checkout_hour,
-        mews_reservation_number, payment_unpaid, min_lead_hours, direct_unpaid,
+        mews_reservation_number, payment_unpaid, min_lead_hours,
+        direct_last_minute, direct_unpaid,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)                 AS member_duve_ids,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)[SAFE_OFFSET(0)] AS canonical_duve
       FROM stay_duve
       GROUP BY customer_id, resource_id, island_id, duve_property_id, customer_name,
                apartment_code, lock_id, lock_tag_id, stay_ci, stay_co,
                earliest_checkin_hour, latest_checkout_hour, mews_reservation_number,
-               payment_unpaid, min_lead_hours, direct_unpaid
+               payment_unpaid, min_lead_hours, direct_last_minute, direct_unpaid
     )"""
 
 
@@ -368,7 +377,7 @@ def _resa_to_provision() -> list[dict]:
       s.stay_ci AS checkin_date, s.stay_co AS checkout_date,
       s.earliest_checkin_hour, s.latest_checkout_hour,
       s.payment_unpaid, s.member_duve_ids,
-      s.min_lead_hours, s.direct_unpaid
+      s.min_lead_hours, s.direct_last_minute, s.direct_unpaid
     FROM stays s
     WHERE s.canonical_duve IS NOT NULL
       AND s.stay_ci <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
@@ -585,7 +594,7 @@ def _resa_to_resync() -> list[dict]:
       s.duve_property_id, s.customer_name,
       s.stay_ci AS live_ci, s.stay_co AS live_co,
       s.earliest_checkin_hour, s.latest_checkout_hour, s.member_duve_ids,
-      s.min_lead_hours, s.direct_unpaid
+      s.min_lead_hours, s.direct_last_minute, s.direct_unpaid
     FROM cache c
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
     WHERE s.stay_ci != c.cache_ci OR s.stay_co != c.cache_co OR c.iseo_invitation_id IS NULL
@@ -803,53 +812,76 @@ def _get_or_create_guest_user(duve_resa_id: str, guest_name: Optional[str]) -> t
 def _evaluate_hold(row: dict) -> Optional[str]:
     """Motif de rétention du code, ou None si le code peut partir chez le client.
 
-    Deux critères, calibrés le 15/08 sur 2026 (≈27 résas/mois au total) :
-      - last-minute (≤ ISEO_HOLD_LEAD_HOURS, tous canaux) — 3 des 4 fraudes d'août
-        étaient des réservations du jour même ;
-      - rien d'encaissé sur le canal DIRECT uniquement (cf. commentaire du CTE).
+    Deux critères, tous deux restreints au canal DIRECT (recalibrage 16/08) :
+      - réservé ≤ ISEO_HOLD_LEAD_HOURS (72 h) avant l'arrivée — ~8 résas/mois, c'est
+        le critère qui porte la valeur : les 4 fraudes d'août sont toutes en direct,
+        3 réservées le jour même et la 4ᵉ (Bossongo) à J-2 ;
+      - rien d'encaissé (cf. commentaire du CTE).
+
+    ⚠ Le critère last-minute était initialement TOUS CANAUX (≤24 h). Restreint au
+    direct le 16/08 : mesuré, 87 % des résas du jour même sont des OTA, payées à
+    l'OTA (moyen de paiement vérifié, recours possible) et absentes des 4 fraudes —
+    retenir leur code, c'est un client dehors le soir pour un gain de sécurité nul.
 
     ⚠ Volontairement PAS conditionné à « pièce d'identité scannée » : scanner une
-    pièce coûte 30 secondes à un fraudeur (n'importe quel document passe l'OCR),
-    donc en faire une condition de libération rendrait la porte contournable par
-    une action que l'attaquant contrôle. La pièce sert au triage humain au moment
-    de libérer, pas à la décision machine.
+    pièce coûte 30 secondes à un fraudeur (n'importe quel document passe l'OCR, et
+    un cas de fausse pièce est avéré côté Merveil), donc en faire une condition de
+    libération rendrait la porte contournable par une action que l'attaquant
+    contrôle. La pièce sert au triage humain au moment de libérer.
     """
     if ISEO_HOLD_MODE == "off":
         return None
     motifs = []
-    lead = row.get("min_lead_hours")
-    if lead is not None and lead <= ISEO_HOLD_LEAD_HOURS:
-        motifs.append(f"last_minute ({int(lead)}h avant l'arrivée)")
+    if row.get("direct_last_minute"):
+        lead = row.get("min_lead_hours")
+        detail = f" ({int(lead)}h avant l'arrivée)" if lead is not None else ""
+        motifs.append(f"direct réservé au dernier moment{detail}")
     if row.get("direct_unpaid"):
         motifs.append("direct sans encaissement")
     return " + ".join(motifs) if motifs else None
 
 
-def _notify_hold(row: dict, motif: str) -> None:
-    """Prévient la RC qu'un code est prêt mais retenu. Sans cette notification, la
-    porte transformerait une fraude évitée en client dehors à 22 h."""
+def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
+    """Prévient la RC qu'une résa est jugée à risque par la porte.
+
+    ⚠ Envoyé dans les modes `on` ET `observe` (décision 16/08) : toute rétention
+    DOIT être doublée d'une alerte, sinon la porte transforme une fraude évitée en
+    client dehors à 22 h — et en `observe`, sans ce mail, personne n'apprenait
+    qu'une résa avait été jugée à risque. Le mail dit explicitement, dans chaque
+    mode, si le client a le code ou non : ce sont deux gestes RC opposés.
+    """
+    effectif = ISEO_HOLD_MODE == "on"
     apt = row.get("apartment_code") or row.get("duve_property_id")
     # Le provision porte checkin_date/checkout_date, le resync live_ci/live_co.
     ci = row.get("checkin_date") or row.get("live_ci")
     co = row.get("checkout_date") or row.get("live_co")
+    if effectif:
+        titre, sujet = "Code d'accès retenu — à valider", "🔒 Code retenu à valider"
+        etat = ("Le code a été <strong>créé côté serrure mais volontairement pas envoyé</strong> "
+                "au client : il ne le voit pas dans son application.")
+        suite = ("Après vérification de l'identité, lire le code sur le dashboard et "
+                 "l'envoyer au client. En cas de doute, ne rien envoyer et faire "
+                 "annuler la réservation.")
+    else:
+        titre, sujet = "Réservation à risque — code déjà envoyé", "⚠️ Résa à risque (code envoyé)"
+        etat = ("La porte de validation est en <strong>mode observation</strong> : le code "
+                "<strong>a bien été envoyé au client</strong>, il peut entrer.")
+        suite = ("Vérifier l'identité du client. En cas de doute, faire annuler la "
+                 "réservation et changer le code de l'appartement avant l'arrivée.")
     html = build_email(
-        "Code d'accès retenu — à valider",
-        subtitle=f"{row.get('customer_name')} · {apt}",
+        titre,
+        subtitle=f"{row.get('customer_name')} · {apt}{suffix}",
         severity="warning",
-        intro=("Le code a été <strong>créé côté serrure mais volontairement pas envoyé</strong> "
-               "au client : il ne le voit pas dans son application. "
-               f"<br><strong>Motif :</strong> {esc(motif)}"),
+        intro=f"{etat}<br><strong>Motif :</strong> {esc(motif)}",
         table={"headers": ["Client", "Appartement", "Séjour", "Résa Mews"],
                "rows": [[esc(row.get("customer_name")), esc(apt),
                          f"{esc(ci)} → {esc(co)}",
                          esc(row.get("mews_reservation_number"))]]},
         sections_html=('<div style="padding:0 24px 8px;font-size:14px;color:#475569">'
-                       "Après vérification de l'identité, lire le code sur le dashboard et "
-                       "l'envoyer au client. En cas de doute, ne rien envoyer et faire "
-                       "annuler la réservation.</div>"),
+                       f"{suite}</div>"),
         button=("Voir les arrivées →",
                 "https://direction.archides.fr/ops-front?tab=arrivees"))
-    send_mail(f"🔒 Code retenu à valider — {row.get('customer_name')} ({apt})",
+    send_mail(f"{sujet} — {row.get('customer_name')} ({apt})",
               html, ISEO_HOLD_ALERT_TO, html=True, sender=GMAIL_SENDER)
 
 
@@ -921,8 +953,9 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     _save_provisioned(row, pin_value, device_id, inv_id, inv_code, link, duve_ok,
                       member_csv=",".join(members),
                       hold_reason=hold if ISEO_HOLD_MODE == "on" else None)
+    if hold:
+        _notify_hold(row, hold)  # `observe` compris — cf. docstring de _notify_hold
     if hold and ISEO_HOLD_MODE == "on":
-        _notify_hold(row, hold)
         return True, None  # rétention volontaire : ce n'est PAS une erreur de run
     if not duve_ok:
         return False, f"Sofia OK mais Duve KO: {duve_err}"
@@ -1139,9 +1172,9 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     _save_resynced(duve_resa_id, ci_str, co_str, device_id, inv_id, inv_code, link, duve_ok,
                    member_csv=",".join(members),
                    hold_reason=hold if ISEO_HOLD_MODE == "on" else None)
+    if hold and not row.get("cache_hold"):  # nouvelle rétention née du changement de dates
+        _notify_hold(row, hold, suffix=" — après modification des dates")
     if hold and ISEO_HOLD_MODE == "on":
-        if not row.get("cache_hold"):  # nouvelle rétention née du changement de dates
-            _notify_hold(row, f"{hold} — après modification des dates")
         logger.info(f"🔄 resync {duve_resa_id} window → {ci_str}→{co_str} (code retenu)")
         return True, None
     if not duve_ok:
@@ -1287,7 +1320,8 @@ def _run_inner() -> None:
     for row in to_provision:
         # Porte évaluée AVANT le provision : en mode `observe` on journalise sans
         # retenir, ce qui permet de mesurer le volume réel et de repérer un faux
-        # positif coûteux avant de passer en `on`.
+        # positif coûteux avant de passer en `on`. La RC est alertée dans les deux
+        # modes (le mail est envoyé par `_provision`, cf. `_notify_hold`).
         row["hold_reason"] = _evaluate_hold(row)
         if row["hold_reason"]:
             held += 1
