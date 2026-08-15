@@ -68,7 +68,13 @@ echo "🚀 Déploiement du job iseo-orchestrator (pipeline V3 100% DWH — natif
 #     code jugé à risque est CRÉÉ côté Sofia (donc lisible au dash, révocable) mais
 #     PAS poussé à Duve — la RC valide puis l'envoie. Critères (recalibrage 15/08,
 #     tous deux sur le canal DIRECT) : réservé ≤ ISEO_HOLD_LEAD_HOURS (72h) avant
-#     l'arrivée + rien d'encaissé. ⚠ ISEO_HOLD_ALERT_TO doit pointer la RC : une
+#     l'arrivée + solde restant dû (> ISEO_HOLD_MIN_BALANCE € ET ≥
+#     ISEO_HOLD_MIN_BALANCE_RATIO du séjour, sur une résa posée ≤
+#     ISEO_HOLD_BALANCE_MAX_LEAD_HOURS avant l'arrivée — bornes posées le 15/08 pour
+#     ne plus sonner sur un reliquat de 75 € ni sur une résa vieille de 6 mois).
+#     ⚠ Le solde se calcule au COMPTE PAYEUR, jamais sur les paiements de la
+#     réservation : Mews y attache l'échec, pas le paiement réussi (cf. _PAYMENTS_CTE).
+#     ⚠ ISEO_HOLD_ALERT_TO doit pointer la RC : une
 #     rétention envoie TOUJOURS un mail (mode `observe` compris), sans quoi la porte
 #     transforme une fraude évitée en client dehors à 22 h.
 #     ⚠ La porte ne mord vraiment que sur les apparts dont le code fixe a été retiré

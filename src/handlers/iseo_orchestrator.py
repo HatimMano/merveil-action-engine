@@ -70,6 +70,8 @@ MEWS_FCT_TABLE = os.environ.get(
     "MEWS_FCT_TABLE", "merveil-data-warehouse.marts.fct_reservations")
 MEWS_PAYMENTS_TABLE = os.environ.get(
     "MEWS_PAYMENTS_TABLE", "merveil-data-warehouse.staging.stg_mews__payments")
+MEWS_ORDER_ITEMS_TABLE = os.environ.get(
+    "MEWS_ORDER_ITEMS_TABLE", "merveil-data-warehouse.staging.stg_mews__order_items")
 SMART_LOCKS_TABLE = os.environ.get(
     "SMART_LOCKS_TABLE", "merveil-data-warehouse.staging.stg_iseo__smart_locks")
 STD_DEVICES_TABLE = os.environ.get(
@@ -123,6 +125,21 @@ LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "3"))
 ISEO_HOLD_MODE = os.environ.get("ISEO_HOLD_MODE", "observe").lower()
 # Seuil « réservé peu avant l'arrivée », appliqué au canal DIRECT seul (cf. _evaluate_hold).
 ISEO_HOLD_LEAD_HOURS = int(os.environ.get("ISEO_HOLD_LEAD_HOURS", "72"))
+# Critère « solde restant dû » (ex-« rien d'encaissé »), lui aussi canal DIRECT seul :
+#   - montant minimum pour qu'un reliquat compte (un résidu de 210 € sur 4 156 € n'est
+#     pas un signal de fraude) ;
+#   - ancienneté MAX de la réservation : une résa posée 6 mois à l'avance et pas encore
+#     soldée est un sujet de relance commerciale, pas de fraude → on n'alerte pas
+#     (demande Hatim 15/08). 720 h = 30 j.
+ISEO_HOLD_MIN_BALANCE = float(os.environ.get("ISEO_HOLD_MIN_BALANCE", "1"))
+# … et part minimale du séjour restant à payer : mesuré le 15/08, se contenter d'un
+# solde > 0 fait sonner des reliquats de 75 € sur un séjour complet (Largaespada) ou
+# 210 € sur 4 156 € (Javier). Le signal utile est « la moitié du séjour n'est toujours
+# pas payée », pas « il reste un résidu ».
+ISEO_HOLD_MIN_BALANCE_RATIO = float(
+    os.environ.get("ISEO_HOLD_MIN_BALANCE_RATIO", "0.5"))
+ISEO_HOLD_BALANCE_MAX_LEAD_HOURS = int(
+    os.environ.get("ISEO_HOLD_BALANCE_MAX_LEAD_HOURS", "720"))
 # Destinataire de la notification « code retenu » (défaut = alerte ISEO).
 ISEO_HOLD_ALERT_TO = os.getenv("ISEO_HOLD_ALERT_TO", "") or ISEO_ALERT_TO
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "13:00")
@@ -236,13 +253,51 @@ _LOCKS_CTE = f"""
       WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
     )"""
 
+# Ce que le client doit vs ce qu'il a réellement payé — calculé au COMPTE PAYEUR,
+# pas à la réservation.
+# ⚠⚠ Le piège qui a coûté deux guests sans code (15/08) : Mews attache la tentative
+# REFUSÉE à la réservation, mais le paiement RÉUSSI au bill / au compte payeur, avec
+# `reservation_id` NULL. Et ce compte payeur n'est même pas `customer_id` : Mews
+# fabrique un profil « shadow » (mêmes 12 derniers caractères du GUID, préfixe
+# différent) qui porte les order items. Compter les paiements par `reservation_id`
+# faisait donc voir « impayé » une résa intégralement encaissée : 4 faux positifs sur
+# 9 mesurés le 15/08, dont 2 apparts whitelistés laissés SANS code généré (Jack
+# Spence, encaissé 4 672 € le 02/08 ; Ray Javier, 3 946 € le 06/08).
+# Le seul chemin fiable est donc : items de la résa → compte payeur → paiements du
+# compte. Il n'existe aucun champ « solde / to be paid » dans l'API Mews (vérifié sur
+# `raw_reservations`), il faut bien le reconstituer.
+# ⚠ `amount_charged` est le total encaissé sur le COMPTE (il peut couvrir plusieurs
+# séjours) → un `balance` négatif veut simplement dire « rien à devoir ».
 _PAYMENTS_CTE = f"""
-    payments AS (
+    resa_accounts AS (
       SELECT reservation_id,
-             COUNTIF(state = 'Charged') AS n_charged,
-             COUNTIF(state = 'Failed')  AS n_failed
+             COALESCE(payer_account_id, customer_id) AS account_id,
+             SUM(amount_gross)                       AS due
+      FROM `{MEWS_ORDER_ITEMS_TABLE}`
+      WHERE NOT is_canceled AND reservation_id IS NOT NULL
+      GROUP BY reservation_id, account_id
+    ),
+    account_charged AS (
+      SELECT account_id,
+             SUM(IF(state = 'Charged', -amount_gross, 0)) AS charged
+      FROM `{MEWS_PAYMENTS_TABLE}`
+      WHERE account_id IS NOT NULL GROUP BY account_id
+    ),
+    resa_failed AS (
+      SELECT reservation_id, COUNTIF(state = 'Failed') AS n_failed
       FROM `{MEWS_PAYMENTS_TABLE}`
       WHERE reservation_id IS NOT NULL GROUP BY reservation_id
+    ),
+    payments AS (
+      SELECT ra.reservation_id,
+             SUM(ra.due)                                AS amount_due,
+             SUM(COALESCE(ac.charged, 0))               AS amount_charged,
+             SUM(ra.due) - SUM(COALESCE(ac.charged, 0)) AS balance,
+             MAX(COALESCE(rf.n_failed, 0))              AS n_failed
+      FROM resa_accounts ra
+      LEFT JOIN account_charged ac USING (account_id)
+      LEFT JOIN resa_failed rf ON rf.reservation_id = ra.reservation_id
+      GROUP BY ra.reservation_id
     )"""
 
 # CTE "stay" = unité d'accès physique = occupation CONTINUE d'un guest sur une serrure.
@@ -271,7 +326,15 @@ _STAYS_CTE = f"""
              m.resource_id, m.checkin_date, m.checkout_date,
              m.earliest_checkin_hour, m.latest_checkout_hour,
              lk.lock_id, lk.lock_tag_id, lk.apartment_code,
-             (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid,
+             -- Gate volontaire : on ne provisionne PAS tant qu'une carte a été refusée
+             -- et que RIEN n'est encaissé sur le compte (cas VCC Expedia/VRBO non
+             -- chargeable avant le jour J). ⚠ Depuis le 15/08 la condition porte sur
+             -- l'encaissé du COMPTE, plus sur les paiements de la réservation : un
+             -- paiement réussi n'y est jamais rattaché (cf. _PAYMENTS_CTE).
+             (COALESCE(pay.n_failed, 0) > 0
+              AND COALESCE(pay.amount_charged, 0) <= 0
+              AND COALESCE(pay.balance, 0) > 0)                          AS payment_unpaid,
+             ROUND(COALESCE(pay.balance, 0), 2)                          AS balance_due,
              -- Signaux de la PORTE (hold). Délai réservation→arrivée en heures, calé sur
              -- 15h le jour du CI (même convention que la mesure du 15/08). Négatif =
              -- réservé après l'heure d'arrivée théorique (cas Defalque, 21h02 pour le soir).
@@ -284,11 +347,20 @@ _STAYS_CTE = f"""
              (m.ota_source = 'Site direct'
               AND TIMESTAMP_DIFF(TIMESTAMP(DATETIME(m.checkin_date, TIME '15:00:00')),
                                  m.created_at, HOUR) <= {ISEO_HOLD_LEAD_HOURS}) AS direct_last_minute,
-             -- « Rien d'encaissé » n'a de sens que sur les canaux où NOUS prenons la carte :
-             -- une résa Booking/Airbnb est payée à l'OTA et n'a AUCUN paiement dans Mews →
-             -- appliqué à tous les canaux, ce critère retiendrait 69 % des arrivées.
+             -- « Solde restant dû » (ex-« rien d'encaissé »). N'a de sens que sur les
+             -- canaux où NOUS prenons la carte : une résa Booking/Airbnb est payée à
+             -- l'OTA et n'a AUCUN paiement dans Mews → appliqué à tous les canaux, ce
+             -- critère retiendrait 69 % des arrivées.
+             -- Borné depuis le 15/08 en ancienneté (une résa posée 6 mois avant et pas
+             -- encore soldée est un sujet de relance, pas de fraude) et en matérialité
+             -- (un reliquat de 75 € n'est pas « sans encaissement »).
              (m.ota_source = 'Site direct'
-              AND COALESCE(pay.n_charged, 0) = 0)                        AS direct_unpaid
+              AND COALESCE(pay.balance, 0) > {ISEO_HOLD_MIN_BALANCE}
+              AND COALESCE(pay.balance, 0)
+                  >= {ISEO_HOLD_MIN_BALANCE_RATIO} * NULLIF(pay.amount_due, 0)
+              AND TIMESTAMP_DIFF(TIMESTAMP(DATETIME(m.checkin_date, TIME '15:00:00')),
+                                 m.created_at, HOUR)
+                  <= {ISEO_HOLD_BALANCE_MAX_LEAD_HOURS})                 AS direct_unpaid
       FROM `{MEWS_FCT_TABLE}` m
       LEFT JOIN locks lk    ON lk.duve_property_id = m.resource_id
       LEFT JOIN payments pay ON pay.reservation_id = m.reservation_id
@@ -322,6 +394,9 @@ _STAYS_CTE = f"""
         ARRAY_AGG(latest_checkout_hour  ORDER BY checkout_date DESC)[SAFE_OFFSET(0)] AS latest_checkout_hour,
         CAST(ARRAY_AGG(reservation_number ORDER BY checkin_date)[SAFE_OFFSET(0)] AS STRING) AS mews_reservation_number,
         ARRAY_AGG(payment_unpaid ORDER BY checkin_date)[SAFE_OFFSET(0)]              AS payment_unpaid,
+        -- Pire cas du stay : chaque membre porte l'encaissé du COMPTE, donc sommer
+        -- doublonnerait. MAX = le membre le moins soldé.
+        MAX(balance_due)                                                             AS balance_due,
         -- Porte agrégée au stay : on prend le membre le PLUS tardivement réservé et on
         -- retient si l'un des membres est impayé. Conservateur par choix — sur un stay
         -- back-to-back, une seule résa suspecte suffit à demander une validation.
@@ -349,7 +424,7 @@ _STAYS_CTE = f"""
         resource_id            AS duve_property_id,
         customer_name, apartment_code, lock_id, lock_tag_id,
         stay_ci, stay_co, earliest_checkin_hour, latest_checkout_hour,
-        mews_reservation_number, payment_unpaid, min_lead_hours,
+        mews_reservation_number, payment_unpaid, balance_due, min_lead_hours,
         direct_last_minute, direct_unpaid,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)                 AS member_duve_ids,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)[SAFE_OFFSET(0)] AS canonical_duve
@@ -357,7 +432,8 @@ _STAYS_CTE = f"""
       GROUP BY customer_id, resource_id, island_id, duve_property_id, customer_name,
                apartment_code, lock_id, lock_tag_id, stay_ci, stay_co,
                earliest_checkin_hour, latest_checkout_hour, mews_reservation_number,
-               payment_unpaid, min_lead_hours, direct_last_minute, direct_unpaid
+               payment_unpaid, balance_due, min_lead_hours, direct_last_minute,
+               direct_unpaid
     )"""
 
 
@@ -378,7 +454,7 @@ def _resa_to_provision() -> list[dict]:
       s.customer_name, s.mews_reservation_number,
       s.stay_ci AS checkin_date, s.stay_co AS checkout_date,
       s.earliest_checkin_hour, s.latest_checkout_hour,
-      s.payment_unpaid, s.member_duve_ids,
+      s.payment_unpaid, s.member_duve_ids, s.balance_due,
       s.min_lead_hours, s.direct_last_minute, s.direct_unpaid
     FROM stays s
     WHERE s.canonical_duve IS NOT NULL
@@ -420,7 +496,8 @@ def _whitelisted_gaps() -> list[dict]:
              WHEN lk.lock_id IS NULL THEN 'lock'
              WHEN d.duve_reservation_id IS NULL THEN 'precheckin'
              WHEN COALESCE(pay.n_failed, 0) > 0
-              AND COALESCE(pay.n_charged, 0) = 0 THEN 'paiement'
+              AND COALESCE(pay.amount_charged, 0) <= 0
+              AND COALESCE(pay.balance, 0) > 0 THEN 'paiement'
              ELSE 'autre'
            END AS reason
     FROM `{MEWS_FCT_TABLE}` m
@@ -596,7 +673,7 @@ def _resa_to_resync() -> list[dict]:
       s.duve_property_id, s.customer_name,
       s.stay_ci AS live_ci, s.stay_co AS live_co,
       s.earliest_checkin_hour, s.latest_checkout_hour, s.member_duve_ids,
-      s.min_lead_hours, s.direct_last_minute, s.direct_unpaid
+      s.min_lead_hours, s.direct_last_minute, s.direct_unpaid, s.balance_due
     FROM cache c
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
     WHERE s.stay_ci != c.cache_ci OR s.stay_co != c.cache_co OR c.iseo_invitation_id IS NULL
@@ -815,10 +892,20 @@ def _evaluate_hold(row: dict) -> Optional[str]:
     """Motif de rétention du code, ou None si le code peut partir chez le client.
 
     Deux critères, tous deux restreints au canal DIRECT (recalibrage 15/08) :
-      - réservé ≤ ISEO_HOLD_LEAD_HOURS (72 h) avant l'arrivée — ~8 résas/mois, c'est
+      - réservé ≤ ISEO_HOLD_LEAD_HOURS (72 h) avant l'arrivée — ~12 résas/mois, c'est
         le critère qui porte la valeur : les 4 fraudes d'août sont toutes en direct,
         3 réservées le jour même et la 4ᵉ (Bossongo) à J-2 ;
-      - rien d'encaissé (cf. commentaire du CTE).
+      - solde restant dû > ISEO_HOLD_MIN_BALANCE, sur une résa posée ≤
+        ISEO_HOLD_BALANCE_MAX_LEAD_HOURS avant l'arrivée (~6/mois, dont 2 déjà prises
+        par le critère précédent).
+
+    ⚠ Ce second critère s'appelait « rien d'encaissé » et se lisait sur les paiements
+    de la RÉSERVATION → il sonnait sur des séjours intégralement payés (cf. le piège
+    documenté dans _PAYMENTS_CTE) et sur des réservations vieilles de 6 mois. Recalculé
+    au compte payeur et borné en ancienneté le 15/08. À garder en tête : les 4 fraudes
+    d'août avaient toutes PAYÉ (les pertes sont des chargebacks) — le paiement n'est
+    pas un signal de fraude, c'est un signal de créance. Le critère qui protège
+    vraiment est le premier.
 
     ⚠ Le critère last-minute était initialement TOUS CANAUX (≤24 h). Restreint au
     direct le 15/08 : mesuré, 87 % des résas du jour même sont des OTA, payées à
@@ -839,7 +926,9 @@ def _evaluate_hold(row: dict) -> Optional[str]:
         detail = f" ({int(lead)}h avant l'arrivée)" if lead is not None else ""
         motifs.append(f"direct réservé au dernier moment{detail}")
     if row.get("direct_unpaid"):
-        motifs.append("direct sans encaissement")
+        bal = row.get("balance_due")
+        detail = f" ({bal:.0f} € restants)" if bal is not None else ""
+        motifs.append(f"direct avec solde restant dû{detail}")
     return " + ".join(motifs) if motifs else None
 
 
@@ -862,11 +951,11 @@ def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
           duve_reservation_id, duve_property_id, apartment_code, customer_name,
           mews_reservation_number, checkin_date, checkout_date,
           hold_reason, direct_last_minute, direct_unpaid, min_lead_hours,
-          hold_lead_hours_setting)
+          hold_lead_hours_setting, balance_due)
         VALUES (CURRENT_TIMESTAMP(), @phase, @mode, @outcome,
           @duve, @pid, @apt, @name, @resa,
           SAFE_CAST(@ci AS DATE), SAFE_CAST(@co AS DATE),
-          @reason, @dlm, @du, @lead, @setting)
+          @reason, @dlm, @du, @lead, @setting, @balance)
         """
         params = [
             bigquery.ScalarQueryParameter("phase", "STRING", phase),
@@ -890,6 +979,9 @@ def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
                 "lead", "INT64",
                 int(row["min_lead_hours"]) if row.get("min_lead_hours") is not None else None),
             bigquery.ScalarQueryParameter("setting", "INT64", ISEO_HOLD_LEAD_HOURS),
+            bigquery.ScalarQueryParameter(
+                "balance", "FLOAT64",
+                float(row["balance_due"]) if row.get("balance_due") is not None else None),
         ]
         _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
     except Exception as e:
