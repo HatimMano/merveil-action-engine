@@ -812,14 +812,14 @@ def _get_or_create_guest_user(duve_resa_id: str, guest_name: Optional[str]) -> t
 def _evaluate_hold(row: dict) -> Optional[str]:
     """Motif de rétention du code, ou None si le code peut partir chez le client.
 
-    Deux critères, tous deux restreints au canal DIRECT (recalibrage 16/08) :
+    Deux critères, tous deux restreints au canal DIRECT (recalibrage 15/08) :
       - réservé ≤ ISEO_HOLD_LEAD_HOURS (72 h) avant l'arrivée — ~8 résas/mois, c'est
         le critère qui porte la valeur : les 4 fraudes d'août sont toutes en direct,
         3 réservées le jour même et la 4ᵉ (Bossongo) à J-2 ;
       - rien d'encaissé (cf. commentaire du CTE).
 
     ⚠ Le critère last-minute était initialement TOUS CANAUX (≤24 h). Restreint au
-    direct le 16/08 : mesuré, 87 % des résas du jour même sont des OTA, payées à
+    direct le 15/08 : mesuré, 87 % des résas du jour même sont des OTA, payées à
     l'OTA (moyen de paiement vérifié, recours possible) et absentes des 4 fraudes —
     retenir leur code, c'est un client dehors le soir pour un gain de sécurité nul.
 
@@ -844,7 +844,7 @@ def _evaluate_hold(row: dict) -> Optional[str]:
 def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
     """Prévient la RC qu'une résa est jugée à risque par la porte.
 
-    ⚠ Envoyé dans les modes `on` ET `observe` (décision 16/08) : toute rétention
+    ⚠ Envoyé dans les modes `on` ET `observe` (décision 15/08) : toute rétention
     DOIT être doublée d'une alerte, sinon la porte transforme une fraude évitée en
     client dehors à 22 h — et en `observe`, sans ce mail, personne n'apprenait
     qu'une résa avait été jugée à risque. Le mail dit explicitement, dans chaque

@@ -66,7 +66,7 @@ echo "🚀 Déploiement du job iseo-orchestrator (pipeline V3 100% DWH — natif
 #     partagé (ancien ISEO_DEFAULT_GUEST_TAG_ID : 184106 system KO, 184181 GC'd).
 #   - ⭐ PORTE (hold) : ISEO_HOLD_MODE=off|observe|on (défaut observe). En `on`, un
 #     code jugé à risque est CRÉÉ côté Sofia (donc lisible au dash, révocable) mais
-#     PAS poussé à Duve — la RC valide puis l'envoie. Critères (recalibrage 16/08,
+#     PAS poussé à Duve — la RC valide puis l'envoie. Critères (recalibrage 15/08,
 #     tous deux sur le canal DIRECT) : réservé ≤ ISEO_HOLD_LEAD_HOURS (72h) avant
 #     l'arrivée + rien d'encaissé. ⚠ ISEO_HOLD_ALERT_TO doit pointer la RC : une
 #     rétention envoie TOUJOURS un mail (mode `observe` compris), sans quoi la porte
