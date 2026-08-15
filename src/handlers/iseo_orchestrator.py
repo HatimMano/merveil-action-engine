@@ -107,6 +107,22 @@ GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@archides.fr")
 ISEO_ALERT_TO = os.getenv("ISEO_ALERT_TO", "hatim@archides.fr")
 
 LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "3"))
+
+# ── Porte de validation (hold) ────────────────────────────────────────────────
+# Le code est CRÉÉ côté Sofia (visible au dashboard, révocable) mais N'EST PAS
+# poussé à Duve : le client ne le voit pas, la RC valide puis le lui envoie.
+#   off     → porte désactivée
+#   observe → décision calculée et journalisée, mais on pousse quand même (défaut)
+#   on      → rétention effective
+# ⚠ La porte n'a d'effet RÉEL qu'une fois le code fixe retiré du champ Duve de
+# l'appartement : tant qu'il y est, Duve l'affiche en repli et le client entre
+# quand même. Elle mord donc progressivement, appartement par appartement, au
+# rythme des suppressions côté ops — c'est voulu, ça rend l'activation sans risque.
+ISEO_HOLD_MODE = os.environ.get("ISEO_HOLD_MODE", "observe").lower()
+# Seuil last-minute, tous canaux (mesuré : ~24 résas/mois).
+ISEO_HOLD_LEAD_HOURS = int(os.environ.get("ISEO_HOLD_LEAD_HOURS", "24"))
+# Destinataire de la notification « code retenu » (défaut = alerte ISEO).
+ISEO_HOLD_ALERT_TO = os.getenv("ISEO_HOLD_ALERT_TO", "") or ISEO_ALERT_TO
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "13:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "19:00")
 PIN_COLLISION_RETRIES = 8
@@ -253,7 +269,17 @@ _STAYS_CTE = f"""
              m.resource_id, m.checkin_date, m.checkout_date,
              m.earliest_checkin_hour, m.latest_checkout_hour,
              lk.lock_id, lk.lock_tag_id, lk.apartment_code,
-             (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid
+             (COALESCE(pay.n_failed, 0) > 0 AND COALESCE(pay.n_charged, 0) = 0) AS payment_unpaid,
+             -- Signaux de la PORTE (hold). Délai réservation→arrivée en heures, calé sur
+             -- 15h le jour du CI (même convention que la mesure du 15/08). Négatif =
+             -- réservé après l'heure d'arrivée théorique (cas Defalque, 21h02 pour le soir).
+             TIMESTAMP_DIFF(TIMESTAMP(DATETIME(m.checkin_date, TIME '15:00:00')),
+                            m.created_at, HOUR)                          AS lead_hours,
+             -- « Rien d'encaissé » n'a de sens que sur les canaux où NOUS prenons la carte :
+             -- une résa Booking/Airbnb est payée à l'OTA et n'a AUCUN paiement dans Mews →
+             -- appliqué à tous les canaux, ce critère retiendrait 69 % des arrivées.
+             (m.ota_source = 'Site direct'
+              AND COALESCE(pay.n_charged, 0) = 0)                        AS direct_unpaid
       FROM `{MEWS_FCT_TABLE}` m
       LEFT JOIN locks lk    ON lk.duve_property_id = m.resource_id
       LEFT JOIN payments pay ON pay.reservation_id = m.reservation_id
@@ -286,7 +312,12 @@ _STAYS_CTE = f"""
         ARRAY_AGG(earliest_checkin_hour ORDER BY checkin_date)[SAFE_OFFSET(0)]       AS earliest_checkin_hour,
         ARRAY_AGG(latest_checkout_hour  ORDER BY checkout_date DESC)[SAFE_OFFSET(0)] AS latest_checkout_hour,
         CAST(ARRAY_AGG(reservation_number ORDER BY checkin_date)[SAFE_OFFSET(0)] AS STRING) AS mews_reservation_number,
-        ARRAY_AGG(payment_unpaid ORDER BY checkin_date)[SAFE_OFFSET(0)]              AS payment_unpaid
+        ARRAY_AGG(payment_unpaid ORDER BY checkin_date)[SAFE_OFFSET(0)]              AS payment_unpaid,
+        -- Porte agrégée au stay : on prend le membre le PLUS tardivement réservé et on
+        -- retient si l'un des membres est impayé. Conservateur par choix — sur un stay
+        -- back-to-back, une seule résa suspecte suffit à demander une validation.
+        MIN(lead_hours)                                                              AS min_lead_hours,
+        LOGICAL_OR(direct_unpaid)                                                    AS direct_unpaid
       FROM islands
       GROUP BY customer_id, resource_id, island_id
     ),
@@ -308,13 +339,14 @@ _STAYS_CTE = f"""
         resource_id            AS duve_property_id,
         customer_name, apartment_code, lock_id, lock_tag_id,
         stay_ci, stay_co, earliest_checkin_hour, latest_checkout_hour,
-        mews_reservation_number, payment_unpaid,
+        mews_reservation_number, payment_unpaid, min_lead_hours, direct_unpaid,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)                 AS member_duve_ids,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)[SAFE_OFFSET(0)] AS canonical_duve
       FROM stay_duve
       GROUP BY customer_id, resource_id, island_id, duve_property_id, customer_name,
                apartment_code, lock_id, lock_tag_id, stay_ci, stay_co,
-               earliest_checkin_hour, latest_checkout_hour, mews_reservation_number, payment_unpaid
+               earliest_checkin_hour, latest_checkout_hour, mews_reservation_number,
+               payment_unpaid, min_lead_hours, direct_unpaid
     )"""
 
 
@@ -335,7 +367,8 @@ def _resa_to_provision() -> list[dict]:
       s.customer_name, s.mews_reservation_number,
       s.stay_ci AS checkin_date, s.stay_co AS checkout_date,
       s.earliest_checkin_hour, s.latest_checkout_hour,
-      s.payment_unpaid, s.member_duve_ids
+      s.payment_unpaid, s.member_duve_ids,
+      s.min_lead_hours, s.direct_unpaid
     FROM stays s
     WHERE s.canonical_duve IS NOT NULL
       AND s.stay_ci <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
@@ -539,6 +572,7 @@ def _resa_to_resync() -> list[dict]:
     cache AS (
       SELECT duve_reservation_id, pin_value, iseo_device_id, iseo_invitation_id,
              iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id,
+             mews_reservation_number, apartment_code, hold_reason, released_at,
              checkin_date AS cache_ci, checkout_date AS cache_co
       FROM `{PIN_CACHE_TABLE}`
       WHERE archived_at IS NULL AND provisioned_at IS NOT NULL
@@ -546,10 +580,12 @@ def _resa_to_resync() -> list[dict]:
     SELECT
       c.duve_reservation_id, c.pin_value, c.iseo_device_id, c.iseo_invitation_id,
       c.iseo_guest_tag_id, c.iseo_lock_id, c.iseo_lock_tag_id,
-      c.cache_ci, c.cache_co,
+      c.cache_ci, c.cache_co, c.hold_reason AS cache_hold, c.released_at AS cache_released,
+      c.mews_reservation_number, c.apartment_code,
       s.duve_property_id, s.customer_name,
       s.stay_ci AS live_ci, s.stay_co AS live_co,
-      s.earliest_checkin_hour, s.latest_checkout_hour, s.member_duve_ids
+      s.earliest_checkin_hour, s.latest_checkout_hour, s.member_duve_ids,
+      s.min_lead_hours, s.direct_unpaid
     FROM cache c
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
     WHERE s.stay_ci != c.cache_ci OR s.stay_co != c.cache_co OR c.iseo_invitation_id IS NULL
@@ -563,17 +599,19 @@ def _resa_to_resync() -> list[dict]:
 def _save_provisioned(row: dict, pin_value: str, device_id: int,
                       inv_id: Optional[int], inv_code: Optional[str],
                       link: Optional[str], duve_ok: bool,
-                      member_csv: Optional[str] = None) -> None:
+                      member_csv: Optional[str] = None,
+                      hold_reason: Optional[str] = None) -> None:
     q = f"""
     INSERT INTO `{PIN_CACHE_TABLE}` (
       duve_reservation_id, mews_reservation_number, apartment_code, pin_value,
       iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id, iseo_device_id,
       iseo_invitation_id, invitation_code, invitation_link,
       checkin_date, checkout_date, cached_at, provisioned_at, duve_pushed_at,
-      shadow_mode, stay_member_duve_ids)
+      shadow_mode, stay_member_duve_ids, hold_reason, held_at)
     VALUES (@duve, @num, @apt, @pin, @gtag, @lock, @ltag, @dev,
             @inv, @code, @link, @ci, @co, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(),
-            {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'}, FALSE, @members)
+            {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'}, FALSE, @members, @hold,
+            {'CURRENT_TIMESTAMP()' if hold_reason else 'NULL'})
     """
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ScalarQueryParameter("duve", "STRING", row["duve_reservation_id"]),
@@ -590,6 +628,7 @@ def _save_provisioned(row: dict, pin_value: str, device_id: int,
         bigquery.ScalarQueryParameter("ci", "DATE", str(row["checkin_date"])),
         bigquery.ScalarQueryParameter("co", "DATE", str(row["checkout_date"])),
         bigquery.ScalarQueryParameter("members", "STRING", member_csv),
+        bigquery.ScalarQueryParameter("hold", "STRING", hold_reason),
     ])
     _bq().query(q, job_config=cfg).result()
 
@@ -597,7 +636,10 @@ def _save_provisioned(row: dict, pin_value: str, device_id: int,
 def _save_resynced(duve_resa_id: str, ci: str, co: str, device_id: object,
                    inv_id: Optional[int], inv_code: Optional[str],
                    link: Optional[str], duve_ok: bool,
-                   member_csv: Optional[str] = None) -> None:
+                   member_csv: Optional[str] = None,
+                   hold_reason: Optional[str] = None) -> None:
+    # `held_at` n'est posé qu'à la PREMIÈRE rétention (COALESCE) : un resync
+    # successif ne doit pas rajeunir l'ancienneté d'une rétention en attente.
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
     SET checkin_date = @ci, checkout_date = @co, iseo_device_id = @dev,
@@ -605,6 +647,8 @@ def _save_resynced(duve_resa_id: str, ci: str, co: str, device_id: object,
         provisioned_at = CURRENT_TIMESTAMP(),
         duve_pushed_at = {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'},
         stay_member_duve_ids = @members,
+        hold_reason = @hold,
+        held_at = {'COALESCE(held_at, CURRENT_TIMESTAMP())' if hold_reason else 'NULL'},
         last_error = NULL
     WHERE duve_reservation_id = @id AND archived_at IS NULL
     """
@@ -617,17 +661,26 @@ def _save_resynced(duve_resa_id: str, ci: str, co: str, device_id: object,
         bigquery.ScalarQueryParameter("code", "STRING", inv_code),
         bigquery.ScalarQueryParameter("link", "STRING", link),
         bigquery.ScalarQueryParameter("members", "STRING", member_csv),
+        bigquery.ScalarQueryParameter("hold", "STRING", hold_reason),
     ])
     _bq().query(q, job_config=cfg).result()
 
 
 def _resa_duve_retry() -> list[dict]:
     """Rows provisionnées côté Sofia mais dont le push Duve a échoué
-    (`duve_pushed_at IS NULL`) → à re-pousser (code + lien déjà en cache)."""
+    (`duve_pushed_at IS NULL`) → à re-pousser (code + lien déjà en cache).
+
+    ⚠ EXCLUT les rétentions volontaires. Une ligne retenue a exactement la même
+    signature qu'un push raté (`provisioned_at` rempli, `duve_pushed_at` NULL) :
+    sans ce filtre, le retry enverrait au client, au run suivant, le code que la
+    porte vient de retenir — la porte serait silencieusement inopérante. Une
+    rétention libérée (`released_at` posé) redevient éligible et part au run d'après.
+    """
     q = f"""
     SELECT duve_reservation_id, pin_value, invitation_link, stay_member_duve_ids
     FROM `{PIN_CACHE_TABLE}`
     WHERE archived_at IS NULL AND provisioned_at IS NOT NULL AND duve_pushed_at IS NULL
+      AND (hold_reason IS NULL OR released_at IS NOT NULL)
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
@@ -747,6 +800,59 @@ def _get_or_create_guest_user(duve_resa_id: str, guest_name: Optional[str]) -> t
 
 # ── Provision (A→E) ───────────────────────────────────────────────────────────
 
+def _evaluate_hold(row: dict) -> Optional[str]:
+    """Motif de rétention du code, ou None si le code peut partir chez le client.
+
+    Deux critères, calibrés le 15/08 sur 2026 (≈27 résas/mois au total) :
+      - last-minute (≤ ISEO_HOLD_LEAD_HOURS, tous canaux) — 3 des 4 fraudes d'août
+        étaient des réservations du jour même ;
+      - rien d'encaissé sur le canal DIRECT uniquement (cf. commentaire du CTE).
+
+    ⚠ Volontairement PAS conditionné à « pièce d'identité scannée » : scanner une
+    pièce coûte 30 secondes à un fraudeur (n'importe quel document passe l'OCR),
+    donc en faire une condition de libération rendrait la porte contournable par
+    une action que l'attaquant contrôle. La pièce sert au triage humain au moment
+    de libérer, pas à la décision machine.
+    """
+    if ISEO_HOLD_MODE == "off":
+        return None
+    motifs = []
+    lead = row.get("min_lead_hours")
+    if lead is not None and lead <= ISEO_HOLD_LEAD_HOURS:
+        motifs.append(f"last_minute ({int(lead)}h avant l'arrivée)")
+    if row.get("direct_unpaid"):
+        motifs.append("direct sans encaissement")
+    return " + ".join(motifs) if motifs else None
+
+
+def _notify_hold(row: dict, motif: str) -> None:
+    """Prévient la RC qu'un code est prêt mais retenu. Sans cette notification, la
+    porte transformerait une fraude évitée en client dehors à 22 h."""
+    apt = row.get("apartment_code") or row.get("duve_property_id")
+    # Le provision porte checkin_date/checkout_date, le resync live_ci/live_co.
+    ci = row.get("checkin_date") or row.get("live_ci")
+    co = row.get("checkout_date") or row.get("live_co")
+    html = build_email(
+        "Code d'accès retenu — à valider",
+        subtitle=f"{row.get('customer_name')} · {apt}",
+        severity="warning",
+        intro=("Le code a été <strong>créé côté serrure mais volontairement pas envoyé</strong> "
+               "au client : il ne le voit pas dans son application. "
+               f"<br><strong>Motif :</strong> {esc(motif)}"),
+        table={"headers": ["Client", "Appartement", "Séjour", "Résa Mews"],
+               "rows": [[esc(row.get("customer_name")), esc(apt),
+                         f"{esc(ci)} → {esc(co)}",
+                         esc(row.get("mews_reservation_number"))]]},
+        sections_html=('<div style="padding:0 24px 8px;font-size:14px;color:#475569">'
+                       "Après vérification de l'identité, lire le code sur le dashboard et "
+                       "l'envoyer au client. En cas de doute, ne rien envoyer et faire "
+                       "annuler la réservation.</div>"),
+        button=("Voir les arrivées →",
+                "https://direction.archides.fr/ops-front?tab=arrivees"))
+    send_mail(f"🔒 Code retenu à valider — {row.get('customer_name')} ({apt})",
+              html, ISEO_HOLD_ALERT_TO, html=True, sender=GMAIL_SENDER)
+
+
 def _provision(row: dict) -> tuple[bool, Optional[str]]:
     duve_resa_id = row["duve_reservation_id"]
 
@@ -797,15 +903,27 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
     link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
 
-    # D. Duve push (code clavier + lien) — à TOUS les duve du stay (back-to-back).
+    # D. Duve push (code clavier + lien) — à TOUS les duve du stay (back-to-back),
+    #    SAUF si la porte retient : le code existe alors côté Sofia (donc lisible au
+    #    dashboard et révocable) mais le client ne le voit pas.
     members = row.get("member_duve_ids") or [duve_resa_id]
-    duve_ok, duve_err = _duve_push_all(members, pin_value, link or "")
-    if not duve_ok:
-        logger.warning(f"⚠️ Duve push failed for {duve_resa_id}: {duve_err}")
+    hold = row.get("hold_reason")  # posé par le caller (déjà évalué pour le log)
+    if hold and ISEO_HOLD_MODE == "on":
+        duve_ok, duve_err = False, None
+        logger.warning(f"🔒 HOLD {duve_resa_id} ({row.get('apartment_code')}) — {hold} "
+                       f"→ code créé, PAS envoyé à Duve")
+    else:
+        duve_ok, duve_err = _duve_push_all(members, pin_value, link or "")
+        if not duve_ok:
+            logger.warning(f"⚠️ Duve push failed for {duve_resa_id}: {duve_err}")
 
     # E. état
     _save_provisioned(row, pin_value, device_id, inv_id, inv_code, link, duve_ok,
-                      member_csv=",".join(members))
+                      member_csv=",".join(members),
+                      hold_reason=hold if ISEO_HOLD_MODE == "on" else None)
+    if hold and ISEO_HOLD_MODE == "on":
+        _notify_hold(row, hold)
+        return True, None  # rétention volontaire : ce n'est PAS une erreur de run
     if not duve_ok:
         return False, f"Sofia OK mais Duve KO: {duve_err}"
     return True, None
@@ -1002,12 +1120,30 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
 
     # 3. Duve push (code identique, lien neuf) — à tous les duve du stay.
+    #    ⚠ La porte est RÉ-ÉVALUÉE ici, sur les dates LIVE. Sinon : réserver à J+5
+    #    (la porte laisse passer), recevoir le code à J-3, puis avancer les dates à
+    #    aujourd'hui — le resync repousserait le code sans aucun contrôle. Une
+    #    rétention déjà libérée à la main n'est pas re-fermée (released_at présent).
     members = row.get("member_duve_ids") or [duve_resa_id]
-    duve_ok, duve_err = _duve_push_all(members, pin_value, link or "")
+    hold = None
+    if not row.get("cache_released"):
+        hold = _evaluate_hold(row)
+    if hold and ISEO_HOLD_MODE == "on":
+        duve_ok, duve_err = False, None
+        logger.warning(f"🔒 HOLD au resync {duve_resa_id} ({row.get('apartment_code')}) — "
+                       f"{hold} → nouveau lien PAS envoyé à Duve")
+    else:
+        duve_ok, duve_err = _duve_push_all(members, pin_value, link or "")
 
     # 4. état
     _save_resynced(duve_resa_id, ci_str, co_str, device_id, inv_id, inv_code, link, duve_ok,
-                   member_csv=",".join(members))
+                   member_csv=",".join(members),
+                   hold_reason=hold if ISEO_HOLD_MODE == "on" else None)
+    if hold and ISEO_HOLD_MODE == "on":
+        if not row.get("cache_hold"):  # nouvelle rétention née du changement de dates
+            _notify_hold(row, f"{hold} — après modification des dates")
+        logger.info(f"🔄 resync {duve_resa_id} window → {ci_str}→{co_str} (code retenu)")
+        return True, None
     if not duve_ok:
         return False, f"resync Sofia OK mais Duve KO: {duve_err}"
     logger.info(f"🔄 resync {duve_resa_id} window → {ci_str}→{co_str}")
@@ -1147,8 +1283,18 @@ def _run_inner() -> None:
     # 1. Provision (J-3)
     to_provision = _resa_to_provision()
     logger.info(f"📋 {len(to_provision)} résa(s) à provisionner (CI dans 0-{LOOKAHEAD_DAYS}j, pas encore couvertes)")
-    ok = skip = 0
+    ok = skip = held = 0
     for row in to_provision:
+        # Porte évaluée AVANT le provision : en mode `observe` on journalise sans
+        # retenir, ce qui permet de mesurer le volume réel et de repérer un faux
+        # positif coûteux avant de passer en `on`.
+        row["hold_reason"] = _evaluate_hold(row)
+        if row["hold_reason"]:
+            held += 1
+            if ISEO_HOLD_MODE == "observe":
+                logger.info(f"🌗 HOLD-OBSERVE {row['duve_reservation_id']} "
+                            f"({row.get('apartment_code')}, {row.get('customer_name')}) — "
+                            f"{row['hold_reason']} → aurait été retenu, code envoyé quand même")
         try:
             success, err = _provision(row)
         except Exception as e:
@@ -1237,8 +1383,9 @@ def _run_inner() -> None:
             errors.append(f"purge {row.get('ext_id')}: {err}")
 
     logger.info("=" * 70)
-    logger.info(f"DONE — provision ok={ok} skip={skip} | resync={resynced} | "
-                f"duve-retry={retry} | archived={archived} | purged={purged} | erreurs={len(errors)}")
+    logger.info(f"DONE — provision ok={ok} skip={skip} | hold[{ISEO_HOLD_MODE}]={held} | "
+                f"resync={resynced} | duve-retry={retry} | archived={archived} | "
+                f"purged={purged} | erreurs={len(errors)}")
     logger.info("=" * 70)
 
     if errors:
