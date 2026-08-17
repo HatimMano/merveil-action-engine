@@ -1144,6 +1144,16 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     _save_provisioned(row, pin_value, device_id, inv_id, inv_code, link, duve_ok,
                       member_csv=",".join(members),
                       hold_reason=hold if ISEO_HOLD_MODE == "on" else None)
+
+    # E bis. Le code natif de CETTE résa devient un doublon à l'instant précis où le
+    # nôtre existe et part chez le client. On le retire ici, et pas en purge groupée :
+    # tant que nous n'avons rien poussé, le code natif est ce que la Guest App affiche,
+    # donc le SEUL code du client (constat 18/08 : 12 codes natifs correspondaient à des
+    # séjours réels à venir, dont 3 sur des appartements non intégrés où nous ne
+    # provisionnerons jamais — les supprimer en masse mettait ces clients dehors).
+    # Ici la substitution est atomique : nouveau code écrit dans Duve → ancien supprimé.
+    for duve_id in members:
+        _purge_native_duplicate(duve_id)
     if hold:
         _notify_hold(row, hold)  # `observe` compris — cf. docstring de _notify_hold
     if hold and ISEO_HOLD_MODE == "on":
@@ -1429,6 +1439,38 @@ def _native_duve_pins_to_purge() -> list[dict]:
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ArrayQueryParameter("wl", "STRING", sorted(ALLOWED_PROPERTY_IDS))])
     return [dict(r.items()) for r in _bq().query(q, job_config=cfg).result()]
+
+
+def _purge_native_duplicate(duve_resa_id: str) -> None:
+    """Supprime le code ET l'invitation créés jadis par l'intégration native Duve pour
+    CETTE réservation, une fois que le nôtre a été posé (appelé en fin de `_provision`).
+
+    L'intégration native est coupée depuis le 20/06/2026 mais ses objets survivent :
+    au 18/08 il restait 19 invitations `DUVE - …` actives ou futures et 10 utilisateurs
+    porteurs d'un code natif encore valide. Sur un appartement intégré, ces objets
+    doublonnent le nôtre — deux codes valides pour le même séjour, dont un que nous ne
+    contrôlons pas. Sur un appartement NON intégré, ce sont au contraire les seuls codes
+    du client : d'où le rattachement à `_provision`, qui ne s'exécute que sur la whitelist.
+
+    Best-effort : un échec ne fait jamais échouer un provisioning réussi (le client a son
+    code, c'est ce qui compte ; le doublon repartira au run suivant).
+    """
+    if ISEO_SHADOW_MODE:
+        logger.info(f"🌗 SHADOW: would purge natifs DUVE de {duve_resa_id}")
+        return
+    for kind, path in (("DUVE_PIN", "standardDevices"), ("DUVE", "invitations")):
+        ext = f"{kind} - {duve_resa_id}"
+        try:
+            g = _sofia("GET", f"/api/v2/{path}/extId/{ext}")
+            if g.status_code != 200:
+                continue  # 404 = rien à faire, le cas normal
+            rd = _sofia("DELETE", f"/api/v2/{path}/{g.json().get('id')}")
+            if rd.status_code in (200, 204, 404):
+                logger.info(f"🧹 doublon natif supprimé : {ext}")
+            else:
+                logger.warning(f"⚠️ suppression {ext} : HTTP {rd.status_code}")
+        except Exception as e:
+            logger.warning(f"⚠️ suppression {ext} : {e}")
 
 
 def _purge_native_orphan(row: dict) -> tuple[bool, Optional[str]]:
