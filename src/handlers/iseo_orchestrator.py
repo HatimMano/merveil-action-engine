@@ -142,8 +142,20 @@ ISEO_HOLD_BALANCE_MAX_LEAD_HOURS = int(
     os.environ.get("ISEO_HOLD_BALANCE_MAX_LEAD_HOURS", "720"))
 # Destinataire de la notification « code retenu » (défaut = alerte ISEO).
 ISEO_HOLD_ALERT_TO = os.getenv("ISEO_HOLD_ALERT_TO", "") or ISEO_ALERT_TO
-DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "13:00")
-DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "19:00")
+# Fenêtre de validité du code, alignée sur les horaires CONTRACTUELS du séjour
+# (décision Hatim 2026-08-17) : ouverture = min(heure annoncée par le client, 16 h),
+# fermeture = max(heure annoncée, 11 h). Autrement dit le code vaut de 16 h à 11 h,
+# étendu — jamais rétréci — par une arrivée anticipée ou un départ tardif négociés.
+# ⚠ Deux conséquences assumées vs les valeurs précédentes (13 h / 19 h) :
+#   · un client qui se présente à 15 h sans avoir annoncé d'arrivée anticipée est
+#     refusé par la porte (il passait avec 13 h) → c'est un appel RC ;
+#   · le jour du départ, plus de retour possible après 11 h pour récupérer des
+#     bagages (la borne avait justement été relevée à 19 h le 14/08 pour ça).
+# ⚠ Ne s'applique qu'aux codes NOUVELLEMENT provisionnés : `_resa_to_resync` ne
+# détecte qu'un drift de DATES, pas d'heures, et le cache ne stocke pas les heures
+# → le stock existant garde 13 h/19 h jusqu'à son archivage (~1 semaine).
+DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "16:00")
+DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "11:00")
 PIN_COLLISION_RETRIES = 8
 
 

@@ -67,8 +67,11 @@ digest_buckets:
       - mickael@archides.fr
 
   fraude:
-    # Chargebacks et doubles sorties. Destinataires : Emilia (dossiers de preuve,
-    # relation OTA) + Hatim. Philippe à ajouter quand la compta s'en saisit.
+    # Chargebacks et doubles sorties. Destinataires (2026-08-18) : Emilia monte
+    # le dossier de preuve et porte la relation OTA, Philippe passe l'écriture et
+    # suit le 411, Hatim en copie technique. ⚠ Emilia reçoit déjà une notification
+    # Mews de son côté — doublon assumé : le mail d'ici porte le contexte séjour
+    # (appart, dates, remboursement éventuel) que Mews ne donne pas.
     # ⚠ flush_with OBLIGATOIRE sur tout bucket satellite : sans lui le bucket est
     # bufferisé puis JETÉ sans erreur (incident data_quality, 2026-07-17).
     # Flushé par le job 2h : `trigger_new_chargeback` a 48 h pour agir, le daily
@@ -77,6 +80,8 @@ digest_buckets:
     send_if_empty: false
     subject_prefix: "[Merveil Fraude]"
     default_recipients:
+      - emilia@archides.fr
+      - philippe@archides.fr
       - hatim@archides.fr
 
 # ============================================================================
@@ -304,6 +309,35 @@ triggers:
   # Balcom 2026-06-10). CRITICAL si in-house sans ouverture ≤48h. Bucket 2h →
   # job merveil-action-engine-2h (latence ≤2h). Destinataires = digest_buckets.2h.
   iseo_pin_missing:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: 2h
+
+  # Code fixe utilisé sur un logement vide, sans intervention ops tracée.
+  # Bucket 2h : c'est la seule alerte du parc qui puisse signaler quelqu'un DANS
+  # un appartement — la porter au digest quotidien lui ferait perdre son sens.
+  # Volume mesuré 17/08 : ~2/mois (313 ouvertures hors séjour en 60 j ramenées à 4
+  # une fois l'activité Breezeway déduite).
+  iseo_code_fixe_intrusion:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: 2h
+
+  # Serrure qui répond mais ne remonte plus le clavier : rend aveugle l'alerte
+  # ci-dessus ET le suivi des entrées client. Quotidien — c'est une panne à
+  # réparer, pas un événement à intercepter.
+  iseo_clavier_muet:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
+  # Saturation de la licence Luckey. Bucket 2h : quand le plafond tombe, PLUS
+  # AUCUN code n'est programmé sur tout le parc (vécu 3 h le 15/08) — attendre le
+  # digest du lendemain reviendrait à découvrir la panne par les clients.
+  iseo_quota_licence:
     enabled: true
     actions:
       - type: email_digest
