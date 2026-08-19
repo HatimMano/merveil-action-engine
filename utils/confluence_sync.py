@@ -157,7 +157,17 @@ def find_page(title, space_id):
 
 
 def upsert(title, parent_id, body, labels, space):
-    """space = {'id': …, 'key': …} résolu au run."""
+    """space = {'id': …, 'key': …} résolu au run.
+
+    ⚠️ L'identité d'une page est son TITRE. Renommer une règle dans `RULES` ne
+    renomme donc pas la page : elle en crée une neuve et laisse l'ancienne en
+    ligne, labellisée `regle-dwh`, donc toujours listée dans l'index CEO. Idem
+    quand une règle est fusionnée dans une autre. Dans les deux cas, retirer le
+    label et archiver l'ancienne à la main (le sync ne supprime JAMAIS rien) :
+      DELETE /wiki/rest/api/content/<id>/label/regle-dwh
+      POST   /wiki/rest/api/content/archive  {"pages":[{"id":"<id>"}]}
+    (fait le 19/08 pour « Gaps de pricing » renommée et « Surcote 1N » fusionnée).
+    """
     pid = find_page(title, space["id"])
     if pid:
         cur = req("GET", f"/wiki/api/v2/pages/{pid}?body-format=storage")
