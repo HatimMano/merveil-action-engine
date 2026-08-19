@@ -30,18 +30,21 @@ Optionnels   : space (défaut VD) · triggers[] (active la dérivation)
 # Spaces métier cibles — 1 page racine « 🤖 Automatisations (DWH) — <domaine> »
 # par space, posée en sibling des sections existantes (on ne touche jamais au
 # contenu préexistant). Chaque règle porte un champ `space` (défaut VD).
-# NB : COR (0. Finance et Stratégie) est archivé → le futur lot finance ira
-# dans CXSXJ (2. Comptabilité x Social x Juridique).
+# NB : COR (0. Finance et Stratégie) est archivé → le lot finance vit dans
+# CXSXJ (2. Comptabilité x Social x Juridique), ouvert le 19/08.
 SPACES = {
-    "VD":   dict(domaine="Ventes",
-                 root="🤖 Automatisations (DWH) — Ventes",
-                 label="domaine-ventes"),
-    "GDA":  dict(domaine="Opérations",
-                 root="🤖 Automatisations (DWH) — Opérations",
-                 label="domaine-operations"),
-    "TRAN": dict(domaine="Serrures & accès",
-                 root="🤖 Automatisations (DWH) — Serrures & accès",
-                 label="domaine-serrures"),
+    "VD":    dict(domaine="Ventes",
+                  root="🤖 Automatisations (DWH) — Ventes",
+                  label="domaine-ventes"),
+    "GDA":   dict(domaine="Opérations",
+                  root="🤖 Automatisations (DWH) — Opérations",
+                  label="domaine-operations"),
+    "TRAN":  dict(domaine="Serrures & accès",
+                  root="🤖 Automatisations (DWH) — Serrures & accès",
+                  label="domaine-serrures"),
+    "CXSXJ": dict(domaine="Finance & Comptabilité",
+                  root="🤖 Automatisations (DWH) — Finance & Comptabilité",
+                  label="domaine-finance"),
 }
 # Index global cross-spaces (vue CEO), dans 00. Entreprise.
 INDEX_SPACE = "EN"
@@ -126,15 +129,26 @@ RULES = [
         owner="Raphael (à confirmer)",
         depuis="17 mai 2026",
         source="trigger_gap_pricing_summary → dash_ventes_gaps (flag_action)",
-        dashboard_url="https://direction.archides.fr/ventes?tab=controle&view=gaps_actions",
+        dashboard_url="https://direction.archides.fr/ventes?tab=calendrier&view=gaps_matrix",
         quoi=[
-            "Chaque nuit, la machine repère les <strong>trous de calendrier</strong> (nuits isolées entre deux "
-            "réservations) qui appellent une action de pricing, et les résume en 3 lignes dans le mail quotidien :",
+            "Chaque nuit, la machine repère les <strong>trous de calendrier de 1 ou 2 nuits</strong> (coincés "
+            "entre deux réservations) que Beyond affiche <em>plus cher</em> que les nuits voisines alors qu'ils "
+            "se vendraient en couvrant le coussin de marge, et les résume en 3 lignes dans le mail quotidien :",
             "• <strong>Gaps critiques</strong> : à combler sous 7 jours (dernière chance de vendre la nuit).<br/>"
             "• <strong>Gaps moyens</strong> : entre 8 et 14 jours.<br/>"
             "• <strong>Marge potentielle</strong> : ce que rapporteraient ces nuits si elles étaient vendues au "
             "prix des nuits voisines (déduction faite du ménage et du coussin de marge).",
-            "Le bouton du mail ouvre la liste détaillée par appartement dans le dashboard.",
+            "Le décompte porte sur <strong>tout le parc</strong> : il inclut donc les appartements où la machine "
+            "pose déjà elle-même le prix (voir « Push automatique des prix sur les nuits seules »), mais "
+            "l'essentiel de ce qui reste est sur les appartements <strong>hors pilote</strong>, où le geste est "
+            "manuel.",
+            "Le bouton du mail ouvre la <strong>matrice des gaps</strong> (1.3 Calendrier), appartement par "
+            "appartement et nuit par nuit.",
+        ],
+        exemple=[
+            "Mail du 19/08/2026 : « 🔴 3 gaps critiques à baisser dans les 7 prochains jours » · "
+            "« 🟡 7 gaps moyens (8-14 jours) » · « 💰 401 € de marge nette potentielle si tous les gaps ≤ 14 j "
+            "étaient vendus au tarif adjacent ».",
         ],
     ),
     dict(
@@ -146,7 +160,7 @@ RULES = [
         owner="Raphael / Arnaud (à confirmer)",
         depuis="juin 2026",
         source="trigger_beyond_surcote_gap → dash_beyond_proposed_changes × dash_beyond_gap1n_surcote",
-        dashboard_url="https://direction.archides.fr/ventes?tab=controle&view=surcote_1n&ineff=1",
+        dashboard_url="https://direction.archides.fr/ventes?tab=controle&view=push_auto",
         quoi=[
             "Beyond applique une <strong>surcote automatique sur les nuits seules</strong> (en moyenne +88 %, "
             "jusqu'à +160 % selon l'appartement). Sur certains appartements, cette surcote est "
@@ -158,14 +172,23 @@ RULES = [
             "L'action suggérée : baisser la surcote / le prix de cette nuit. Depuis le 17/07, sur les "
             "appartements du pilote, la machine pose <strong>elle-même</strong> la fenêtre de prix — voir la "
             "règle « Push automatique des prix sur les nuits seules ». Sur ces appartements, la surcote 1 nuit "
-            "Beyond a été <strong>supprimée le 21/07</strong> (elle s'appliquait après la fenêtre et la rendait "
-            "inopérante).",
+            "Beyond a été supprimée (le 21/07 sur les 8 premiers, le 07/08 sur les 31 du pilote élargi) : elle "
+            "s'appliquait <strong>après</strong> la fenêtre et la rendait inopérante.",
+            "Le bouton du mail ouvre le sous-onglet <strong>Push auto</strong> (1.4 Contrôle des prix) : c'est "
+            "là qu'on voit ce que la machine a réellement posé sur chaque trou de 1 et 2 nuits, à quel prix, "
+            "et si la nuit s'est vendue ensuite. La vue de détail des surcotes elle-même reste réservée aux "
+            "comptes techniques.",
+        ],
+        exemple=[
+            "Mail du 19/08/2026 : 14 appartements avec une nuit seule à vendre sous 14 jours et une surcote "
+            "flaggée inefficace (P09-CAR7-0G, P03-MAR326-3D, P08-MON58-0G, P02-ABO52-2D…). Tous hors pilote — "
+            "sur le pilote, la surcote a été retirée et la machine pose la fourchette elle-même.",
         ],
     ),
     dict(
         titre="Push automatique des prix sur les nuits seules (gaps 1N/2N)",
         slug="beyond-push-gaps-1n",
-        frequence_extra="Push des prix : quotidien 6h45 + 10h45",
+        frequence_extra="Push des prix : quotidien 6h45, 10h45 et 20h45",
         triggers=["beyond_gap_filled"],  # le mail 🎉 ; le push lui-même est un job autonome
         live="beyond_push",
         domaine="Ventes — Pricing Beyond",
@@ -192,10 +215,16 @@ RULES = [
             "matin) ; et les "
             "<strong>nuits orphelines</strong> (fin de trou : la nuit de ce soir est libre, quelqu'un arrive "
             "demain, la veille est déjà passée) : plancher plein posé pour la journée dès le run de 6h45 — "
-            "sur <strong>l'ensemble du parc</strong>, pas seulement la whitelist (pure protection plancher, "
-            "aucune surcote à retirer : le clamp s'applique après les réglages Beyond).",
+            "sur <strong>l'ensemble du parc</strong>, pas seulement la whitelist. Là, c'est une protection du "
+            "plancher, rien de plus : on empêche la nuit de partir à perte.",
             "Si les nuits voisines vendent sous notre plancher (fréquent sur les petits appartements), la "
             "fourchette devient un <strong>prix fixe rentable</strong> — mieux que le prix surcoté, jamais à perte.",
+            "⚠️ <strong>Limite connue depuis le 16/08</strong> : Beyond applique sa surcote 1 nuit "
+            "<strong>après</strong> notre fourchette, pas avant. Sur les appartements du pilote la surcote a été "
+            "retirée, donc le prix affiché est exactement notre fourchette. Sur les autres — ceux que couvre "
+            "seulement la protection des nuits orphelines — la nuit reste publiée 1,5 à 2 fois au-dessus de "
+            "notre plafond : <strong>le plancher tient, le plafond non</strong>. La nuit ne part donc jamais à "
+            "perte, mais elle reste difficile à vendre. Sujet ouvert avec Beyond au point du 8 septembre.",
             "Les <strong>règles saisonnières posées par l'équipe dans Beyond sont préservées</strong> (un plancher "
             "équipe plus haut gagne toujours). Nuit vendue ou gap disparu → la fenêtre est retirée le lendemain. "
             "Chaque modification est journalisée (audit complet, réversible en un clic).",
@@ -244,6 +273,14 @@ RULES = [
             "par une annulation suivie d'une nouvelle réservation. Un événement « annulation » part donc pour "
             "un client qui vient quand même — à filtrer côté ciblage de la campagne.",
         ],
+        exemple=[
+            "Le cas à connaître, parce qu'il se produit régulièrement : un client déplacé d'un appartement à "
+            "un autre (surbooking, travaux) voit sa réservation <strong>annulée puis recréée</strong> dans Mews. "
+            "Le DWH publie fidèlement l'événement « réservation annulée », et customers.io peut lui envoyer une "
+            "relance de récupération alors qu'il arrive le lendemain. Ce n'est pas une erreur de donnée : c'est "
+            "la façon dont Mews enregistre un changement d'appartement, et c'est au ciblage de la campagne de "
+            "l'exclure.",
+        ],
         modifier=[
             "Le <strong>contenu des e-mails et les conditions de déclenchement</strong> se règlent dans "
             "customers.io, pas dans le DWH.",
@@ -276,6 +313,11 @@ RULES = [
             "Les appartements <strong>bloqués</strong> (travaux, usage interne) sont exclus automatiquement — "
             "le chiffre est directement exploitable pour pousser des ventes last-minute.",
         ],
+        exemple=[
+            "Mail du 19/08/2026 : 3 appartements disponibles dès le matin · 7 cet après-midi · 1 libre sur au "
+            "moins 3 nuits à partir d'après-demain. Chaque ligne ouvre la liste filtrée des appartements "
+            "concernés (6.0 Disponibilités).",
+        ],
     ),
     dict(
         space="GDA",
@@ -305,6 +347,14 @@ RULES = [
             "hasard (incident sur un canal, sur un appartement, ou erreur de manipulation).",
             "Filtre anti-bruit : si le client a une autre réservation active à ±7 jours (changement de dates "
             "ou d'appartement), ce n'est pas une vraie perte → pas d'alerte.",
+            "Deux destinations selon le mail : le <strong>brief de 11h</strong> ouvre la page 6.5 Annulations "
+            "sur les dernières 24h ; les <strong>alertes ciblées du digest de 7h</strong> ouvrent le journal "
+            "des annulations côté Ventes (1.6), avec le chiffre d'affaires qui part.",
+        ],
+        exemple=[
+            "Alerte du 18/08/2026 : annulation sur un <strong>4 chambres</strong> (P08-PON48-1D, Champs-Élysées) "
+            "pour un check-in au 28/08 — dix jours pour revendre des nuits chères en pleine saison. C'est le "
+            "profil type de l'alerte « grand appartement » : peu de volume, mais chaque cas pèse.",
         ],
     ),
     dict(
@@ -321,7 +371,7 @@ RULES = [
         owner="Mickael (à confirmer)",
         depuis="mai 2026",
         source="trigger_last_minute_checkin · trigger_double_booking · trigger_checkin_no_apartment",
-        dashboard_url="https://direction.archides.fr/ops-front",
+        dashboard_url="https://direction.archides.fr/ops-front?tab=arrivals",
         quoi=[
             "Trois surveillances qui ne se manifestent <strong>que lorsqu'il y a un cas</strong> (la plupart "
             "des jours : rien) :",
@@ -330,6 +380,15 @@ RULES = [
             "• <strong>Double booking</strong> : deux réservations actives qui se chevauchent sur le même "
             "appartement → à résoudre avant l'arrivée.<br/>"
             "• <strong>Check-in sans appartement</strong> : arrivée imminente sans espace assigné dans Mews.",
+            "Les deux alertes liées à une arrivée ouvrent la page <strong>6.1 Préparation Arrivées</strong> ; "
+            "le double booking ouvre le tableau des disponibilités (6.0), où le chevauchement se voit.",
+        ],
+        exemple=[
+            "18/08/2026 — check-in last-minute : réservation en <strong>direct</strong> de 3 nuits (887 € TTC) "
+            "sur P15-VIA29-1G, prise la veille de l'arrivée. Ménage, code et accueil à confirmer dans la journée.",
+            "08/08/2026 — check-in sans appartement : arrivée Airbnb à <strong>J-1</strong>, 6 nuits, 8 276 € — "
+            "aucun espace assigné dans Mews. L'alerte est repartie le lendemain, toujours non assignée : c'est "
+            "exactement le cas qu'on ne veut pas découvrir le jour même.",
         ],
     ),
     dict(
@@ -355,6 +414,14 @@ RULES = [
             "case unique dans le mail, triés par volume d'avis puis pire note.",
             "C'est le radar avancé de la note publique : la moyenne 3 mois bouge des semaines avant la note "
             "affichée sur les OTAs.",
+            "Deux destinations : l'alerte <strong>mauvais avis</strong> ouvre le post-mortem de l'avis "
+            "(5.4 Post-mortem ≤ 3★, avec la conversation et l'historique de l'appartement) ; l'alerte "
+            "<strong>Superhost</strong> ouvre la vue par appartement (5.2).",
+        ],
+        exemple=[
+            "Alerte Superhost du 19/08/2026 : <strong>P01-CHE6-3F à 3,9/5 sur 8 avis</strong> des 3 derniers "
+            "mois (🔴, sous 4,0) et P01-RAM80-1G à 3,7/5 sur 3 avis. Sur les OTAs, la note affichée de ces "
+            "appartements est encore bonne — elle décrochera dans quelques semaines si rien ne bouge.",
         ],
     ),
 
@@ -371,7 +438,7 @@ RULES = [
         owner="Sylvain / Mickael (à confirmer)",
         depuis="juin 2026 (élargissement progressif du parc)",
         source="merveil-action-engine-iseo → API Sofia/ISEO + Duve → iseo_raw.merveil_pin_cache",
-        dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
+        dashboard_url="https://direction.archides.fr/ops-back?tab=pin_pipeline",
         quoi=[
             "Sur les appartements basculés (liste dans le bloc « État actuel »), la machine gère "
             "<strong>seule</strong> tout le cycle de vie du code de la porte — à la place du code fixe "
@@ -405,8 +472,11 @@ RULES = [
         modifier=[
             "La liste des appartements basculés est un référentiel DWH : l'élargissement se fait par lots "
             "après période d'observation — demande à Hatim.",
-            "⚠️ Basculer un appartement ne supprime pas son code fixe (conservés en doublon pour l'instant, "
-            "décision du 13/07).",
+            "⚠️ <strong>Basculer un appartement ne supprime pas son code fixe.</strong> Les deux coexistent "
+            "tant que le code fixe n'a pas été retiré du champ Duve — ce retrait est un chantier "
+            "<strong>séparé</strong>, engagé depuis la mi-août appartement par appartement. Tant qu'il n'est "
+            "pas fait, Duve continue d'afficher le code fixe en repli et le code par séjour ne remplace pas "
+            "vraiment l'ancien.",
         ],
     ),
     dict(
@@ -431,16 +501,20 @@ RULES = [
         source="trigger_iseo_pin_missing · trigger_iseo_reconciliation · trigger_iseo_etl_stale · trigger_iseo_gateway_offline → dash_ops_pin_reconciliation · stg_iseo__gateways · gaps orchestrateur",
         dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
         quoi=[
-            "Le filet de sécurité de la règle « Codes d'accès automatiques » — trois surveillances toutes "
-            "les 2 heures :",
+            "Le filet de sécurité de la règle « Codes d'accès automatiques ». Trois surveillances tournent "
+            "<strong>toutes les 2 heures</strong>, parce qu'un client peut être devant la porte :",
             "• <strong>Porte dormante</strong> : un client est censé séjourner sur un appartement basculé, "
             "aucun code n'est posé ET la porte n'a pas été ouverte depuis 48h → vrai risque d'accès.<br/>"
             "• <strong>Réconciliation</strong> : l'état interne est comparé à l'état réel des serrures Sofia. "
             "Code supprimé à la main dans l'interface, code orphelin, code encore actif après le départ → "
             "chaque écart est signalé (l'incident fondateur : un code effacé par erreur dans l'UI, client "
-            "bloqué dehors).<br/>"
+            "bloqué dehors). Le détail est dans le "
+            "<a href=\"https://direction.archides.fr/ops-back?tab=pin_pipeline\">7.8 Pipeline PIN</a>.<br/>"
             "• <strong>Données en retard</strong> : si la collecte ISEO ne remonte plus, alerte — on ne "
             "surveille jamais à l'aveugle.",
+            "Trois autres ne partent qu'<strong>une fois par jour</strong>, parce que ce sont des pannes à "
+            "planifier et non des urgences de l'heure qui vient : passerelles hors ligne, serrures muettes au "
+            "clavier, plafond de licence (détaillées ci-dessous).",
             "Un même problème n'est signalé qu'une fois tant qu'il n'est pas résolu (déduplication 4h).",
             "S'y ajoute depuis le <strong>10 août 2026</strong> la surveillance des <strong>HyperGates</strong> "
             "(les boîtiers qui relient les serrures au réseau) : une passerelle qui n'a plus donné signe de vie "
@@ -465,6 +539,15 @@ RULES = [
             "<strong>plus aucun code ne peut être posé, sur tout le parc</strong> (vécu le 15/08 : 3 heures "
             "sans programmation).",
         ],
+        exemple=[
+            "Trois alertes réelles du 18-19/08/2026, une par famille : "
+            "<strong>passerelle</strong> — l'HyperGate de P15-LAO4-0G n'a plus donné signe de vie depuis "
+            "43 jours (1 serrure desservie, plus de pose de code ni d'ouverture à distance possible) ; "
+            "<strong>clavier muet</strong> — ce même appartement n'a remonté aucune ouverture au clavier "
+            "depuis 44 jours alors que 11 séjours s'y sont succédé (le journal des entrées est aveugle) ; "
+            "<strong>licence</strong> — 561 éléments sur 600, soit 93 %, environ 19 séjours de marge avant "
+            "de ne plus pouvoir programmer un seul code.",
+        ],
     ),
     dict(
         space="TRAN",
@@ -472,12 +555,16 @@ RULES = [
         slug="resa-risque-acces",
         domaine="Serrures & accès",
         niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        # La porte tourne en observation : elle journalise et alerte, mais laisse
+        # partir le code. Afficher « Actif » ferait croire que des codes sont déjà
+        # retenus. À repasser en ("Green", "Actif") le jour du ISEO_HOLD_MODE=on.
+        statut=("Yellow", "Alerte active · porte en observation"),
         frequence="Immédiat (à la seconde où le client remplit son pre-checkin) · réévaluation toutes les 2 h",
         canal="Mail ⚠️ / 🔒 → hatim@archides.fr (bascule vers la RC prévue avant l'activation complète)",
         owner="Emilia / RC (à confirmer)",
         depuis="15 août 2026 (après trois tentatives de fraude en trois jours)",
         source="webhook-gateway (pre-checkin Duve, temps réel) · orchestrateur serrures (porte de validation) → iseo_raw.hold_decisions",
-        dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
+        dashboard_url="https://direction.archides.fr/ops-back?tab=pin_pipeline&view=hold",
         quoi=[
             "<strong>Le moment critique est le pre-checkin</strong> : c'est en le remplissant que le client "
             "fait apparaître son code d'accès — sur les fraudes d'août, il a été rempli 20 à 47 minutes "
@@ -499,6 +586,15 @@ RULES = [
             "Où voir les décisions : dashboard 7.8, sous-onglet « Porte (décisions) » — chaque évaluation, "
             "son motif et son issue réelle (retenu / observation / non provisionné).",
         ],
+        exemple=[
+            "Les quatre fraudes d'août suivaient le même scénario : réservation en direct prise dans la "
+            "journée, pre-checkin rempli 20 à 47 minutes plus tard en soirée, aucune pièce d'identité "
+            "scannée — et le code d'accès apparaissait dans la foulée. L'alerte immédiate part désormais à "
+            "ce moment-là, pendant qu'il reste quelques heures pour regarder le dossier.",
+            "Les deux mails ne demandent pas le même geste : <strong>« ⚠️ résa à risque (code envoyé) »</strong> "
+            "= le client peut entrer, on surveille ; <strong>« 🔒 code retenu à valider »</strong> = le client "
+            "n'a rien reçu, il faut trancher <em>avant</em> son arrivée, sinon il est dehors le soir venu.",
+        ],
         modifier=[
             "Les critères exacts (délais, seuils de solde) sont volontairement <strong>absents de cette "
             "page</strong> : une page qui décrit précisément comment la machine décide est aussi une recette "
@@ -515,7 +611,7 @@ RULES = [
         owner="Sylvain / Mickael (à confirmer)",
         depuis="18 août 2026",
         source="trigger_iseo_code_fixe_intrusion → dash_ops_lock_events × fct_reservations × Breezeway",
-        dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
+        dashboard_url="https://direction.archides.fr/ops-back?tab=lock_events",
         quoi=[
             "Les <strong>codes fixes</strong> sont les codes permanents d'appartement, partagés entre tous "
             "ceux qui les ont un jour reçus. Les fraudes de juillet en sont passées par là : 16 ouvertures "
@@ -528,15 +624,28 @@ RULES = [
             "quel code ; si l'ouverture n'est pas explicable (équipe, prestataire connu), faire "
             "<strong>changer le code fixe</strong> de l'appartement.",
             "Périmètre : <strong>tout le parc</strong> depuis le 19/08 (le journal couvrait avant les seuls "
-            "appartements basculés — précisément pas ceux où vivent les codes fixes).",
+            "appartements basculés — précisément pas ceux où vivent les codes fixes). Une ouverture sur une "
+            "serrure dont l'appartement n'est pas reconnu au parc ne déclenche plus rien : ce garde-fou, posé "
+            "le 19/08, a supprimé 28 jours d'alertes fantômes venues d'une serrure mal nommée.",
+        ],
+        exemple=[
+            "Le cas fondateur, mesuré le 11/08/2026 sur P09-CAU28-2G : un même code fixe ouvre la porte "
+            "<strong>quatre fois</strong> dans la journée — 14h58, 16h45, 17h40, puis <strong>23h58</strong>. "
+            "Aucun client en séjour, aucune tâche ménage ni maintenance prévue ce jour-là ni la veille. "
+            "L'ouverture de minuit fait passer l'alerte en critique. C'est le seul cas de ce type sur "
+            "60 jours : quand elle sonne, ce n'est pas du bruit.",
         ],
     ),
+    # ── CXSXJ — 2. Comptabilité (fraude & litiges bancaires) ─────────────────
+    # Déplacée de TRAN le 19/08 : la règle naît d'un incident serrures, mais ses
+    # owners (Emilia, Philippe) et sa page de suivi (9.9 Contestations) sont
+    # comptables. Elle reste liée aux règles serrures par le texte.
     dict(
-        space="TRAN",
+        space="CXSXJ",
         titre="Fraude — usurpation d'identité & chargebacks",
         slug="fraude-alertes",
         triggers=["fraude_identite", "new_chargeback", "payment_double_exit"],
-        domaine="Serrures & accès — Fraude",
+        domaine="Finance — Fraude & litiges",
         niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
         owner="Emilia (dossier & relation OTA) / Philippe (écriture comptable)",
         depuis="15 août 2026 (chargebacks) · 19 août 2026 (usurpation d'identité)",
@@ -544,10 +653,11 @@ RULES = [
         dashboard_url="https://direction.archides.fr/finances?tab=contestations",
         quoi=[
             "<strong>Suspicion d'usurpation avant l'arrivée</strong> : la machine croise trois signaux — "
-            "réservation directe au dernier moment · échecs de carte répétés avant un paiement accepté · "
-            "nom du formulaire ou de la pièce différent du nom de la réservation. <strong>Deux signaux ou "
-            "plus</strong> → mail « [Merveil Fraude] » sous 2 h (~2 cas/mois). Un signal isolé ne déclenche "
-            "jamais de mail : il colore seulement le badge risque du dashboard (6.1 / 6.7).",
+            "réservation directe au dernier moment · échec de carte avant un paiement accepté (sur une "
+            "réservation directe) · nom du formulaire ou de la pièce différent du nom de la réservation. "
+            "<strong>Deux signaux ou plus</strong> → mail « [Merveil Fraude] » sous 2 h (~2 cas/mois). Un "
+            "signal isolé ne déclenche jamais de mail : il colore seulement le badge risque du dashboard "
+            "(6.1 / 6.7).",
             "<strong>Nouveau chargeback</strong> : chaque litige bancaire ouvert par un client est signalé "
             "immédiatement. ⏱ <strong>Le dossier de contestation Adyen se dépose sous ~48 h</strong> — "
             "au-delà, le litige est perdu d'office (en 2026 : 1 chargeback récupéré sur 20).",
@@ -583,11 +693,14 @@ RULES = [
         quoi=[
             "Chaque arrivée des prochaines semaines porte un niveau de risque : <strong>rouge</strong> "
             "(vérifier avant l'arrivée) · <strong>ambre</strong> (garder un œil) · vert.",
-            "<strong>Signaux forts</strong> (rouge dès un seul) : solde impayé significatif à quelques jours "
-            "de l'arrivée · réservation directe de dernière minute · échecs de carte répétés.",
-            "<strong>Signaux moyens et faibles</strong> (rouge par accumulation) : nom du formulaire ≠ nom de "
-            "la réservation · groupe de jeunes adultes · plus de personnes que la capacité · séjour local "
-            "court le week-end · motif « célébration » · pre-checkin toujours manquant la veille.",
+            "<strong>Signaux forts</strong> — un seul suffit à passer au rouge : solde impayé significatif à "
+            "quelques jours de l'arrivée · réservation directe de dernière minute · groupe de jeunes adultes.",
+            "<strong>Signaux moyens</strong> — il en faut <strong>deux</strong> pour le rouge, un seul met en "
+            "ambre : échec de carte sur une réservation directe · réservation faite pour quelqu'un d'autre · "
+            "plus de personnes que la capacité · séjour local court le week-end · motif « célébration » · "
+            "solde impayé sur une arrivée encore lointaine.",
+            "<strong>Signaux faibles</strong> — mettent en ambre, jamais en rouge à eux seuls : pre-checkin "
+            "toujours manquant la veille · nom du formulaire ≠ nom de la réservation.",
             "Quand <strong>deux signaux de fraude ou plus</strong> se combinent, un mail part en parallèle — "
             "voir la règle « Fraude — usurpation d'identité & chargebacks » (space Serrures & accès).",
             "<strong>Le geste sur un rouge</strong> : ouvrir la fiche, vérifier paiement et identité, appeler "
@@ -595,6 +708,11 @@ RULES = [
             "Anti-bruit : les paiements des réservations OTA (Booking, Airbnb, Expedia…) sont encaissés par "
             "la plateforme — l'absence de paiement dans Mews n'y est <strong>pas</strong> un signal, et ces "
             "réservations ne sonnent pas pour ça.",
+        ],
+        exemple=[
+            "Photo du 19/08/2026 : sur <strong>648 arrivées à venir</strong>, 11 rouges, 93 ambres, 544 vertes. "
+            "Le rouge reste rare par construction — c'est ce qui le rend actionnable : onze fiches à ouvrir, "
+            "pas six cents.",
         ],
     ),
 ]

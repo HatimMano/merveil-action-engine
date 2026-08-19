@@ -323,14 +323,23 @@ HEADINGS = "Niveau,Statut,Fréquence,Canal,Owner métier,Depuis,Dernière activi
 ROUTING_PATH = Path(__file__).resolve().parent.parent / "config" / "routing.yaml"
 
 # Cadence d'envoi par bucket : portée par les Cloud Schedulers, pas par le
-# routing → seul mapping resté déclaratif (5 entrées, une par bucket existant).
+# routing → seul mapping resté déclaratif. Ne contient que les buckets qui ONT
+# leur propre scheduler ; un bucket satellite est résolu par son `flush_with`
+# (cf. _cadence) — sinon tout nouveau bucket affiche son nom technique comme
+# fréquence, ce qu'a fait `fraude` jusqu'au 19/08 (« Fréquence : fraude »).
 BUCKET_CADENCE = {
-    "daily":        "Quotidien 7h",
-    "2h":           "Toutes les 2 heures",
-    "4h":           "Toutes les 4 heures",
-    "data_quality": "Quotidien 7h",
-    "beyond":       "Quotidien 7h",
+    "daily": "Quotidien 7h",
+    "2h":    "Toutes les 2 heures",
+    "4h":    "Toutes les 4 heures",
 }
+
+
+def _cadence(routing: dict, bucket: str) -> str:
+    """Cadence lisible d'un bucket, en suivant `flush_with` pour les satellites."""
+    if bucket in BUCKET_CADENCE:
+        return BUCKET_CADENCE[bucket]
+    flush = routing.get("digest_buckets", {}).get(bucket, {}).get("flush_with")
+    return BUCKET_CADENCE.get(flush, "—")
 
 
 def load_routing() -> dict:
@@ -347,7 +356,11 @@ def derive_facts(r: dict, routing: dict) -> dict:
     """
     names = r.get("triggers") or []
     if not names:                                    # hors dispatcher
-        return dict(actif=True, statut=("Green", "Actif"),
+        # Rien à dériver : le statut vaut « Actif » sauf déclaration explicite
+        # (`statut=("Yellow", "Mode observation")` par ex.). Sans cette porte de
+        # sortie, une règle en rodage s'affiche « Actif » — exactement le défaut
+        # que la dérivation depuis routing.yaml a corrigé pour les autres.
+        return dict(actif=True, statut=r.get("statut") or ("Green", "Actif"),
                     frequence=r.get("frequence", "—"), canal=r.get("canal", "—"),
                     unknown=[])
 
@@ -372,7 +385,7 @@ def derive_facts(r: dict, routing: dict) -> dict:
             if a.get("bucket") and a["bucket"] not in buckets:
                 buckets.append(a["bucket"])
 
-    freq = " · ".join(dict.fromkeys(BUCKET_CADENCE.get(b, b) for b in buckets))
+    freq = " · ".join(dict.fromkeys(_cadence(routing, b) for b in buckets))
     canaux = []
     for b in buckets:
         meta = routing.get("digest_buckets", {}).get(b, {})
