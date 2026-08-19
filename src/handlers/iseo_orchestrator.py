@@ -76,6 +76,8 @@ SMART_LOCKS_TABLE = os.environ.get(
     "SMART_LOCKS_TABLE", "merveil-data-warehouse.staging.stg_iseo__smart_locks")
 STD_DEVICES_TABLE = os.environ.get(
     "STD_DEVICES_TABLE", "merveil-data-warehouse.staging.stg_iseo__standard_devices")
+GATEWAYS_TABLE = os.environ.get(
+    "GATEWAYS_TABLE", "merveil-data-warehouse.staging.stg_iseo__gateways")
 WHITELIST_TABLE = os.environ.get(
     "ISEO_WHITELIST_TABLE", "merveil-data-warehouse.staging.iseo_whitelisted_apartments")
 HOLD_DECISIONS_TABLE = os.environ.get(
@@ -260,8 +262,20 @@ _LOCKS_CTE = f"""
     locks AS (
       SELECT l.lock_id, l.apartment_code,
              JSON_VALUE(t, '$.name')              AS duve_property_id,
-             CAST(JSON_VALUE(t, '$.id') AS INT64) AS lock_tag_id
+             CAST(JSON_VALUE(t, '$.id') AS INT64) AS lock_tag_id,
+             -- ⚠⚠ Passerelle vivante ? Une serrure ISEO stocke ses codes EN LOCAL ;
+             -- c'est la HyperGate qui y pousse les nouveaux. Passerelle morte = le code
+             -- part bien dans Duve mais n'arrive JAMAIS dans la serrure, et le client
+             -- se retrouve devant une porte qui refuse son code. Vécu sur
+             -- `P15-LAO4-0G` : HyperGate hors ligne depuis le 06/07, 9 codes poussés
+             -- quand même, et QUATRE clients bloqués dehors (Sardar Bilal 23/07,
+             -- Sara Mavromatis 27/07, Maritza Padilla 07/08, Samantha Mamone 12/08 —
+             -- verbatims dans le chat Duve). La donnée était là depuis le début, rien
+             -- ne la lisait. Cf. ADR 19/08.
+             (g.gateway_id IS NULL
+              OR COALESCE(g.hours_since_last_connection, 1e9) >= 24 * 7) AS gateway_dead
       FROM `{SMART_LOCKS_TABLE}` l, UNNEST(JSON_QUERY_ARRAY(l.tags)) AS t
+      LEFT JOIN `{GATEWAYS_TABLE}` g ON g.gateway_id = l.gateway_id
       WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
     )"""
 
@@ -370,6 +384,7 @@ _STAYS_CTE = f"""
              m.resource_id, m.checkin_date, m.checkout_date,
              m.earliest_checkin_hour, m.latest_checkout_hour,
              lk.lock_id, lk.lock_tag_id, lk.apartment_code,
+             COALESCE(lk.gateway_dead, FALSE)                            AS gateway_dead,
              -- Gate volontaire : on ne provisionne PAS tant qu'une carte a été refusée
              -- et que RIEN n'est encaissé sur le compte (cas VCC Expedia/VRBO non
              -- chargeable avant le jour J). ⚠ Depuis le 15/08 la condition porte sur
@@ -432,6 +447,7 @@ _STAYS_CTE = f"""
         ANY_VALUE(apartment_code) AS apartment_code,
         ANY_VALUE(lock_id)        AS lock_id,
         ANY_VALUE(lock_tag_id)    AS lock_tag_id,
+        LOGICAL_OR(gateway_dead)  AS gateway_dead,
         MIN(checkin_date)         AS stay_ci,
         MAX(checkout_date)        AS stay_co,
         ARRAY_AGG(earliest_checkin_hour ORDER BY checkin_date)[SAFE_OFFSET(0)]       AS earliest_checkin_hour,
@@ -466,7 +482,7 @@ _STAYS_CTE = f"""
     stays AS (
       SELECT
         resource_id            AS duve_property_id,
-        customer_name, apartment_code, lock_id, lock_tag_id,
+        customer_name, apartment_code, lock_id, lock_tag_id, gateway_dead,
         stay_ci, stay_co, earliest_checkin_hour, latest_checkout_hour,
         mews_reservation_number, payment_unpaid, balance_due, min_lead_hours,
         direct_last_minute, direct_unpaid,
@@ -474,7 +490,7 @@ _STAYS_CTE = f"""
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)[SAFE_OFFSET(0)] AS canonical_duve
       FROM stay_duve
       GROUP BY customer_id, resource_id, island_id, duve_property_id, customer_name,
-               apartment_code, lock_id, lock_tag_id, stay_ci, stay_co,
+               apartment_code, lock_id, lock_tag_id, gateway_dead, stay_ci, stay_co,
                earliest_checkin_hour, latest_checkout_hour, mews_reservation_number,
                payment_unpaid, balance_due, min_lead_hours, direct_last_minute,
                direct_unpaid
@@ -494,7 +510,7 @@ def _resa_to_provision() -> list[dict]:
     )
     SELECT
       s.canonical_duve AS duve_reservation_id,
-      s.duve_property_id, s.lock_id, s.lock_tag_id, s.apartment_code,
+      s.duve_property_id, s.lock_id, s.lock_tag_id, s.apartment_code, s.gateway_dead,
       s.customer_name, s.mews_reservation_number,
       s.stay_ci AS checkin_date, s.stay_co AS checkout_date,
       s.earliest_checkin_hour, s.latest_checkout_hour,
@@ -1553,7 +1569,29 @@ def _run_inner() -> None:
     to_provision = _resa_to_provision()
     logger.info(f"📋 {len(to_provision)} résa(s) à provisionner (CI dans 0-{LOOKAHEAD_DAYS}j, pas encore couvertes)")
     ok = skip = held = 0
+    gateway_blocked: list[dict] = []
     for row in to_provision:
+        # ⚠⚠ HyperGate morte = NE PAS PROVISIONNER. Le code partirait dans Duve sans
+        # jamais atteindre la serrure (qui stocke ses codes en local et ne les reçoit
+        # que par la passerelle) → le client se présente avec un code qui ne s'ouvre
+        # pas. Ne rien pousser est ici l'état SÛR : Duve retombe alors sur le code
+        # fixe de l'appartement, lui bien programmé dans la serrure.
+        # ⚠ Ce n'est PAS un `hold` : la porte de validation retient un code VALIDE en
+        # attendant un humain ; ici le code serait inutilisable quoi qu'on décide.
+        # ⚠ Restreint à la WHITELIST, comme le premier skip de `_provision` : hors
+        # whitelist on ne provisionne de toute façon jamais, et alerter dessus ferait
+        # sonner toutes les 2 h sur des appartements sans passerelle qu'on n'a aucune
+        # intention de piloter (mesuré : `ROY15-5D`, 2 séjours, alerterait à vide).
+        if row.get("gateway_dead") and (
+                not ALLOWED_PROPERTY_IDS
+                or (row.get("duve_property_id") or "").lower() in ALLOWED_PROPERTY_IDS):
+            gateway_blocked.append(row)
+            skip += 1
+            logger.warning(
+                f"🚫 GATEWAY MORTE {row.get('apartment_code')} — provision annulée pour "
+                f"{row.get('customer_name')} (CI {row.get('checkin_date')}) : le code "
+                f"n'atteindrait pas la serrure. Duve garde le code fixe.")
+            continue
         # Porte évaluée AVANT le provision : en mode `observe` on journalise sans
         # retenir, ce qui permet de mesurer le volume réel et de repérer un faux
         # positif coûteux avant de passer en `on`. La RC est alertée dans les deux
@@ -1671,6 +1709,36 @@ def _run_inner() -> None:
                 f"resync={resynced} | duve-retry={retry} | archived={archived} | "
                 f"purged={purged} | erreurs={len(errors)}")
     logger.info("=" * 70)
+
+    # HyperGate morte : alerte à CHAQUE run, pas 1×/jour comme les gaps. Une résa
+    # non provisionnée pour cette cause ne se résout pas toute seule — il faut aller
+    # sur place. Le client, lui, a bien un code qui marche (le fixe), donc ce n'est
+    # pas une urgence de la nuit : c'est une urgence de maintenance.
+    if gateway_blocked:
+        body = build_email(
+            "ISEO — HyperGate hors ligne, codes non générés",
+            subtitle=datetime.now(PARIS_TZ).strftime("%d/%m/%Y %H:%M"),
+            severity="critical",
+            kpis=[
+                {"label": "Séjours concernés", "value": len(gateway_blocked), "color": "#dc2626"},
+                {"label": "Appartements",
+                 "value": len({g.get("apartment_code") for g in gateway_blocked})},
+            ],
+            intro="La passerelle de ces appartements ne répond plus depuis plus de 7 jours. "
+                  "Un code généré n'atteindrait PAS la serrure (elle ne les reçoit que par la "
+                  "passerelle) et le client se retrouverait devant une porte qui refuse son "
+                  "code. Aucun code n'a donc été généré : Duve affiche le code fixe de "
+                  "l'appartement, qui lui fonctionne. À traiter sur place — la passerelle ne "
+                  "se redémarre pas à distance une fois hors ligne.",
+            table={"headers": ["Appartement", "Client", "Arrivée"],
+                   "rows": [[esc(g.get("apartment_code")), esc(g.get("customer_name")),
+                             esc(str(g.get("checkin_date")))] for g in gateway_blocked[:50]]},
+            button=("Ops · 7.7 Serrures",
+                    "https://direction.archides.fr/ops-back?tab=locks"),
+        )
+        _send_alert(
+            f"🚫 ISEO — HyperGate hors ligne : {len(gateway_blocked)} séjour(s) sans code généré",
+            body, html=True)
 
     if errors:
         body = build_email(
