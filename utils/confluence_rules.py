@@ -81,7 +81,7 @@ CROSSLINKS = [
         page_id="98830694",
         space="TRAN",
         titre="2. Gestion des clés",
-        rules=["codes-acces-auto", "surveillance-serrures"],
+        rules=["codes-acces-auto", "surveillance-serrures", "resa-risque-acces", "intrusion-code-fixe"],
         intro="Aux trousseaux physiques décrits ci-dessus s'ajoutent les <strong>serrures connectées</strong> : "
               "sur les appartements basculés, le code de la porte est généré, posé et retiré automatiquement "
               "pour chaque séjour, et une surveillance signale les codes manquants ou les passerelles hors "
@@ -386,8 +386,16 @@ RULES = [
             "Séjour <strong>prolongé, raccourci ou décalé</strong> → le code est reposé sur les nouvelles "
             "dates (même code, le client ne voit rien). <strong>Départ ou annulation</strong> → le code est "
             "supprimé de la serrure.",
-            "Le code fixe historique reste en place en parallèle pendant la phase pilote (décision du "
-            "13/07) — filet de sécurité, à purger appartement par appartement plus tard.",
+            "Le code fixe historique reste en place en parallèle sur la plupart des appartements, mais sa "
+            "<strong>suppression est engagée depuis la mi-août</strong> : il est retiré de Duve appartement "
+            "par appartement, et les codes des appartements sensibles ont été <strong>changés</strong>. À "
+            "terme, le code par séjour est le seul que le client voit.",
+            "Sur une réservation jugée <strong>à risque</strong>, le code peut être retenu au lieu d'être "
+            "envoyé — voir la règle « Réservation à risque à l'arrivée ».",
+            "<strong>Si un client appelle sans code</strong> : la page Arrivées (6.1) affiche, sur sa "
+            "réservation, le code généré et les codes de l'appartement (bouton « Afficher les codes »), les "
+            "heures de validité, et le <strong>bouton d'ouverture à distance</strong> — la RC peut dépanner "
+            "pendant l'appel, sans quitter la page.",
         ],
         exemple=[
             "Réservation arrivant vendredi sur un appartement basculé : mardi, la machine pose un code unique "
@@ -412,11 +420,14 @@ RULES = [
             "iseo_reconciliation",
             "iseo_etl_stale",
             "iseo_gateway_offline",
+            "iseo_clavier_muet",
+            "iseo_quota_licence",
         ],
         domaine="Serrures & accès",
         niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
         owner="Sylvain / Mickael (à confirmer)",
-        depuis="13 juin 2026 (récap quotidien par cause : 5 août 2026 · surveillance des HyperGates : 10 août 2026)",
+        depuis="13 juin 2026 (récap quotidien par cause : 5 août 2026 · HyperGates : 10 août 2026 · "
+               "clavier muet & plafond de licence : 18 août 2026)",
         source="trigger_iseo_pin_missing · trigger_iseo_reconciliation · trigger_iseo_etl_stale · trigger_iseo_gateway_offline → dash_ops_pin_reconciliation · stg_iseo__gateways · gaps orchestrateur",
         dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
         quoi=[
@@ -443,6 +454,147 @@ RULES = [
             "paiement en échec (le code est volontairement retenu), serrure non résolue, ou anomalie à "
             "investiguer. Le même état est visible arrivée par arrivée sur la page Arrivées (6.1, "
             "« Code d'accès ISEO »).",
+            "Depuis le <strong>18 août 2026</strong>, deux surveillances de plus : "
+            "• <strong>serrure muette au clavier</strong> — une serrure qui répond à distance mais dont les "
+            "ouvertures au clavier ne remontent plus depuis deux semaines alors que des clients y séjournent : "
+            "le journal des entrées est aveugle. Relance une fois par semaine tant que ce n'est pas réparé ; "
+            "le geste, validé avec ISEO : <strong>redémarrer l'HyperGate depuis l'interface Luckey</strong> "
+            "(2 minutes, à distance — l'historique gardé en mémoire par la serrure remonte tout seul).<br/>"
+            "• <strong>plafond de licence Luckey</strong> — l'abonnement limite le nombre d'« éléments » "
+            "(utilisateurs, serrures, invitations). Alerte à 90 % (critique à 96 %) : au plafond, "
+            "<strong>plus aucun code ne peut être posé, sur tout le parc</strong> (vécu le 15/08 : 3 heures "
+            "sans programmation).",
+        ],
+    ),
+    dict(
+        space="TRAN",
+        titre="Réservation à risque à l'arrivée — alerte immédiate & code retenu",
+        slug="resa-risque-acces",
+        domaine="Serrures & accès",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        frequence="Immédiat (à la seconde où le client remplit son pre-checkin) · réévaluation toutes les 2 h",
+        canal="Mail ⚠️ / 🔒 → hatim@archides.fr (bascule vers la RC prévue avant l'activation complète)",
+        owner="Emilia / RC (à confirmer)",
+        depuis="15 août 2026 (après trois tentatives de fraude en trois jours)",
+        source="webhook-gateway (pre-checkin Duve, temps réel) · orchestrateur serrures (porte de validation) → iseo_raw.hold_decisions",
+        dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
+        quoi=[
+            "<strong>Le moment critique est le pre-checkin</strong> : c'est en le remplissant que le client "
+            "fait apparaître son code d'accès — sur les fraudes d'août, il a été rempli 20 à 47 minutes "
+            "après la réservation, en pleine soirée.",
+            "<strong>Alerte immédiate</strong> : arrivée le jour même + aucune pièce d'identité scannée → "
+            "mail en quelques secondes, pour que quelqu'un regarde la réservation <em>avant</em> l'arrivée. "
+            "Les quatre fraudes d'août cochaient toutes ces deux cases.",
+            "<strong>Porte de validation</strong> : sur une réservation en direct de dernière minute, ou en "
+            "direct avec un solde impayé significatif, le code est créé mais <strong>pas envoyé au "
+            "client</strong> — la RC vérifie, puis le libère. ⚠ <strong>Mode observation aujourd'hui</strong> : "
+            "la décision est journalisée et alertée, mais le code part quand même ; l'activation réelle se "
+            "fera appartement par appartement, au fil du retrait des codes fixes.",
+            "Chaque rétention envoie un mail qui dit explicitement lequel des deux cas s'applique : "
+            "<strong>« ⚠️ résa à risque (code envoyé) »</strong> = surveiller · <strong>« 🔒 code retenu à "
+            "valider »</strong> = le client n'a PAS de code, agir avant son arrivée.",
+            "La <strong>pièce d'identité ne libère jamais le code automatiquement</strong> : scanner un "
+            "document coûte 30 secondes à un fraudeur (un cas de fausse pièce est avéré). Elle sert au "
+            "triage humain, pas à la décision machine.",
+            "Où voir les décisions : dashboard 7.8, sous-onglet « Porte (décisions) » — chaque évaluation, "
+            "son motif et son issue réelle (retenu / observation / non provisionné).",
+        ],
+        modifier=[
+            "Les critères exacts (délais, seuils de solde) sont volontairement <strong>absents de cette "
+            "page</strong> : une page qui décrit précisément comment la machine décide est aussi une recette "
+            "de contournement. Ils sont gérés dans le DWH — demande à Hatim.",
+        ],
+    ),
+    dict(
+        space="TRAN",
+        titre="Intrusion sur code fixe (logement vide)",
+        slug="intrusion-code-fixe",
+        triggers=["iseo_code_fixe_intrusion"],
+        domaine="Serrures & accès",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        owner="Sylvain / Mickael (à confirmer)",
+        depuis="18 août 2026",
+        source="trigger_iseo_code_fixe_intrusion → dash_ops_lock_events × fct_reservations × Breezeway",
+        dashboard_url="https://direction.archides.fr/ops-back?tab=serrures",
+        quoi=[
+            "Les <strong>codes fixes</strong> sont les codes permanents d'appartement, partagés entre tous "
+            "ceux qui les ont un jour reçus. Les fraudes de juillet en sont passées par là : 16 ouvertures "
+            "sur un appartement, 62 sur un autre, <strong>sans qu'aucune alerte n'existe</strong>.",
+            "Chaque jour, la machine repère toute ouverture par code fixe sur un logement <strong>vide</strong> "
+            "— aucun séjour en cours, aucune tâche ménage/maintenance prévue à ±1 jour. Une ouverture "
+            "la <strong>nuit</strong> (22h-7h) est classée critique.",
+            "Volume attendu : ~2 cas par mois — quand ça sonne, ce n'est pas du bruit.",
+            "<strong>Le geste</strong> : ouvrir le journal des serrures (7.9) pour voir qui, quand et avec "
+            "quel code ; si l'ouverture n'est pas explicable (équipe, prestataire connu), faire "
+            "<strong>changer le code fixe</strong> de l'appartement.",
+            "Périmètre : <strong>tout le parc</strong> depuis le 19/08 (le journal couvrait avant les seuls "
+            "appartements basculés — précisément pas ceux où vivent les codes fixes).",
+        ],
+    ),
+    dict(
+        space="TRAN",
+        titre="Fraude — usurpation d'identité & chargebacks",
+        slug="fraude-alertes",
+        triggers=["fraude_identite", "new_chargeback", "payment_double_exit"],
+        domaine="Serrures & accès — Fraude",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        owner="Emilia (dossier & relation OTA) / Philippe (écriture comptable)",
+        depuis="15 août 2026 (chargebacks) · 19 août 2026 (usurpation d'identité)",
+        source="trigger_fraude_identite → int_reservations__risk · trigger_new_chargeback / trigger_payment_double_exit → paiements Mews",
+        dashboard_url="https://direction.archides.fr/finances?tab=contestations",
+        quoi=[
+            "<strong>Suspicion d'usurpation avant l'arrivée</strong> : la machine croise trois signaux — "
+            "réservation directe au dernier moment · échecs de carte répétés avant un paiement accepté · "
+            "nom du formulaire ou de la pièce différent du nom de la réservation. <strong>Deux signaux ou "
+            "plus</strong> → mail « [Merveil Fraude] » sous 2 h (~2 cas/mois). Un signal isolé ne déclenche "
+            "jamais de mail : il colore seulement le badge risque du dashboard (6.1 / 6.7).",
+            "<strong>Nouveau chargeback</strong> : chaque litige bancaire ouvert par un client est signalé "
+            "immédiatement. ⏱ <strong>Le dossier de contestation Adyen se dépose sous ~48 h</strong> — "
+            "au-delà, le litige est perdu d'office (en 2026 : 1 chargeback récupéré sur 20).",
+            "<strong>Double sortie d'argent</strong> : le même séjour remboursé au client ET perdu en "
+            "chargeback = payé deux fois → mail immédiat.",
+            "<strong>Le geste</strong> — avant la remise des clés : vérifier identité et paiement (appeler "
+            "le client au besoin) ; après un chargeback : déposer le dossier sous 48 h et tout tracer dans "
+            "la page <strong>9.9 Contestations</strong> (statut, dates, notes) — c'est elle qui répond à "
+            "« qu'a-t-on contesté, qu'a-t-on récupéré ».",
+        ],
+        exemple=[
+            "Cas réel (août 2026) : deux séjours directs réservés au dernier moment à trois jours "
+            "d'intervalle, 3-4 échecs de carte avant chaque paiement accepté, pre-checkin du second séjour "
+            "rempli sous un <strong>autre nom</strong> que la réservation (même téléphone, même e-mail), "
+            "aucune pièce scannée. Le combo aurait déclenché le mail dans les 2 h — détecté rétroactivement, "
+            "chargeback attendu.",
+        ],
+    ),
+
+    # ── GDA — badge risque (visualisation, pas de mail) ──────────────────────
+    dict(
+        space="GDA",
+        titre="Badge « résa à risque » sur les arrivées (6.1 / 6.7)",
+        slug="resa-risque-badge",
+        domaine="Opérations — Front office",
+        niveau="N2", niveau_desc="la machine surveille et signale, l'humain décide",
+        frequence="Recalculé toutes les 2 heures",
+        canal="Badge dans le dashboard (6.1 Arrivées · 6.7 Résas à risque) — pas de mail",
+        owner="Emilia / RC",
+        depuis="21 juin 2026 (signaux affinés en août 2026)",
+        source="int_reservations__risk → dash_ops_arrivals · dash_resa_risk",
+        dashboard_url="https://direction.archides.fr/ops-front?tab=risque",
+        quoi=[
+            "Chaque arrivée des prochaines semaines porte un niveau de risque : <strong>rouge</strong> "
+            "(vérifier avant l'arrivée) · <strong>ambre</strong> (garder un œil) · vert.",
+            "<strong>Signaux forts</strong> (rouge dès un seul) : solde impayé significatif à quelques jours "
+            "de l'arrivée · réservation directe de dernière minute · échecs de carte répétés.",
+            "<strong>Signaux moyens et faibles</strong> (rouge par accumulation) : nom du formulaire ≠ nom de "
+            "la réservation · groupe de jeunes adultes · plus de personnes que la capacité · séjour local "
+            "court le week-end · motif « célébration » · pre-checkin toujours manquant la veille.",
+            "Quand <strong>deux signaux de fraude ou plus</strong> se combinent, un mail part en parallèle — "
+            "voir la règle « Fraude — usurpation d'identité & chargebacks » (space Serrures & accès).",
+            "<strong>Le geste sur un rouge</strong> : ouvrir la fiche, vérifier paiement et identité, appeler "
+            "le client au besoin — <em>avant</em> la remise des clés, pas après.",
+            "Anti-bruit : les paiements des réservations OTA (Booking, Airbnb, Expedia…) sont encaissés par "
+            "la plateforme — l'absence de paiement dans Mews n'y est <strong>pas</strong> un signal, et ces "
+            "réservations ne sonnent pas pour ça.",
         ],
     ),
 ]
