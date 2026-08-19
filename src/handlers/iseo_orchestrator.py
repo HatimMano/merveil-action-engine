@@ -272,8 +272,18 @@ _LOCKS_CTE = f"""
              -- Sara Mavromatis 27/07, Maritza Padilla 07/08, Samantha Mamone 12/08 —
              -- verbatims dans le chat Duve). La donnée était là depuis le début, rien
              -- ne la lisait. Cf. ADR 19/08.
+             -- ⚠ SEUIL 24 h, PAS 7 JOURS (resserré le 19/08 au soir). Mesuré sur les
+             -- 106 HyperGates : **101 pinguent dans l'heure et AUCUNE ne se situe entre
+             -- 1 h et 24 h** — les 5 restantes sont à 51 h, 70 h, 72 h, 82 h et 1 072 h.
+             -- La distribution est binaire : vivante ou morte. À 7 j, 4 passerelles
+             -- tombées restaient non protégées, dont `CAI31-2D` qui est intégré.
+             -- L'asymétrie justifie de bloquer tôt : bloquer à tort coûte un code de
+             -- séjour en moins (le client garde le code fixe, qui marche, et le
+             -- provisioning repart au run suivant, 2 h après) ; pousser à tort met le
+             -- client dehors. ⚠ Ne PAS aligner sur le seuil du trigger `iseo_gateway_offline`
+             -- (72 h) : alerter et bloquer n'ont pas le même coût d'erreur.
              (g.gateway_id IS NULL
-              OR COALESCE(g.hours_since_last_connection, 1e9) >= 24 * 7) AS gateway_dead
+              OR COALESCE(g.hours_since_last_connection, 1e9) >= 24) AS gateway_dead
       FROM `{SMART_LOCKS_TABLE}` l, UNNEST(JSON_QUERY_ARRAY(l.tags)) AS t
       LEFT JOIN `{GATEWAYS_TABLE}` g ON g.gateway_id = l.gateway_id
       WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
