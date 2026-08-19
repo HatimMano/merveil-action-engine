@@ -444,7 +444,7 @@ RULES = [
             "Un même problème n'est signalé qu'une fois tant qu'il n'est pas résolu (déduplication 4h).",
             "S'y ajoute depuis le <strong>10 août 2026</strong> la surveillance des <strong>HyperGates</strong> "
             "(les boîtiers qui relient les serrures au réseau) : une passerelle qui n'a plus donné signe de vie "
-            "depuis <strong>plus de 7 jours</strong> est signalée dans le mail quotidien, avec la liste des "
+            "depuis <strong>plus de 3 jours</strong> est signalée dans le mail quotidien, avec la liste des "
             "serrures qu'elle dessert. Sans passerelle, la serrure fonctionne toujours au clavier mais on ne "
             "peut plus ni poser un code à distance, ni ouvrir la porte à distance, ni voir les ouvertures — "
             "c'est une panne à traiter sur place. Cette surveillance rend <strong>redondant</strong> le rapport "
