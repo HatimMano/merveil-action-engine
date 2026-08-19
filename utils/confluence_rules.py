@@ -74,7 +74,7 @@ CROSSLINKS = [
         page_id="378077185",
         space="VD",
         titre="1.0. Ventes - Vérifications Quotidiennes",
-        rules=["beyond-push-gaps-1n", "gaps-pricing", "surcote-1n-inefficace"],
+        rules=["beyond-push-gaps-1n", "gaps-pricing"],
         intro="Les étapes « gaps de 1 et 2 nuits au prix minimum » de cette procédure sont "
               "désormais <strong>faites par la machine</strong> sur les appartements du pilote : elle pose "
               "elle-même la fourchette de prix dans Beyond chaque matin, et signale dans le mail quotidien "
@@ -120,8 +120,14 @@ RULES = [
             "— 34 apparts &lt; 80 % ».",
         ],
     ),
+    # ⚠️ Cette règle et « Push automatique des prix » regardent le MÊME objet :
+    # les trous de 1 et 2 nuits (`dash_ventes_gaps` ne couvre rien d'autre). La
+    # ligne de partage n'est pas le périmètre, c'est le geste : ici l'humain
+    # baisse un prix à la main, là-bas la machine le pose. Ne pas les refondre
+    # en une page unique : un niveau (N2/N4) par page, sinon le lecteur ne sait
+    # plus de quel côté est son appartement.
     dict(
-        titre="Gaps de pricing — récap quotidien",
+        titre="Trous de 1 et 2 nuits restant à traiter à la main",
         slug="gaps-pricing",
         triggers=["gap_pricing_summary"],
         domaine="Ventes — Pricing",
@@ -151,52 +157,26 @@ RULES = [
             "étaient vendus au tarif adjacent ».",
         ],
     ),
-    dict(
-        titre="Surcote 1 nuit inefficace sur gap à venir",
-        slug="surcote-1n-inefficace",
-        triggers=["beyond_surcote_gap"],
-        domaine="Ventes — Pricing Beyond",
-        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
-        owner="Raphael / Arnaud (à confirmer)",
-        depuis="juin 2026",
-        source="trigger_beyond_surcote_gap → dash_beyond_proposed_changes × dash_beyond_gap1n_surcote",
-        dashboard_url="https://direction.archides.fr/ventes?tab=controle&view=push_auto",
-        quoi=[
-            "Beyond applique une <strong>surcote automatique sur les nuits seules</strong> (en moyenne +88 %, "
-            "jusqu'à +160 % selon l'appartement). Sur certains appartements, cette surcote est "
-            "<strong>empiriquement inefficace</strong> : historiquement, moins de 5 % de ces nuits surcotées "
-            "≥ 100 % se vendent — la nuit reste vide.",
-            "Chaque nuit, la machine repère les appartements qui ont <strong>une nuit seule à vendre dans les "
-            "14 prochains jours</strong> ET une surcote flaggée inefficace → alerte dans le mail quotidien, "
-            "<strong>avant</strong> que la nuit ne soit perdue.",
-            "L'action suggérée : baisser la surcote / le prix de cette nuit. Depuis le 17/07, sur les "
-            "appartements du pilote, la machine pose <strong>elle-même</strong> la fenêtre de prix — voir la "
-            "règle « Push automatique des prix sur les nuits seules ». Sur ces appartements, la surcote 1 nuit "
-            "Beyond a été supprimée (le 21/07 sur les 8 premiers, le 07/08 sur les 31 du pilote élargi) : elle "
-            "s'appliquait <strong>après</strong> la fenêtre et la rendait inopérante.",
-            "Le bouton du mail ouvre le sous-onglet <strong>Push auto</strong> (1.4 Contrôle des prix) : c'est "
-            "là qu'on voit ce que la machine a réellement posé sur chaque trou de 1 et 2 nuits, à quel prix, "
-            "et si la nuit s'est vendue ensuite. La vue de détail des surcotes elle-même reste réservée aux "
-            "comptes techniques.",
-        ],
-        exemple=[
-            "Mail du 19/08/2026 : 14 appartements avec une nuit seule à vendre sous 14 jours et une surcote "
-            "flaggée inefficace (P09-CAR7-0G, P03-MAR326-3D, P08-MON58-0G, P02-ABO52-2D…). Tous hors pilote — "
-            "sur le pilote, la surcote a été retirée et la machine pose la fourchette elle-même.",
-        ],
-    ),
+    # ⭐ Fusion du 19/08 : l'ancienne règle « Surcote 1 nuit inefficace » (slug
+    # surcote-1n-inefficace, trigger beyond_surcote_gap) a été absorbée ici. Elle
+    # décrivait le même levier que le bloc « Modifier » de cette page, et depuis
+    # la mesure du 16/08 la surcote n'est plus un sujet autonome : c'est le
+    # mécanisme qui rend notre plafond inopérant. Sa page Confluence a été
+    # archivée à la main (le sync ne supprime jamais).
     dict(
         titre="Push automatique des prix sur les nuits seules (gaps 1N/2N)",
         slug="beyond-push-gaps-1n",
         frequence_extra="Push des prix : quotidien 6h45, 10h45 et 20h45",
-        triggers=["beyond_gap_filled"],  # le mail 🎉 ; le push lui-même est un job autonome
+        # beyond_gap_filled = le mail 🎉 ; beyond_surcote_gap = le nudge surcote
+        # (fusionné le 19/08) ; le push lui-même est un job autonome.
+        triggers=["beyond_gap_filled", "beyond_surcote_gap"],
         live="beyond_push",
         domaine="Ventes — Pricing Beyond",
         niveau="N4", niveau_desc="la machine agit seule, l'humain audite a posteriori",
         owner="Raphael / Mickael",
         depuis="17 juillet 2026 (pilote 8 appartements — élargi à 31 appartements le 07/08, "
                "nuits orphelines sur tout le parc le 06/08, trous de 2 nuits activés le 10/08)",
-        source="merveil-action-engine-beyond → dash_beyond_push_targets → API Beyond (seasonal-prices) → beyond_raw.price_pushes_log",
+        source="merveil-action-engine-beyond → dash_beyond_push_targets → API Beyond (seasonal-prices) → beyond_raw.price_pushes_log · trigger_beyond_surcote_gap → dash_beyond_gap1n_surcote",
         dashboard_url="https://direction.archides.fr/ventes?tab=controle&view=push_auto",
         quoi=[
             "Sur 2026, ~1 380 « nuits seules » (une nuit vide coincée entre deux réservations) — seules 2,5 % "
@@ -219,12 +199,21 @@ RULES = [
             "plancher, rien de plus : on empêche la nuit de partir à perte.",
             "Si les nuits voisines vendent sous notre plancher (fréquent sur les petits appartements), la "
             "fourchette devient un <strong>prix fixe rentable</strong> — mieux que le prix surcoté, jamais à perte.",
-            "⚠️ <strong>Limite connue depuis le 16/08</strong> : Beyond applique sa surcote 1 nuit "
-            "<strong>après</strong> notre fourchette, pas avant. Sur les appartements du pilote la surcote a été "
-            "retirée, donc le prix affiché est exactement notre fourchette. Sur les autres — ceux que couvre "
-            "seulement la protection des nuits orphelines — la nuit reste publiée 1,5 à 2 fois au-dessus de "
-            "notre plafond : <strong>le plancher tient, le plafond non</strong>. La nuit ne part donc jamais à "
-            "perte, mais elle reste difficile à vendre. Sujet ouvert avec Beyond au point du 8 septembre.",
+            "<strong>La surcote 1 nuit de Beyond, et pourquoi elle compte.</strong> Beyond majore "
+            "automatiquement les nuits seules (en moyenne +88 %, jusqu'à +160 % selon l'appartement). Sur "
+            "beaucoup d'appartements cette majoration est <strong>empiriquement inefficace</strong> : moins de "
+            "5 % des nuits surcotées de 100 % ou plus se vendent — la nuit reste vide. Elle a donc été retirée "
+            "sur les appartements du pilote (le 21/07 sur les 8 premiers, le 07/08 sur les 31 actuels), et "
+            "c'est le <strong>prérequis</strong> à l'entrée d'un appartement dans le pilote.",
+            "⚠️ <strong>Pourquoi ce prérequis, mesuré le 16/08</strong> : Beyond applique sa surcote "
+            "<strong>après</strong> notre fourchette, pas avant. Sur le pilote, surcote retirée, le prix affiché "
+            "est exactement notre fourchette. Sur les autres — ceux que couvre seulement la protection des "
+            "nuits orphelines — la nuit reste publiée 1,5 à 2 fois au-dessus de notre plafond : <strong>le "
+            "plancher tient, le plafond non</strong>. La nuit ne part jamais à perte, mais elle reste difficile "
+            "à vendre. Sujet ouvert avec Beyond au point du 8 septembre.",
+            "En attendant, un <strong>nudge quotidien</strong> signale les appartements <em>hors pilote</em> qui "
+            "ont une nuit seule à vendre dans les 14 prochains jours ET une surcote flaggée inefficace — pour "
+            "faire baisser le prix à la main, ou pour décider de basculer l'appartement dans le pilote.",
             "Les <strong>règles saisonnières posées par l'équipe dans Beyond sont préservées</strong> (un plancher "
             "équipe plus haut gagne toujours). Nuit vendue ou gap disparu → la fenêtre est retirée le lendemain. "
             "Chaque modification est journalisée (audit complet, réversible en un clic).",
@@ -233,6 +222,10 @@ RULES = [
             "17/07/2026 : 1er run — fenêtres posées sur 10 nuits seules des 5 premiers appartements "
             "(ex. P11-RIC75-0F, nuit du 10/09 : fourchette 394 → 419 €, ADR voisin 469 €). "
             "Quand une de ces nuits se vend : mail 🎉 automatique avec le prix vendu, le canal et la fenêtre.",
+            "19/08/2026, le nudge surcote : 14 appartements avec une nuit seule à vendre sous 14 jours et une "
+            "surcote flaggée inefficace (P09-CAR7-0G, P03-MAR326-3D, P08-MON58-0G, P02-ABO52-2D…). "
+            "<strong>Tous hors pilote</strong> — sur le pilote, la surcote a été retirée et la machine pose la "
+            "fourchette elle-même.",
         ],
         modifier=[
             "La <strong>liste des appartements du pilote</strong> est modifiable en direct depuis le dashboard "

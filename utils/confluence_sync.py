@@ -416,6 +416,43 @@ def coverage_gap(routing: dict) -> list:
                   if c.get("enabled") and n not in documented)
 
 
+def link_gap(bq) -> list:
+    """Règles dont le `dashboard_url` n'ouvre pas ce qu'il prétend.
+
+    Même référentiel que le test dbt `assert_dashboard_links_valid` : le seed
+    `staging.dashboard_routes`, généré depuis le code du front. Un lien de doc
+    qui pointe un onglet supprimé, renommé, ou réservé aux comptes techniques
+    est aussi faux qu'un lien de mail — et personne ne s'en aperçoit, puisque le
+    dashboard affiche simplement autre chose. Deux cas trouvés le 19/08.
+    """
+    try:
+        routes = {(r.route, r.tab or "", r.view or ""): r.is_dev
+                  for r in bq.query(
+                      f"SELECT route, tab, view, is_dev "
+                      f"FROM `{PROJECT}.staging.dashboard_routes`").result()}
+    except Exception as e:                          # seed absent = pas de contrôle
+        logger.warning(f"contrôle des liens impossible ({e.__class__.__name__})")
+        return []
+
+    out = []
+    for r in RULES:
+        url = r["dashboard_url"]
+        route = (re.search(r"archides\.fr/([^?#/]*)", url) or [None, ""])[1]
+        tab = (re.search(r"[?&]tab=([^&#]+)", url) or [None, ""])[1]
+        view = (re.search(r"[?&]view=([^&#]+)", url) or [None, ""])[1]
+        if (route, "", "") not in routes:
+            out.append(f"{r['slug']} : page inconnue ({route})")
+        elif tab and (route, tab, "") not in routes:
+            out.append(f"{r['slug']} : onglet inexistant ({tab})")
+        elif tab and routes[(route, tab, "")]:
+            out.append(f"{r['slug']} : onglet réservé aux comptes techniques ({tab})")
+        elif view and (route, tab, view) not in routes:
+            out.append(f"{r['slug']} : sous-onglet inexistant ({view})")
+        elif view and routes[(route, tab, view)]:
+            out.append(f"{r['slug']} : sous-onglet réservé aux comptes techniques ({view})")
+    return out
+
+
 def rule_body(r, live=None, facts=None):
     facts = facts or dict(statut=("Green", "Actif"), frequence=r.get("frequence", "—"),
                           canal=r.get("canal", "—"))
@@ -593,6 +630,8 @@ def run() -> None:
     gap = coverage_gap(routing)
     if gap:
         logger.warning(f"{len(gap)} trigger(s) actif(s) sans page Confluence : {', '.join(gap)}")
+    for bad in link_gap(bq):
+        logger.warning(f"lien mort : {bad}")
     logger.info("Done.")
 
 
