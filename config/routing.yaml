@@ -334,14 +334,18 @@ triggers:
       - type: email_digest
         bucket: daily
 
-  # Saturation de la licence Luckey. Bucket 2h : quand le plafond tombe, PLUS
-  # AUCUN code n'est programmé sur tout le parc (vécu 3 h le 15/08) — attendre le
-  # digest du lendemain reviendrait à découvrir la panne par les clients.
+  # Saturation de la licence Luckey.
+  # ⚠ Passé de `2h` à `daily` le 19/08 (demande Hatim) : la saturation est un ÉTAT,
+  # pas un événement — tant qu'on est au-dessus du seuil, la répéter toutes les 2 h
+  # ne fait qu'apprendre à ignorer le mail. Une fois par jour suffit à ne pas
+  # l'oublier. Contrepartie assumée : si le plafond tombe juste après le digest,
+  # on l'apprend par l'échec de programmation (mail d'erreur de l'orchestrateur,
+  # qui lui tourne toutes les 2 h) et non par cette alerte.
   iseo_quota_licence:
     enabled: true
     actions:
       - type: email_digest
-        bucket: 2h
+        bucket: daily
 
   iseo_etl_stale:
     enabled: true
