@@ -145,6 +145,17 @@ triggers:
       - type: email_digest
         bucket: fraude
 
+  # Suspicion fraude AVANT l'arrivée (2026-08-19) : ≥2 signaux parmi
+  # {direct réservé ≤72h, échecs CB direct, nom de la pièce ≠ nom résa}.
+  # Combo calibré par backtest (ADR 19/08 : 13 cas/7,5 mois — Rachel Williams
+  # 5 915 €, cas Hamdaoui). Un signal isolé ne mail JAMAIS (badge 6.1/6.7).
+  # Vérification humaine avant remise des clés — cadre N3.
+  fraude_identite:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: fraude
+
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
   # 6 fois/jour → 1 mail/jour). Le scheduler merveil-action-engine-4h est
