@@ -564,6 +564,11 @@ def _whitelisted_gaps() -> list[dict]:
            m.checkout_date, lk.apartment_code,
            CASE
              WHEN lk.lock_id IS NULL THEN 'lock'
+             -- ⚠ AVANT 'precheckin' et 'paiement' : quand la passerelle est morte, la
+             -- cause du « pas de code » est celle-là et aucune autre — le formulaire ou
+             -- le paiement n'y changeraient rien. La classer plus bas la ferait passer
+             -- pour un bruit qui se résout tout seul.
+             WHEN COALESCE(lk.gateway_dead, FALSE) THEN 'gateway'
              WHEN d.duve_reservation_id IS NULL THEN 'precheckin'
              WHEN COALESCE(pay.n_failed, 0) > 0
               AND COALESCE(pay.amount_charged, 0) <= 0
@@ -590,8 +595,8 @@ def _whitelisted_gaps() -> list[dict]:
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY CAST(m.reservation_number AS STRING)
       ORDER BY m.checkin_date) = 1
-    ORDER BY CASE reason WHEN 'autre' THEN 0 WHEN 'lock' THEN 1
-                         WHEN 'paiement' THEN 2 ELSE 3 END, m.checkin_date
+    ORDER BY CASE reason WHEN 'autre' THEN 0 WHEN 'gateway' THEN 1 WHEN 'lock' THEN 2
+                         WHEN 'paiement' THEN 3 ELSE 4 END, m.checkin_date
     """
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ArrayQueryParameter("wl", "STRING", sorted(ALLOWED_PROPERTY_IDS))])
@@ -605,6 +610,16 @@ _GAP_REASONS = {
         "label": "⚠ Aurait dû être généré — à investiguer",
         "hint":  "Whitelisté, pre-checkin fait, paiement OK, serrure OK… mais aucun code. "
                  "Vérifier le tab 7.8 et les logs de l'orchestrateur.",
+        "bg": "#fef2f2", "fg": "#dc2626",
+    },
+    "gateway": {
+        "label": "HyperGate hors ligne — intervention sur place",
+        "hint":  "La passerelle ne répond plus depuis > 24 h. Un code généré n'atteindrait "
+                 "PAS la serrure (elle ne les reçoit que par elle) et le client trouverait "
+                 "porte close — c'est ce qui a bloqué 4 clients dehors sur LAO4-0G entre le "
+                 "23/07 et le 12/08. On ne génère donc rien : Duve sert le code fixe, qui "
+                 "fonctionne. Se déplacer — une passerelle hors ligne ne se redémarre plus "
+                 "à distance.",
         "bg": "#fef2f2", "fg": "#dc2626",
     },
     "lock": {
@@ -1579,7 +1594,6 @@ def _run_inner() -> None:
     to_provision = _resa_to_provision()
     logger.info(f"📋 {len(to_provision)} résa(s) à provisionner (CI dans 0-{LOOKAHEAD_DAYS}j, pas encore couvertes)")
     ok = skip = held = 0
-    gateway_blocked: list[dict] = []
     for row in to_provision:
         # ⚠⚠ HyperGate morte = NE PAS PROVISIONNER. Le code partirait dans Duve sans
         # jamais atteindre la serrure (qui stocke ses codes en local et ne les reçoit
@@ -1595,7 +1609,6 @@ def _run_inner() -> None:
         if row.get("gateway_dead") and (
                 not ALLOWED_PROPERTY_IDS
                 or (row.get("duve_property_id") or "").lower() in ALLOWED_PROPERTY_IDS):
-            gateway_blocked.append(row)
             skip += 1
             logger.warning(
                 f"🚫 GATEWAY MORTE {row.get('apartment_code')} — provision annulée pour "
@@ -1720,36 +1733,11 @@ def _run_inner() -> None:
                 f"purged={purged} | erreurs={len(errors)}")
     logger.info("=" * 70)
 
-    # HyperGate morte : alerte à CHAQUE run, pas 1×/jour comme les gaps. Une résa
-    # non provisionnée pour cette cause ne se résout pas toute seule — il faut aller
-    # sur place. Le client, lui, a bien un code qui marche (le fixe), donc ce n'est
-    # pas une urgence de la nuit : c'est une urgence de maintenance.
-    if gateway_blocked:
-        body = build_email(
-            "ISEO — HyperGate hors ligne, codes non générés",
-            subtitle=datetime.now(PARIS_TZ).strftime("%d/%m/%Y %H:%M"),
-            severity="critical",
-            kpis=[
-                {"label": "Séjours concernés", "value": len(gateway_blocked), "color": "#dc2626"},
-                {"label": "Appartements",
-                 "value": len({g.get("apartment_code") for g in gateway_blocked})},
-            ],
-            intro="La passerelle de ces appartements ne répond plus depuis plus de 7 jours. "
-                  "Un code généré n'atteindrait PAS la serrure (elle ne les reçoit que par la "
-                  "passerelle) et le client se retrouverait devant une porte qui refuse son "
-                  "code. Aucun code n'a donc été généré : Duve affiche le code fixe de "
-                  "l'appartement, qui lui fonctionne. À traiter sur place — la passerelle ne "
-                  "se redémarre pas à distance une fois hors ligne.",
-            table={"headers": ["Appartement", "Client", "Arrivée"],
-                   "rows": [[esc(g.get("apartment_code")), esc(g.get("customer_name")),
-                             esc(str(g.get("checkin_date")))] for g in gateway_blocked[:50]]},
-            button=("Ops · 7.7 Serrures",
-                    "https://direction.archides.fr/ops-back?tab=locks"),
-        )
-        _send_alert(
-            f"🚫 ISEO — HyperGate hors ligne : {len(gateway_blocked)} séjour(s) sans code généré",
-            body, html=True)
-
+    # ⚠ PAS de mail dédié ici (retiré le 20/08, il sonnait toutes les 2 h pour la
+    # même réservation). Une passerelle morte est un état PERSISTANT : le répéter huit
+    # fois par nuit n'ajoute rien et apprend au lecteur à ignorer l'expéditeur. La cause
+    # est désormais portée par le mail quotidien « résas sans code » (`_whitelisted_gaps`,
+    # cause `gateway`) — un seul mail, au bon endroit, avec les autres causes.
     if errors:
         body = build_email(
             "ISEO orchestrator — erreurs",
@@ -1773,7 +1761,7 @@ def _run_inner() -> None:
     # Gaps : mail 1×/jour (run du matin ~08:45 Paris), séparé des erreurs dures qui,
     # elles, alertent à chaque run. Évite le spam sur un gap qui se résout tout seul.
     if gaps and datetime.now(PARIS_TZ).hour == 8:
-        n_urgent = sum(1 for g in gaps if g["reason"] in ("autre", "lock"))
+        n_urgent = sum(1 for g in gaps if g["reason"] in ("autre", "lock", "gateway"))
         subject = (f"{'🔴' if n_urgent else 'ℹ️'} ISEO — {len(gaps)} résa(s) sans code"
                    + (f" dont {n_urgent} à investiguer" if n_urgent else ""))
         paris_today = datetime.now(PARIS_TZ).strftime("%A %d %B %Y")
