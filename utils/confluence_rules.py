@@ -643,7 +643,7 @@ RULES = [
         owner="Emilia (dossier & relation OTA) / Philippe (écriture comptable)",
         depuis="15 août 2026 (chargebacks) · 19 août 2026 (usurpation d'identité)",
         source="trigger_fraude_identite → int_reservations__risk · trigger_new_chargeback / trigger_payment_double_exit → paiements Mews",
-        dashboard_url="https://direction.archides.fr/finances?tab=contestations",
+        dashboard_url="https://direction.archides.fr/ops-front?tab=contestations",
         quoi=[
             "<strong>Suspicion d'usurpation avant l'arrivée</strong> : la machine croise trois signaux — "
             "réservation directe au dernier moment · échec de carte avant un paiement accepté (sur une "
