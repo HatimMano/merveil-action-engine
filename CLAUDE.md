@@ -401,6 +401,8 @@ gcloud beta run jobs executions logs read <execution-name> --region europe-west1
 bash deploy.sh
 ```
 
+⚠️ **`--max-retries 2` depuis le 2026-08-21** (était 1, sur les 7 jobs). Un hang d'infra au démarrage — conteneur tué au `taskTimeout` de 300 s **sans avoir émis une seule ligne de log**, donc avant `main.py` — consommait l'unique retry. Observé le 21/08 sur le job 2h : tentative 1 muette pendant 300 s, retry en succès en 12 s (les runs normaux durent 10-12 s, la 2ᵉ chance est quasi gratuite). ⚠ Le réglage est **pinné dans `deploy.sh`** à 4 endroits (`COMMON_ARGS` + les 3 jobs autonomes) : le changer à chaud via `gcloud run jobs update` ne survit pas au prochain deploy. ⚠ Angle mort connu, inchangé par ce réglage : `_flush_digest` envoie le mail **avant** d'écrire dans `dispatched_actions` — un conteneur qui meurt dans cette fenêtre de quelques ms fera renvoyer le digest à la tentative suivante.
+
 ## IAM — Prérequis
 `action-engine-sa` doit avoir les rôles suivants :
 - `roles/bigquery.dataEditor` — lire/écrire action_triggers
