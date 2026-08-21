@@ -27,7 +27,7 @@ COMMON_ARGS="--image $IMAGE \
   --memory 512Mi \
   --cpu 1 \
   --task-timeout 300 \
-  --max-retries 1 \
+  --max-retries 2 \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest \
   --service-account $SA \
   --project $PROJECT"
@@ -93,7 +93,7 @@ echo "🚀 Déploiement du job iseo-orchestrator (pipeline V3 100% DWH — natif
 gcloud run jobs deploy merveil-action-engine-iseo \
   --image $IMAGE \
   --region $REGION \
-  --memory 512Mi --cpu 1 --task-timeout 300 --max-retries 1 \
+  --memory 512Mi --cpu 1 --task-timeout 300 --max-retries 2 \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest,ISEO_MANAGER_USERNAME=iseo-manager-username:latest,ISEO_MANAGER_PASSWORD=iseo-manager-password:latest,DUVE_CONNECT_TOKEN=duve-connect-token:latest \
   --service-account $SA \
   --project $PROJECT \
@@ -108,7 +108,7 @@ echo "🚀 Déploiement du job beyond-push (fenêtres prix gaps 1N, daily 10h45)
 gcloud run jobs deploy merveil-action-engine-beyond \
   --image $IMAGE \
   --region $REGION \
-  --memory 512Mi --cpu 1 --task-timeout 300 --max-retries 1 \
+  --memory 512Mi --cpu 1 --task-timeout 300 --max-retries 2 \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest,BEYOND_PAT=beyond-pat-dwh:latest \
   --service-account $SA \
   --project $PROJECT \
@@ -124,7 +124,7 @@ echo "🚀 Déploiement du job confluence-rules-sync (pages vivantes Confluence,
 gcloud run jobs deploy confluence-rules-sync \
   --image $IMAGE \
   --region $REGION \
-  --memory 512Mi --cpu 1 --task-timeout 300 --max-retries 1 \
+  --memory 512Mi --cpu 1 --task-timeout 300 --max-retries 2 \
   --command python \
   --args="-m,utils.confluence_sync" \
   --service-account $SA \
