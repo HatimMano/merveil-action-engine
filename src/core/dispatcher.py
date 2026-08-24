@@ -124,25 +124,58 @@ class TriggerDispatcher:
     # ── Étape 2 : Charger triggers + dispatched_actions ouvertes ────────────
 
     def _load_triggers(self) -> list[dict]:
-        """Charge les triggers détectés dans les dernières 24h.
+        """Charge les triggers ARRIVÉS EN BASE dans les dernières 24h.
 
         ⚠ `action_engine.triggers` est incrémental (append-only, dedup par
         trigger_id = HASH(name+property+DATE(detected_at))) → la table accumule
         TOUT l'historique. Sans borne temporelle, chaque run rechargeait des
         milliers de triggers anciens dont le dispatched_action avait expiré (TTL),
-        donc renvoyés en masse à chaque digest (~1000 alertes/run).
+        donc renvoyés en masse à chaque digest (~1000 alertes/run). D'où une borne.
 
-        Fenêtre 24h : un trigger persistant produit une ligne fraîche par jour
-        (dedup à la journée), donc reste capté ; la borne ≤ TTL daily (24h) évite
-        de renvoyer deux fois la même occurrence d'un jour à l'autre.
+        ⭐ Mais la borne portait sur `detected_at`, c'est-à-dire sur la date de
+        l'ÉVÉNEMENT — pas sur le moment où le DWH l'a su. Or plusieurs triggers
+        ANTIDATENT volontairement `detected_at` (date de l'avis, de l'annulation…),
+        et la chaîne met des heures à les faire remonter. Un trigger dont la donnée
+        arrivait plus de 24 h après l'événement n'était donc JAMAIS chargé — pas
+        dédupliqué, pas expiré : jamais lu.
+
+        Mesuré le 21/08, et ce n'est pas un cas de bord :
+          · `satisfaction_low_review` — **19 détectés, 0 envoyés depuis toujours**.
+            Il pose `detected_at = TIMESTAMP(review_date)` = minuit UTC, et le daily
+            tourne à 07:00 UTC → il fallait que l'avis soit en base moins de 7 h
+            après minuit. Lag réel mesuré : 12 h minimum, 35 h en moyenne. 0/19
+            est mécanique.
+          · `cancellation_large_apt` — séparation parfaite : les 22 arrivés en < 24 h
+            sont tous partis, les 7 arrivés après (32 h à 104 h) sont tous perdus.
+
+        La fenêtre porte donc sur `_dbt_loaded_at` (écrit une fois à l'INSERT, jamais
+        réécrit : le modèle est insert-only via `NOT IN (SELECT trigger_id FROM this)`).
+        Comme `_dbt_loaded_at >= detected_at` toujours, c'est un SUR-ENSEMBLE strict de
+        l'ancien filtre — ça ne peut qu'ajouter, jamais retirer. Impact rejoué sur
+        30 j de runs : **+35 lignes** (25 satisfaction, 7 cancellation_large_apt,
+        3 cancellation_vip), soit ~1/jour.
+
+        ⚠ La borne 7 j sur `detected_at` est le garde-fou `--full-refresh` : un
+        rebuild complet remettrait TOUS les `_dbt_loaded_at` à maintenant, et sans
+        elle on redispatcherait tout l'historique. Avec elle le blast est borné à
+        une semaine, et la dédup `open` l'absorbe. NE PAS la retirer.
+
+        ⚠ Pas de double envoi possible : dédup par `trigger_id` côté
+        `dispatched_actions`, et `_dbt_loaded_at` ne bouge jamais sur une ligne
+        existante → une ligne n'est dans la fenêtre qu'une seule fois.
+
+        ⚠ Forward-only : les lignes historiques ont un `_dbt_loaded_at` trop vieux,
+        elles ne partiront pas rétroactivement (elles restent lisibles au dashboard).
         """
         query = f"""
             SELECT * FROM `{TRIGGERS_TABLE}`
-            WHERE detected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+            WHERE _dbt_loaded_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+              AND detected_at    >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
             ORDER BY detected_at
         """
         rows = list(self.bq.query(query).result())
-        logger.info(f"{len(rows)} trigger(s) chargé(s) (24h) depuis action_engine.triggers")
+        logger.info(f"{len(rows)} trigger(s) chargé(s) (arrivés en base < 24h) "
+                    f"depuis action_engine.triggers")
         return [dict(r) for r in rows]
 
     def _load_open_dispatches(self) -> set[tuple[str, str, str]]:

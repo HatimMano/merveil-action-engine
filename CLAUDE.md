@@ -186,10 +186,18 @@ Le job lit `FREQ` au démarrage. **FREQ absent/vide = CRITICAL + exit(1)** (fail
 
 | FREQ value | Triggered by |
 |---|---|
-| `4h` | Cloud Scheduler every 4 hours |
-| `daily` | Cloud Scheduler daily at 07:00 |
-| `weekly` | Cloud Scheduler every Monday at 08:00 |
-| `monthly` | Cloud Scheduler 1st of month at 08:00 |
+⚠️ **Horaires relevés sur les schedulers le 2026-08-24, PAS recopiés de la doc** — deux d'entre eux
+sont en `Etc/UTC` et la table les présentait comme des heures locales. Ce n'est pas cosmétique : le
+décalage de 2 h est exactement ce qui a fait que `satisfaction_low_review` n'a **jamais** envoyé un
+seul mail (fenêtre du dispatcher ancrée sur un `detected_at` antidaté à minuit UTC, cf. la docstring
+de `_load_triggers`). Toujours lire `gcloud scheduler jobs describe <job> --location=europe-west1`.
+
+| FREQ value | Triggered by | Cron | TZ | Heure Paris |
+|---|---|---|---|---|
+| `4h` | `merveil-action-engine-4h` | `30 6,10,14,18,22 * * *` | Europe/Paris | 06:30 · 10:30 · 14:30 · 18:30 · 22:30 |
+| `daily` | `merveil-action-engine-daily` | `0 7 * * *` | **Etc/UTC** | **09:00** (⚠ pas 07:00) |
+| `weekly` | `merveil-action-engine-weekly` | `0 8 * * 1` | **Etc/UTC** | **10:00 lundi** (⚠ pas 08:00) |
+| `monthly` | — | — | — | ⚠ **aucun scheduler n'existe** : le FREQ est géré par le code mais n'est déclenché par rien |
 | (not set) | ⛔ **CRITICAL + exit(1) depuis 2026-07-02** — sans FREQ, le dispatcher bufferisait les digests puis les jetait (`run(freq=None)` ne flush jamais) = alertes muettes silencieuses (typiquement après un deploy qui écrase les env vars). L'ancien "runs all rules" décrivait le legacy ActionRunner supprimé en Phase E. Exécution manuelle : toujours passer un FREQ explicite. |
 
 ### Cloud Scheduler setup
