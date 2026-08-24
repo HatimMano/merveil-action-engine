@@ -358,6 +358,20 @@ triggers:
       - type: email_digest
         bucket: daily
 
+  # Code DWH accepté par Sofia mais jamais écrit dans la serrure (rule_state
+  # NOT_UPDATED > 12 h) alors que le séjour approche — le client tapera un code
+  # que la serrure ne connaît pas. Né de l'incident 23-24/08 (iseo-vision §12) :
+  # 7 séjours touchés depuis le 08/08 sans une alerte, personne ne lisait
+  # `rule_state`, le seul accusé d'écriture en serrure. Bucket daily : c'est une
+  # panne à réparer (resync / gateway), pas un événement à intercepter — le
+  # property_id journalier du trigger assure un rappel par jour jusqu'à
+  # résolution, et la RC a le repli immédiat (codes fixes, 6.1).
+  iseo_code_non_propage:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
   iseo_etl_stale:
     enabled: true
     actions:
