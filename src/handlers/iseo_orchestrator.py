@@ -156,7 +156,12 @@ ISEO_HOLD_ALERT_TO = os.getenv("ISEO_HOLD_ALERT_TO", "") or ISEO_ALERT_TO
 # ⚠ Ne s'applique qu'aux codes NOUVELLEMENT provisionnés : `_resa_to_resync` ne
 # détecte qu'un drift de DATES, pas d'heures, et le cache ne stocke pas les heures
 # → le stock existant garde 13 h/19 h jusqu'à son archivage (~1 semaine).
-DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "16:00")
+# ⚠ 13:00, PAS 16:00 — décision Hatim 24/08. Le commit du 18/08 (« alignée sur les
+# horaires contractuels ») avait basculé à 16 h : contractuel ne veut pas dire vécu —
+# un client qui arrive à 14 h 30 avec un early check-in accordé oralement tapait un
+# code mort. 13 h = marge d'une heure sur le CI contractuel, et l'ETA déclarée au
+# pre-checkin ouvre plus tôt encore si besoin (`_earliest_hour`, plancher 07:00).
+DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "13:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "11:00")
 PIN_COLLISION_RETRIES = 8
 
