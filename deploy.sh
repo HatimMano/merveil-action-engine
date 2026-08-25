@@ -90,6 +90,15 @@ echo "🚀 Déploiement du job iseo-orchestrator (pipeline V3 100% DWH — natif
 #       847cac7d-4030-4c3d-84fa-b1d201078a1f,3cc98d6e-294c-43df-848b-b16f0079821c,
 #       fb06038d-3d4a-4910-b7f7-b16f0079821c,f88ab4e0-16ed-4f5c-965f-b16f0079821c,
 #       db56b3ca-1462-46ec-aaee-b16f0079821c
+#   - ⭐ FENÊTRE DU CODE (25/08) : ouverture = min(politique Duve, early check-in
+#     ACHETÉ, ISEO_DEFAULT_CI_HOUR=13:00), plancher 07:00 · fermeture =
+#     max(politique, ISEO_LATE_CO_HOUR=18:00 si late check-out acheté,
+#     ISEO_DEFAULT_CO_HOUR=11:00), plafond 23:59. L'early check-in acheté vient de
+#     `fct_reservations.purchased_early_checkin_hour` (Duve order events) — avant,
+#     seule la POLITIQUE annoncée était lue : 12 des 15 early check-ins tombés sur un
+#     appart intégré avaient un code qui n'ouvrait pas à l'heure payée.
+#     ⚠ ISEO_LATE_CO_HOUR n'est PAS lu dans la donnée : Duve ne transmet pas l'heure
+#     prolongée. 18:00 = la promesse produit (arbitrage Hatim 21/08).
 gcloud run jobs deploy merveil-action-engine-iseo \
   --image $IMAGE \
   --region $REGION \
@@ -97,7 +106,7 @@ gcloud run jobs deploy merveil-action-engine-iseo \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest,ISEO_MANAGER_USERNAME=iseo-manager-username:latest,ISEO_MANAGER_PASSWORD=iseo-manager-password:latest,DUVE_CONNECT_TOKEN=duve-connect-token:latest \
   --service-account $SA \
   --project $PROJECT \
-  --set-env-vars "^;^GCP_PROJECT_ID=$PROJECT;FREQ=iseo_orchestrator;ISEO_SHADOW_MODE=false;DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18;GMAIL_SENDER=noreply@archides.fr;ISEO_ALERT_TO=hatim@archides.fr;ISEO_HOLD_MODE=${ISEO_HOLD_MODE:-observe};ISEO_HOLD_LEAD_HOURS=${ISEO_HOLD_LEAD_HOURS:-72};ISEO_HOLD_ALERT_TO=${ISEO_HOLD_ALERT_TO:-hatim@archides.fr};ISEO_ALLOWED_PROPERTY_IDS=e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,ed0d0ccd-d5a0-4cbf-9f6f-b1d20103b89f,70edbca0-6abb-4bae-bd89-b16f0079821c,aa37778e-7257-40ad-9b5c-b16f0079821c,3cc98d6e-294c-43df-848b-b16f0079821c,880c9419-8e25-4740-b8c3-b1c200b95203"
+  --set-env-vars "^;^GCP_PROJECT_ID=$PROJECT;FREQ=iseo_orchestrator;ISEO_SHADOW_MODE=false;DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18;GMAIL_SENDER=noreply@archides.fr;ISEO_ALERT_TO=hatim@archides.fr;ISEO_HOLD_MODE=${ISEO_HOLD_MODE:-observe};ISEO_HOLD_LEAD_HOURS=${ISEO_HOLD_LEAD_HOURS:-72};ISEO_HOLD_ALERT_TO=${ISEO_HOLD_ALERT_TO:-hatim@archides.fr};ISEO_LATE_CO_HOUR=${ISEO_LATE_CO_HOUR:-18:00};ISEO_ALLOWED_PROPERTY_IDS=e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,ed0d0ccd-d5a0-4cbf-9f6f-b1d20103b89f,70edbca0-6abb-4bae-bd89-b16f0079821c,aa37778e-7257-40ad-9b5c-b16f0079821c,3cc98d6e-294c-43df-848b-b16f0079821c,880c9419-8e25-4740-b8c3-b1c200b95203"
 
 echo "🚀 Déploiement du job beyond-push (fenêtres prix gaps 1N, daily 10h45)..."
 # Notes :

@@ -68,6 +68,8 @@ DUVE_CHECKIN_STG_TABLE = os.environ.get(
     "DUVE_CHECKIN_STG_TABLE", "merveil-data-warehouse.staging.stg_duve__checkin_events")
 MEWS_FCT_TABLE = os.environ.get(
     "MEWS_FCT_TABLE", "merveil-data-warehouse.marts.fct_reservations")
+ISEO_DEVICES_STG_TABLE = os.environ.get(
+    "ISEO_DEVICES_STG_TABLE", "merveil-data-warehouse.staging.stg_iseo__standard_devices")
 MEWS_PAYMENTS_TABLE = os.environ.get(
     "MEWS_PAYMENTS_TABLE", "merveil-data-warehouse.staging.stg_mews__payments")
 MEWS_ORDER_ITEMS_TABLE = os.environ.get(
@@ -163,6 +165,11 @@ ISEO_HOLD_ALERT_TO = os.getenv("ISEO_HOLD_ALERT_TO", "") or ISEO_ALERT_TO
 # pre-checkin ouvre plus tôt encore si besoin (`_earliest_hour`, plancher 07:00).
 DEFAULT_CI_HOUR = os.environ.get("ISEO_DEFAULT_CI_HOUR", "13:00")
 DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "11:00")
+# Heure de fin de fenêtre quand un LATE CHECK-OUT a été acheté via Duve.
+# ⚠ Ce n'est PAS une valeur lue dans la donnée : Duve ne transmet pas l'heure
+# prolongée (`delivery_at` vaut l'heure standard 11 h sur 10 des 11 orders
+# mesurés le 25/08). 18:00 = ce que promet le produit (arbitrage Hatim 21/08).
+LATE_CO_HOUR = os.environ.get("ISEO_LATE_CO_HOUR", "18:00")
 PIN_COLLISION_RETRIES = 8
 
 
@@ -398,6 +405,10 @@ _STAYS_CTE = f"""
       SELECT m.reservation_id, m.reservation_number, m.customer_id, m.customer_name,
              m.resource_id, m.checkin_date, m.checkout_date,
              m.earliest_checkin_hour, m.latest_checkout_hour,
+             -- Services d'arrivée/départ ACHETÉS (≠ les 2 heures ci-dessus, qui
+             -- sont la politique annoncée au pré-checkin).
+             m.purchased_early_checkin_hour,
+             COALESCE(m.has_purchased_late_checkout, FALSE) AS has_purchased_late_checkout,
              lk.lock_id, lk.lock_tag_id, lk.apartment_code,
              COALESCE(lk.gateway_dead, FALSE)                            AS gateway_dead,
              -- Gate volontaire : on ne provisionne PAS tant qu'une carte a été refusée
@@ -467,6 +478,13 @@ _STAYS_CTE = f"""
         MAX(checkout_date)        AS stay_co,
         ARRAY_AGG(earliest_checkin_hour ORDER BY checkin_date)[SAFE_OFFSET(0)]       AS earliest_checkin_hour,
         ARRAY_AGG(latest_checkout_hour  ORDER BY checkout_date DESC)[SAFE_OFFSET(0)] AS latest_checkout_hour,
+        -- ⚠ MIN / LOGICAL_OR et non « la 1re / la dernière résa du stay » : sur un
+        -- back-to-back l'early check-in est acheté sur la 1re résa et le late
+        -- check-out sur la dernière, mais rien ne garantit que Duve rattache
+        -- l'achat au bon membre. Prendre le plus favorable ne fait qu'élargir une
+        -- fenêtre déjà payée ; le rater laisse un client à la porte.
+        MIN(purchased_early_checkin_hour)                                            AS purchased_early_checkin_hour,
+        LOGICAL_OR(has_purchased_late_checkout)                                      AS has_purchased_late_checkout,
         CAST(ARRAY_AGG(reservation_number ORDER BY checkin_date)[SAFE_OFFSET(0)] AS STRING) AS mews_reservation_number,
         ARRAY_AGG(payment_unpaid ORDER BY checkin_date)[SAFE_OFFSET(0)]              AS payment_unpaid,
         -- Pire cas du stay : chaque membre porte l'encaissé du COMPTE, donc sommer
@@ -499,6 +517,7 @@ _STAYS_CTE = f"""
         resource_id            AS duve_property_id,
         customer_name, apartment_code, lock_id, lock_tag_id, gateway_dead,
         stay_ci, stay_co, earliest_checkin_hour, latest_checkout_hour,
+        purchased_early_checkin_hour, has_purchased_late_checkout,
         mews_reservation_number, payment_unpaid, balance_due, min_lead_hours,
         direct_last_minute, direct_unpaid,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)                 AS member_duve_ids,
@@ -506,7 +525,8 @@ _STAYS_CTE = f"""
       FROM stay_duve
       GROUP BY customer_id, resource_id, island_id, duve_property_id, customer_name,
                apartment_code, lock_id, lock_tag_id, gateway_dead, stay_ci, stay_co,
-               earliest_checkin_hour, latest_checkout_hour, mews_reservation_number,
+               earliest_checkin_hour, latest_checkout_hour, purchased_early_checkin_hour,
+               has_purchased_late_checkout, mews_reservation_number,
                payment_unpaid, balance_due, min_lead_hours, direct_last_minute,
                direct_unpaid
     )"""
@@ -529,6 +549,7 @@ def _resa_to_provision() -> list[dict]:
       s.customer_name, s.mews_reservation_number,
       s.stay_ci AS checkin_date, s.stay_co AS checkout_date,
       s.earliest_checkin_hour, s.latest_checkout_hour,
+      s.purchased_early_checkin_hour, s.has_purchased_late_checkout,
       s.payment_unpaid, s.member_duve_ids, s.balance_due,
       s.min_lead_hours, s.direct_last_minute, s.direct_unpaid
     FROM stays s
@@ -754,6 +775,18 @@ def _resa_to_resync() -> list[dict]:
              checkin_date AS cache_ci, checkout_date AS cache_co
       FROM `{PIN_CACHE_TABLE}`
       WHERE archived_at IS NULL AND provisioned_at IS NOT NULL
+    ),
+    -- Fenêtre RÉELLEMENT posée en serrure, telle que la voit le snapshot ISEO
+    -- (fraîcheur ~2 h ETL + ~2 h dbt). Sert UNIQUEMENT à repérer des candidats :
+    -- `_resync` re-lit le credential en direct avant d'écrire quoi que ce soit,
+    -- donc une ligne déjà corrigée mais encore périmée au snapshot ne produit
+    -- qu'un GET sans effet.
+    cred AS (
+      SELECT duve_reservation_id, active_from, active_to
+      FROM `{ISEO_DEVICES_STG_TABLE}`
+      WHERE duve_reservation_id IS NOT NULL AND pin_origin = 'merveil_dwh'
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY duve_reservation_id ORDER BY snapshot_at DESC) = 1
     )
     SELECT
       c.duve_reservation_id, c.pin_value, c.iseo_device_id, c.iseo_invitation_id,
@@ -762,11 +795,25 @@ def _resa_to_resync() -> list[dict]:
       c.mews_reservation_number, c.apartment_code,
       s.duve_property_id, s.customer_name,
       s.stay_ci AS live_ci, s.stay_co AS live_co,
-      s.earliest_checkin_hour, s.latest_checkout_hour, s.member_duve_ids,
+      s.earliest_checkin_hour, s.latest_checkout_hour,
+      s.purchased_early_checkin_hour, s.has_purchased_late_checkout, s.member_duve_ids,
       s.min_lead_hours, s.direct_last_minute, s.direct_unpaid, s.balance_due
     FROM cache c
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
+    LEFT JOIN cred cr ON cr.duve_reservation_id = c.duve_reservation_id
     WHERE s.stay_ci != c.cache_ci OR s.stay_co != c.cache_co OR c.iseo_invitation_id IS NULL
+       -- ⭐ Drift d'HEURES : un service d'arrivée/départ acheté APRÈS le
+       -- provisioning (J-3) ne déplace AUCUNE date — les 3 conditions ci-dessus
+       -- sont aveugles à ce cas, qui est précisément le plus fréquent (l'achat
+       -- se fait quand l'arrivée approche). On compare donc l'heure achetée à
+       -- l'heure réellement posée en serrure.
+       OR (s.purchased_early_checkin_hour IS NOT NULL
+           AND cr.active_from IS NOT NULL
+           AND FORMAT_TIME('%H:%M', TIME(cr.active_from, 'Europe/Paris'))
+               > s.purchased_early_checkin_hour)
+       OR (s.has_purchased_late_checkout
+           AND cr.active_to IS NOT NULL
+           AND FORMAT_TIME('%H:%M', TIME(cr.active_to, 'Europe/Paris')) < '{LATE_CO_HOUR}')
     ORDER BY s.stay_ci
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
@@ -898,6 +945,38 @@ def _hm_to_min(h: Optional[str]) -> Optional[int]:
 
 WINDOW_FLOOR_CI = "07:00"
 WINDOW_CEIL_CO = "23:59"
+
+
+def _min_hm(*hours: Optional[str]) -> Optional[str]:
+    """La plus TÔT des heures fournies (NULL ignorés). Sert à faire entrer l'early
+    check-in ACHETÉ dans le même calcul que l'heure de politique annoncée."""
+    vals = [h[:5] for h in hours if h and _hm_to_min(h) is not None]
+    return min(vals, key=lambda h: _hm_to_min(h)) if vals else None
+
+
+def _max_hm(*hours: Optional[str]) -> Optional[str]:
+    vals = [h[:5] for h in hours if h and _hm_to_min(h) is not None]
+    return max(vals, key=lambda h: _hm_to_min(h)) if vals else None
+
+
+def _stay_hours(row: dict) -> tuple[str, str]:
+    """Fenêtre horaire du séjour : min(politique, early check-in acheté, 13:00) →
+    max(politique, 18:00 si late check-out acheté, 11:00).
+
+    ⭐ La 2e entrée est la correction du 25/08 : jusque-là seul
+    `earliest_checkin_hour` était lu — une heure de POLITIQUE Duve, jamais l'heure
+    NÉGOCIÉE. Un client ayant payé 140 € pour entrer à 9 h avait un code qui
+    n'ouvrait qu'à 13 h (12 cas sur 15 mesurés sur les apparts intégrés).
+    ⚠ La fenêtre ne peut que s'ÉLARGIR : le plancher 07:00 et le plafond 23:59
+    tiennent, et un early check-in acheté APRÈS 13 h ne repousse pas l'ouverture."""
+    ci = _earliest_hour(
+        _min_hm(row.get("earliest_checkin_hour"), row.get("purchased_early_checkin_hour")),
+        DEFAULT_CI_HOUR)
+    co = _latest_hour(
+        _max_hm(row.get("latest_checkout_hour"),
+                LATE_CO_HOUR if row.get("has_purchased_late_checkout") else None),
+        DEFAULT_CO_HOUR)
+    return ci, co
 
 
 def _earliest_hour(policy: Optional[str], default: str) -> str:
@@ -1138,8 +1217,7 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     if ci_date is None or co_date is None:
         return False, "missing CI/CO date"
     ci_str, co_str = str(ci_date), str(co_date)
-    ci_hour = _earliest_hour(row.get("earliest_checkin_hour"), DEFAULT_CI_HOUR)
-    co_hour = _latest_hour(row.get("latest_checkout_hour"), DEFAULT_CO_HOUR)
+    ci_hour, co_hour = _stay_hours(row)
     ci_ms, co_ms = _build_window_ms(ci_str, co_str, ci_hour, co_hour)
     if co_ms < int(time.time() * 1000):
         return False, "skipped: checkout déjà passé (sera archivé demain)"
@@ -1266,6 +1344,62 @@ def _get_or_create_device(row: dict, pin_ext: str, win: dict) -> tuple[Optional[
     return _post_device(row, pin_ext, win)
 
 
+def _put_device_window(dev: dict, win: dict) -> tuple[bool, Optional[str]]:
+    """Déplace la fenêtre d'un device EXISTANT, en place. Validé en prod le 21/08
+    (cas LaBrash) et re-vérifié le 25/08 en no-op : HTTP 201, même enregistrement,
+    même PIN.
+
+    ⭐ Pourquoi PUT plutôt que le DELETE + re-POST historique : le code ne
+    disparaît jamais, même une seconde. Le delete+recreate ouvre une fenêtre de
+    lockout si le POST échoue — et il n'a d'intérêt que quand le device n'existe
+    pas encore.
+
+    ⚠ Asymétrie du DTO Sofia : l'entrée attend `lockTagIds`/`guestTagIds`
+    (SINGULIER « Tag »), alors que le GET renvoie les tags en objets
+    `lockTags[].id` / `guestTags[].id` et laisse `lockTagsIds`/`guestTagsIds`
+    (pluriel) à NULL. Reconstruire depuis les objets, pas depuis les champs ids."""
+    cr = dev.get("credentialRule") or {}
+    body = {
+        "type": dev.get("type"), "extId": dev.get("extId"), "notes": dev.get("notes"),
+        "deviceId": dev.get("deviceId"),
+        "validationMode": dev.get("validationMode"),
+        "validationPeriod": dev.get("validationPeriod"),
+        "additionalCredentialRules": [],
+        "credentialRule": {
+            "name": cr.get("name"), "description": cr.get("description"),
+            "lockTagIds": [t["id"] for t in (cr.get("lockTags") or [])],
+            "lockTagMatchingMode": cr.get("lockTagMatchingMode"),
+            "guestTagIds": [t["id"] for t in (cr.get("guestTags") or [])],
+            "guestTagMatchingMode": cr.get("guestTagMatchingMode"),
+            "daysOfTheWeek": cr.get("daysOfTheWeek"),
+            "dateInterval": win, "timeInterval": cr.get("timeInterval"),
+            "alwaysOpen": cr.get("alwaysOpen"), "holidays": cr.get("holidays"),
+            "openOnPrivacy": cr.get("openOnPrivacy")},
+    }
+    r = _sofia("PUT", f"/api/v2/standardDevices/{dev.get('id')}", json_body=body)
+    if r.status_code in (200, 201):
+        return True, None
+    return False, f"PUT device {r.status_code}: {r.text[:200]}"
+
+
+def _put_invitation_window(inv: dict, win: dict) -> tuple[bool, Optional[str]]:
+    """Déplace la fenêtre d'une invitation existante. ⭐ Le CODE est conservé
+    (vérifié 25/08) — donc le lien remote-open déjà parti dans un message Duve
+    reste valide. Le DELETE + recréation, lui, tuait ce lien : les messages Duve
+    envoyés sont figés, le client gardait un lien mort."""
+    body = {
+        "name": inv.get("name"), "extId": inv.get("extId"),
+        "smartLockIds": [l["id"] for l in (inv.get("smartLocks") or [])],
+        "daysOfTheWeek": inv.get("daysOfTheWeek"),
+        "dateInterval": win, "timeInterval": inv.get("timeInterval"),
+        "numberOfDevices": inv.get("numberOfDevices") or 0,
+    }
+    r = _sofia("PUT", f"/api/v2/invitations/{inv.get('id')}", json_body=body)
+    if r.status_code in (200, 201):
+        return True, None
+    return False, f"PUT invitation {r.status_code}: {r.text[:200]}"
+
+
 def _get_or_create_invitation(row: dict, inv_ext: str, win: dict) -> tuple[Optional[int], Optional[str]]:
     g = _sofia("GET", f"/api/v2/invitations/extId/{inv_ext}")
     if g.status_code == 200:
@@ -1342,8 +1476,7 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
         return False, "skipped: whitelist"
 
     ci_str, co_str = str(row["live_ci"]), str(row["live_co"])
-    ci_hour = _earliest_hour(row.get("earliest_checkin_hour"), DEFAULT_CI_HOUR)
-    co_hour = _latest_hour(row.get("latest_checkout_hour"), DEFAULT_CO_HOUR)
+    ci_hour, co_hour = _stay_hours(row)
     ci_ms, co_ms = _build_window_ms(ci_str, co_str, ci_hour, co_hour)
     if co_ms < int(time.time() * 1000):
         return False, "skipped: checkout passé (sera archivé)"
@@ -1367,36 +1500,67 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     pin_ext = f"MERVEIL_RESA - {duve_resa_id}"
     inv_ext = f"MERVEIL_INV - {duve_resa_id}"
 
-    # Drift de dates ? Sinon on est ici pour réparer une invitation manquante → NE PAS
-    # toucher au device (éviter une fenêtre de lockout ≤2h si le re-POST échoue après
-    # le DELETE, et le churn Sofia). Le device n'a besoin d'être refait que si la window
-    # a changé.
-    has_drift = (str(row["live_ci"]) != str(row.get("cache_ci"))
-                 or str(row["live_co"]) != str(row.get("cache_co")))
+    # ⭐ La fenêtre cible se compare à ce que Sofia porte RÉELLEMENT, pas au cache :
+    # le cache ne stocke que les DATES, jamais les heures. Un early check-in acheté
+    # après le provisioning (le cas LaBrash : acheté à J-2, code posé à J-3) ne
+    # déplace aucune date — il ne serait jamais rattrapé par une comparaison de cache.
+    g = _sofia("GET", f"/api/v2/standardDevices/extId/{pin_ext}")
+    if g.status_code not in (200, 404):
+        return False, f"resync device GET {g.status_code}"
+    dev = g.json() if g.status_code == 200 else None
+    live_win = ((dev or {}).get("credentialRule") or {}).get("dateInterval") or {}
+    window_drift = dev is not None and (
+        int(live_win.get("from") or 0) != ci_ms or int(live_win.get("to") or 0) != co_ms)
 
-    if has_drift:
-        # 1. DELETE device puis re-POST avec la window live (même code PIN).
-        g = _sofia("GET", f"/api/v2/standardDevices/extId/{pin_ext}")
-        if g.status_code == 200:
-            rd = _sofia("DELETE", f"/api/v2/standardDevices/{g.json().get('id')}")
-            if rd.status_code not in (200, 204):
-                return False, f"resync device DELETE {rd.status_code}"
-        elif g.status_code != 404:
-            return False, f"resync device GET {g.status_code}"
+    if dev is None:
+        # Device absent côté Sofia (supprimé à la main, ou POST jamais abouti) :
+        # seul cas qui justifie un re-POST. Même code PIN si possible.
         pin_value, device_id = _post_device(row, pin_ext, win, pin_value=row.get("pin_value"))
         if pin_value is None:
             return False, f"resync device re-POST failed: {device_id}"
+    elif window_drift:
+        logger.info(
+            f"↔️ window drift {duve_resa_id} ({row.get('apartment_code')}) → "
+            f"{ci_str} {ci_hour} → {co_str} {co_hour}"
+            + (f" [early check-in acheté {row.get('purchased_early_checkin_hour')}]"
+               if row.get("purchased_early_checkin_hour") else "")
+            + (" [late check-out acheté]" if row.get("has_purchased_late_checkout") else ""))
+        pin_value, device_id = str(dev.get("deviceId")), dev.get("id")
+        ok, perr = _put_device_window(dev, win)
+        if not ok:
+            # Repli sur l'ancien chemin (DELETE + re-POST). Il rouvre la fenêtre de
+            # lockout que le PUT évite, mais mieux vaut ça qu'une fenêtre périmée.
+            logger.warning(f"⚠️ PUT device KO ({perr}) → repli delete+recreate")
+            rd = _sofia("DELETE", f"/api/v2/standardDevices/{dev.get('id')}")
+            if rd.status_code not in (200, 204):
+                return False, f"resync device DELETE {rd.status_code}"
+            pin_value, device_id = _post_device(row, pin_ext, win, pin_value=row.get("pin_value"))
+            if pin_value is None:
+                return False, f"resync device re-POST failed: {device_id}"
     else:
-        # Invitation-only : device intact (window déjà correcte), on garde son état cache.
-        pin_value, device_id = str(row.get("pin_value")), row.get("iseo_device_id")
+        # Fenêtre déjà bonne : on est ici pour réparer une invitation manquante.
+        pin_value, device_id = str(dev.get("deviceId")), dev.get("id")
 
-    # Invitation : DELETE l'ancienne (si présente) + recréer (nouveau code/lien). Sans la
-    # vérif du DELETE, un échec ferait réutiliser l'ancienne invitation (window périmée).
-    if row.get("iseo_invitation_id"):
-        ri = _sofia("DELETE", f"/api/v2/invitations/{int(row['iseo_invitation_id'])}")
-        if ri.status_code not in (200, 204, 404):
-            return False, f"resync invitation DELETE {ri.status_code}"
-    inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
+    # Invitation : même logique. ⭐ Le PUT conserve le CODE, donc le lien
+    # remote-open déjà parti dans un message Duve (figé) reste valide — le
+    # delete+recreate le tuait à chaque resync.
+    gi = _sofia("GET", f"/api/v2/invitations/extId/{inv_ext}")
+    inv = gi.json() if gi.status_code == 200 else None
+    inv_id = inv_code = None
+    if inv is not None:
+        inv_win = inv.get("dateInterval") or {}
+        if int(inv_win.get("from") or 0) != ci_ms or int(inv_win.get("to") or 0) != co_ms:
+            ok, ierr = _put_invitation_window(inv, win)
+            if not ok:
+                logger.warning(f"⚠️ PUT invitation KO ({ierr}) → repli delete+recreate")
+                ri = _sofia("DELETE", f"/api/v2/invitations/{inv.get('id')}")
+                if ri.status_code not in (200, 204, 404):
+                    return False, f"resync invitation DELETE {ri.status_code}"
+                inv = None
+        if inv is not None:
+            inv_id, inv_code = inv.get("id"), inv.get("code")
+    if inv_id is None:
+        inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
     link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
 
     # 3. Duve push (code identique, lien neuf) — à tous les duve du stay.
