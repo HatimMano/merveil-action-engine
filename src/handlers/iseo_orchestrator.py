@@ -596,6 +596,13 @@ def _whitelisted_gaps() -> list[dict]:
              -- pour un bruit qui se résout tout seul.
              WHEN COALESCE(lk.gateway_dead, FALSE) THEN 'gateway'
              WHEN d.duve_reservation_id IS NULL THEN 'precheckin'
+             -- ⚠ 'paiement' ne devrait plus JAMAIS sortir depuis le 25/08 : le gate
+             -- qui empêchait la création a été absorbé par la porte, donc une résa
+             -- impayée reçoit désormais son code comme les autres et n'est plus un
+             -- « trou ». La branche est conservée comme DÉTECTEUR DE RÉGRESSION —
+             -- si elle se remet à compter, c'est qu'un blocage a été réintroduit
+             -- quelque part avant la création. Ne pas la supprimer sans avoir
+             -- vérifié qu'elle est bien à zéro depuis plusieurs jours.
              WHEN COALESCE(pay.n_failed, 0) > 0
               AND COALESCE(pay.amount_charged, 0) <= 0
               AND COALESCE(pay.balance, 0) > 0 THEN 'paiement'
@@ -1060,13 +1067,37 @@ def _get_or_create_guest_user(duve_resa_id: str, guest_name: Optional[str]) -> t
 def _evaluate_hold(row: dict) -> Optional[str]:
     """Motif de rétention du code, ou None si le code peut partir chez le client.
 
-    Deux critères, tous deux restreints au canal DIRECT (recalibrage 15/08) :
+    ⭐ **UN SEUL ORGANE RETIENT** (refonte 25/08, cf. ADR). Le paiement était un
+    `skip` de `_provision` évalué AVANT cette fonction : il empêchait la CRÉATION du
+    code, donc la porte n'était jamais atteinte et la RC devait fabriquer un code à
+    la main le jour de l'arrivée (cas Liliana Goldwyn, 22/08). Désormais le code est
+    créé quoi qu'il arrive et le paiement n'est plus qu'un critère de rétention parmi
+    les autres — seul le push Duve est retenu, jamais la création.
+
+    ⚠ **Conséquence de la fusion : `ISEO_HOLD_MODE=off` désactive AUSSI le contrôle
+    paiement.** C'est le prix d'un organe unique et c'est voulu — mais le passer à
+    `off` ne se fait plus « juste pour couper la porte fraude ».
+
+    Trois critères. Les deux premiers restreints au canal DIRECT (recalibrage 15/08) :
       - réservé ≤ ISEO_HOLD_LEAD_HOURS (72 h) avant l'arrivée — ~12 résas/mois, c'est
         le critère qui porte la valeur : les 4 fraudes d'août sont toutes en direct,
         3 réservées le jour même et la 4ᵉ (Bossongo) à J-2 ;
       - solde restant dû > ISEO_HOLD_MIN_BALANCE, sur une résa posée ≤
         ISEO_HOLD_BALANCE_MAX_LEAD_HOURS avant l'arrivée (~6/mois, dont 2 déjà prises
         par le critère précédent).
+    Le troisième, TOUS CANAUX (ex-gate `payment_unpaid`) :
+      - carte refusée ET rien d'encaissé sur le compte ET solde positif — typiquement
+        une VCC Expedia/VRBO non chargeable avant le jour J.
+
+    ⚠ Ce troisième critère est le SEUL applicable hors direct, et c'est sûr parce
+    qu'il exige une **tentative refusée** (`n_failed > 0`) : une résa Booking/Airbnb
+    payée à l'OTA n'a aucun paiement dans Mews, donc ne le déclenche jamais. Ne PAS
+    le confondre avec `direct_unpaid`, qui se lit sur le solde seul et retiendrait
+    69 % des arrivées s'il était généralisé.
+
+    ⚠ « Retenu paiement » et « retenu fraude » sont deux gestes RC OPPOSÉS (relancer
+    l'encaissement vs vérifier une identité) — d'où le motif explicite dans le mail
+    et dans `hold_decisions.hold_reason`.
 
     ⚠ Ce second critère s'appelait « rien d'encaissé » et se lisait sur les paiements
     de la RÉSERVATION → il sonnait sur des séjours intégralement payés (cf. le piège
@@ -1098,6 +1129,10 @@ def _evaluate_hold(row: dict) -> Optional[str]:
         bal = row.get("balance_due")
         detail = f" ({bal:.0f} € restants)" if bal is not None else ""
         motifs.append(f"direct avec solde restant dû{detail}")
+    if row.get("payment_unpaid"):
+        bal = row.get("balance_due")
+        detail = f" ({bal:.0f} € dus)" if bal is not None else ""
+        motifs.append(f"paiement refusé, rien d'encaissé{detail}")
     return " + ".join(motifs) if motifs else None
 
 
@@ -1109,7 +1144,11 @@ def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
     peut pas l'y écrire sans casser `_resa_duve_retry`, qui filtre précisément dessus —
     un push Duve réellement raté ne serait alors plus jamais retenté. Cette table capture
     donc ce que le cache ne peut pas dire : les décisions en `observe`, et celles dont la
-    résa est ensuite skippée (whitelist/lock/paiement) et qui n'envoient aucun mail.
+    résa est ensuite skippée (whitelist/lock) et qui n'envoient aucun mail.
+
+    ⚠ `skipped:paiement` a disparu des `outcome` possibles le 25/08 — le paiement est
+    devenu un critère de la porte, plus un skip. Les lignes historiques le portent
+    encore ; ne pas les lire comme des rétentions, c'étaient des non-créations.
 
     Best-effort : une écriture ratée ne doit jamais faire échouer un provisioning.
     """
@@ -1119,12 +1158,12 @@ def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
           evaluated_at, phase, hold_mode, outcome,
           duve_reservation_id, duve_property_id, apartment_code, customer_name,
           mews_reservation_number, checkin_date, checkout_date,
-          hold_reason, direct_last_minute, direct_unpaid, min_lead_hours,
-          hold_lead_hours_setting, balance_due)
+          hold_reason, direct_last_minute, direct_unpaid, payment_unpaid,
+          min_lead_hours, hold_lead_hours_setting, balance_due)
         VALUES (CURRENT_TIMESTAMP(), @phase, @mode, @outcome,
           @duve, @pid, @apt, @name, @resa,
           SAFE_CAST(@ci AS DATE), SAFE_CAST(@co AS DATE),
-          @reason, @dlm, @du, @lead, @setting, @balance)
+          @reason, @dlm, @du, @pu, @lead, @setting, @balance)
         """
         params = [
             bigquery.ScalarQueryParameter("phase", "STRING", phase),
@@ -1144,6 +1183,7 @@ def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
             bigquery.ScalarQueryParameter("reason", "STRING", motif),
             bigquery.ScalarQueryParameter("dlm", "BOOL", bool(row.get("direct_last_minute"))),
             bigquery.ScalarQueryParameter("du", "BOOL", bool(row.get("direct_unpaid"))),
+            bigquery.ScalarQueryParameter("pu", "BOOL", bool(row.get("payment_unpaid"))),
             bigquery.ScalarQueryParameter(
                 "lead", "INT64",
                 int(row["min_lead_hours"]) if row.get("min_lead_hours") is not None else None),
@@ -1155,6 +1195,38 @@ def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
         _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
     except Exception as e:
         logger.warning(f"⚠️ hold_decisions : écriture échouée — {type(e).__name__}: {e}")
+
+
+def _hold_already_notified(duve_resa_id: str) -> bool:
+    """La RC a-t-elle DÉJÀ été prévenue d'une rétention sur cette réservation ?
+
+    ⚠ Garde-fou anti-boucle d'alerte, posé le 25/08 avec la fusion du gate paiement.
+    Le resync se garde de re-notifier via `row['cache_hold']` — mais en mode
+    `observe` le cache ne porte JAMAIS de `hold_reason` (cf. `_log_hold_decision`),
+    donc ce garde-fou est inopérant et chaque resync renvoyait le mail. Ça ne se
+    voyait pas tant que la porte ne retenait que ~12 résas directes/mois ; en y
+    versant le paiement (tous canaux), le resync devient un émetteur régulier.
+
+    On interroge donc le journal, seule trace qui survit au mode `observe`. Coût :
+    une petite query, uniquement pour les résas effectivement retenues et non déjà
+    marquées en cache — quelques-unes par run au plus.
+
+    Best-effort volontairement ASYMÉTRIQUE : en cas d'erreur on renvoie False, donc
+    on notifie. Rater une alerte de rétention coûte un client devant une porte ;
+    envoyer un doublon coûte un mail.
+    """
+    try:
+        q = f"""
+        SELECT 1 FROM `{HOLD_DECISIONS_TABLE}`
+        WHERE duve_reservation_id = @duve AND hold_reason IS NOT NULL
+        LIMIT 1
+        """
+        cfg = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("duve", "STRING", duve_resa_id)])
+        return len(list(_bq().query(q, job_config=cfg).result())) > 0
+    except Exception as e:
+        logger.warning(f"⚠️ hold déjà notifié ? query KO — {type(e).__name__}: {e}")
+        return False
 
 
 def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
@@ -1209,8 +1281,16 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
         return False, "skipped: whitelist"
     if row.get("lock_tag_id") is None or row.get("lock_id") is None:
         return False, "skipped: lock non résolue"
-    if row.get("payment_unpaid"):
-        return False, "skipped: paiement non validé"
+    # ⚠ NE PAS RÉINTRODUIRE DE GATE DE JUGEMENT ICI (retiré le 25/08, cf. ADR).
+    # Il y avait `if row.get("payment_unpaid"): return False, "skipped: paiement non
+    # validé"`. Il court-circuitait la porte : aucun code n'était créé, donc rien à
+    # lire au dashboard, et la RC en fabriquait un à la main le jour de l'arrivée.
+    # Le paiement est désormais un critère de `_evaluate_hold` — seul le push Duve
+    # est retenu. Les seuls refus qui restent ici sont des PRÉREQUIS TECHNIQUES
+    # (whitelist, serrure non résolue, dates absentes, checkout passé) : sans eux
+    # l'appel Sofia n'a pas de sens. Tout ce qui relève d'un jugement métier va dans
+    # la porte, sinon on se retrouve avec deux organes qui retiennent et un seul qui
+    # alerte.
 
     ci_date = row.get("checkin_date")
     co_date = row.get("checkout_date")
@@ -1583,10 +1663,17 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     _save_resynced(duve_resa_id, ci_str, co_str, device_id, inv_id, inv_code, link, duve_ok,
                    member_csv=",".join(members),
                    hold_reason=hold if ISEO_HOLD_MODE == "on" else None)
+    # ⚠ ORDRE IMPORTANT : la question « a-t-on déjà prévenu ? » se pose AVANT
+    # d'écrire la décision de ce run, sinon la query voit la ligne qu'on vient de
+    # poser et le mail ne part JAMAIS. `cache_hold` ne suffit pas en mode `observe`
+    # (le cache n'y porte pas de `hold_reason`) — sans ce second garde-fou la RC
+    # reçoit le même mail à chaque resync. Cf. `_hold_already_notified`.
+    deja_notifie = bool(row.get("cache_hold")) or (
+        bool(hold) and _hold_already_notified(duve_resa_id))
     if hold:
         _log_hold_decision(row, hold, "resync",
                            "held" if ISEO_HOLD_MODE == "on" else "pushed_observe")
-    if hold and not row.get("cache_hold"):  # nouvelle rétention née du changement de dates
+    if hold and not deja_notifie:  # nouvelle rétention née du changement de dates
         _notify_hold(row, hold, suffix=" — après modification des dates")
     if hold and ISEO_HOLD_MODE == "on":
         logger.info(f"🔄 resync {duve_resa_id} window → {ci_str}→{co_str} (code retenu)")
