@@ -80,6 +80,9 @@ STD_DEVICES_TABLE = os.environ.get(
     "STD_DEVICES_TABLE", "merveil-data-warehouse.staging.stg_iseo__standard_devices")
 GATEWAYS_TABLE = os.environ.get(
     "GATEWAYS_TABLE", "merveil-data-warehouse.staging.stg_iseo__gateways")
+GATEWAY_PUSH_HEALTH_TABLE = os.environ.get(
+    "GATEWAY_PUSH_HEALTH_TABLE",
+    "merveil-data-warehouse.staging.stg_iseo__gateway_push_health")
 WHITELIST_TABLE = os.environ.get(
     "ISEO_WHITELIST_TABLE", "merveil-data-warehouse.staging.iseo_whitelisted_apartments")
 HOLD_DECISIONS_TABLE = os.environ.get(
@@ -294,10 +297,25 @@ _LOCKS_CTE = f"""
              -- provisioning repart au run suivant, 2 h après) ; pousser à tort met le
              -- client dehors. ⚠ Ne PAS aligner sur le seuil du trigger `iseo_gateway_offline`
              -- (72 h) : alerter et bloquer n'ont pas le même coût d'erreur.
+             -- ⭐⭐ TROISIÈME CONDITION, ajoutée le 25/08 (ADR) : `ph.push_stuck`.
+             -- Les deux tests ci-dessus lisent la CONNEXION de la passerelle, et
+             -- l'incident du 08-24/08 a montré que ça ne suffit pas : les six
+             -- passerelles fautives pinguaient toutes à la minute — donc vertes ici —
+             -- pendant que sept séjours recevaient un code que la serrure n'a jamais
+             -- appris. `P15-LAO4-0G` a tenu SEPT SEMAINES ainsi, et le garde-fou
+             -- qu'on avait posé le 19/08 précisément pour ce cas l'a laissé passer.
+             -- « Pingue » et « écrit encore les codes » sont deux questions
+             -- différentes ; seule la seconde nous intéresse. Le statut du dernier
+             -- push `CREDENTIALS_UPDATED` y répond (cf. `stg_iseo__gateway_push_health`).
+             -- ⚠ COALESCE à FALSE et pas à TRUE : tant que le flux ETL n'a pas tourné,
+             -- l'absence de mesure ne doit pas bloquer le parc entier — l'ancien
+             -- comportement reste le repli sûr.
              (g.gateway_id IS NULL
-              OR COALESCE(g.hours_since_last_connection, 1e9) >= 24) AS gateway_dead
+              OR COALESCE(g.hours_since_last_connection, 1e9) >= 24
+              OR COALESCE(ph.push_stuck, FALSE)) AS gateway_dead
       FROM `{SMART_LOCKS_TABLE}` l, UNNEST(JSON_QUERY_ARRAY(l.tags)) AS t
       LEFT JOIN `{GATEWAYS_TABLE}` g ON g.gateway_id = l.gateway_id
+      LEFT JOIN `{GATEWAY_PUSH_HEALTH_TABLE}` ph ON ph.gateway_id = l.gateway_id
       WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
     )"""
 
@@ -646,13 +664,18 @@ _GAP_REASONS = {
         "bg": "#fef2f2", "fg": "#dc2626",
     },
     "gateway": {
-        "label": "HyperGate hors ligne — intervention sur place",
-        "hint":  "La passerelle ne répond plus depuis > 24 h. Un code généré n'atteindrait "
-                 "PAS la serrure (elle ne les reçoit que par elle) et le client trouverait "
-                 "porte close — c'est ce qui a bloqué 4 clients dehors sur LAO4-0G entre le "
-                 "23/07 et le 12/08. On ne génère donc rien : Duve sert le code fixe, qui "
-                 "fonctionne. Se déplacer — une passerelle hors ligne ne se redémarre plus "
-                 "à distance.",
+        "label": "HyperGate qui n'écrit plus dans la serrure",
+        "hint":  "Un code généré n'atteindrait PAS la serrure (elle ne les reçoit que par "
+                 "la passerelle) et le client trouverait porte close — c'est ce qui a bloqué "
+                 "4 clients dehors sur LAO4-0G entre le 23/07 et le 12/08. On ne génère donc "
+                 "rien : Duve sert le code fixe, qui fonctionne. DEUX causes possibles, et "
+                 "elles n'appellent pas le même geste. (1) La passerelle ne répond plus "
+                 "depuis > 24 h → se déplacer, elle ne se redémarre plus à distance. "
+                 "(2) Elle répond mais son dernier push de codes n'a pas abouti → tenter "
+                 "d'abord `utils/iseo_unstick_gateway.py --gateway <id>` (redémarrage + "
+                 "réémission), ça a débloqué 8 passerelles sur 13 depuis le 24/08 ; si six "
+                 "tentatives échouent, escalader à Sofia. Le détail est dans le tab 7.7 et "
+                 "dans `docs/iseo-vision.md` §12.",
         "bg": "#fef2f2", "fg": "#dc2626",
     },
     "lock": {

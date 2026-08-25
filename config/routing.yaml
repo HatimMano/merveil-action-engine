@@ -397,6 +397,19 @@ triggers:
       - type: email_digest
         bucket: daily
 
+  # Passerelle qui RÉPOND au cloud mais n'écrit plus les codes dans ses serrures.
+  # ⚠ Ne fait PAS doublon avec `iseo_gateway_offline` : celui-ci lit la connexion,
+  # donc il attrape une passerelle débranchée. Les 6 passerelles de l'incident du
+  # 08-24/08 pinguaient toutes normalement — vertes pour lui — pendant que 7 séjours
+  # recevaient un code jamais écrit en serrure. Garder les deux.
+  # Bucket daily et pas 2h : une file de synchro coincée est un état PERSISTANT,
+  # le répéter 12×/jour apprend à ignorer l'expéditeur (leçon LAO4 du 20/08).
+  iseo_gateway_push_stuck:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
   # ── Trésorerie ────────────────────────────────────────────────────────────
   # Compte bancaire sous son seuil (seed treasury_thresholds). Le message propose
   # le montant à virer. Bucket daily (snapshot bancaire daily). N2 → N3.
