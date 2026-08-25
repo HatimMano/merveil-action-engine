@@ -1835,7 +1835,7 @@ def _run_inner() -> None:
     # 1b. Resync drift de dates (window cache ≠ dates live Mews)
     to_resync = _resa_to_resync()
     if to_resync:
-        logger.info(f"🔄 {len(to_resync)} résa(s) à resync (drift de dates)")
+        logger.info(f"🔄 {len(to_resync)} résa(s) à resync (drift de dates ou d'heures)")
     resynced = 0
     for row in to_resync:
         try:
