@@ -552,19 +552,20 @@ RULES = [
         # partir le code. Afficher « Actif » ferait croire que des codes sont déjà
         # retenus. À repasser en ("Green", "Actif") le jour du ISEO_HOLD_MODE=on.
         statut=("Yellow", "Alerte active · porte en observation"),
-        frequence="Immédiat (à la seconde où le client remplit son pre-checkin) · réévaluation toutes les 2 h",
+        frequence="Réévaluation toutes les 2 h (à chaque passage de l'orchestrateur)",
         canal="Mail ⚠️ / 🔒 → hatim@archides.fr (bascule vers la RC prévue avant l'activation complète)",
         owner="Emilia / RC (à confirmer)",
         depuis="15 août 2026 (après trois tentatives de fraude en trois jours)",
-        source="webhook-gateway (pre-checkin Duve, temps réel) · orchestrateur serrures (porte de validation) → iseo_raw.hold_decisions",
+        source="orchestrateur serrures (porte de validation) → iseo_raw.hold_decisions",
         dashboard_url="https://direction.archides.fr/ops-back?tab=pin_pipeline&view=hold",
         quoi=[
             "<strong>Le moment critique est le pre-checkin</strong> : c'est en le remplissant que le client "
             "fait apparaître son code d'accès — sur les fraudes d'août, il a été rempli 20 à 47 minutes "
             "après la réservation, en pleine soirée.",
-            "<strong>Alerte immédiate</strong> : arrivée le jour même + aucune pièce d'identité scannée → "
-            "mail en quelques secondes, pour que quelqu'un regarde la réservation <em>avant</em> l'arrivée. "
-            "Les quatre fraudes d'août cochaient toutes ces deux cases.",
+            "<strong>Il n'y a plus de mail « au fil de l'eau »</strong> (coupé le 24 août 2026) : il "
+            "signalait les arrivées du jour sans pièce d'identité scannée, soit ~36 par mois, alors qu'une "
+            "fausse pièce passe l'OCR — un cas est avéré chez nous. L'information vit désormais dans la "
+            "page <em>6.1 Préparation Arrivées</em>, où elle sert au triage sans réclamer un geste.",
             "<strong>Porte de validation</strong> : sur une réservation en direct de dernière minute, ou en "
             "direct avec un solde impayé significatif, le code est créé mais <strong>pas envoyé au "
             "client</strong> — la RC vérifie, puis le libère. ⚠ <strong>Mode observation aujourd'hui</strong> : "
@@ -689,11 +690,16 @@ RULES = [
             "<strong>Signaux forts</strong> — un seul suffit à passer au rouge : solde impayé significatif à "
             "quelques jours de l'arrivée · réservation directe de dernière minute · groupe de jeunes adultes.",
             "<strong>Signaux moyens</strong> — il en faut <strong>deux</strong> pour le rouge, un seul met en "
-            "ambre : échec de carte sur une réservation directe · réservation faite pour quelqu'un d'autre · "
-            "plus de personnes que la capacité · séjour local court le week-end · motif « célébration » · "
-            "solde impayé sur une arrivée encore lointaine.",
+            "ambre : échec de carte sur une réservation directe · <strong>réservation OTA faite moins de "
+            "48 h avant l'arrivée</strong> · réservation faite pour quelqu'un d'autre · plus de personnes que "
+            "la capacité · séjour local court le week-end · motif « célébration » · solde impayé sur une "
+            "arrivée encore lointaine.",
             "<strong>Signaux faibles</strong> — mettent en ambre, jamais en rouge à eux seuls : pre-checkin "
-            "toujours manquant la veille · nom du formulaire ≠ nom de la réservation.",
+            "toujours manquant la veille · nom du formulaire ≠ nom de la réservation (rapprochement "
+            "tolérant aux fautes de saisie et aux noms composés).",
+            "La <strong>pièce d'identité</strong> n'entre PAS dans le score : elle est affichée en 6.1 comme "
+            "information de triage (« sans pièce »), parce qu'un fraudeur peut en téléverser une fausse — "
+            "un filtre qu'il contrôle ne doit pas décider qui on regarde.",
             "Quand <strong>deux signaux de fraude ou plus</strong> se combinent, un mail part en parallèle — "
             "voir la règle « Fraude — usurpation d'identité & chargebacks » (space Serrures & accès).",
             "<strong>Le geste sur un rouge</strong> : ouvrir la fiche, vérifier paiement et identité, appeler "

@@ -551,7 +551,7 @@ _STAYS_CTE = f"""
 
 
 def _resa_to_provision() -> list[dict]:
-    """Stays à provisionner : fenêtre CI dans [today, today+LOOKAHEAD], CO futur,
+    """Stays à provisionner : fenêtre CI dans [today-1, today+LOOKAHEAD], CO futur,
     canonical_duve résolu, PAS déjà couvert par une row de cache active — ni par le
     canonical, ni par un member duve (évite un 2e device sur le même stay). Le
     `duve_reservation_id` renvoyé = le canonical (= identité Sofia du stay)."""
@@ -573,6 +573,17 @@ def _resa_to_provision() -> list[dict]:
     FROM stays s
     WHERE s.canonical_duve IS NOT NULL
       AND s.stay_ci <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
+      -- ⭐ Borne BASSE (25-26/08, ADR) : on ne CRÉE plus un code après le lendemain
+      -- de l'arrivée. Tant que le gate paiement bloquait la création, c'est
+      -- justement l'absence de borne qui rattrapait les résas débloquées le jour J
+      -- (cas Goldwyn 22/08) ; depuis que la création est inconditionnelle, le code
+      -- existe depuis J-3 et seul le push Duve reste à décider. En fabriquer un
+      -- nouveau en plein séjour n'ajoute qu'un code de plus — donc un élément de
+      -- quota Luckey de plus — au client qui a déjà le sien par un autre chemin.
+      -- ⚠ Ne borne QUE la création : `_resa_to_resync` part du cache et doit
+      -- continuer à tourner tout le séjour (drift de dates, early CI / late CO
+      -- achetés après coup).
+      AND s.stay_ci >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
       AND s.stay_co >= CURRENT_DATE()
       AND NOT EXISTS (SELECT 1 FROM active a WHERE a.duve_reservation_id = s.canonical_duve)
       AND NOT EXISTS (SELECT 1 FROM UNNEST(s.member_duve_ids) md
@@ -583,8 +594,8 @@ def _resa_to_provision() -> list[dict]:
 
 
 def _whitelisted_gaps() -> list[dict]:
-    """Trous silencieux : résas whitelistées à provisionner (CI ≤ J-lookahead, CO ≥
-    today, non annulées) SANS row cache active, classées par cause :
+    """Trous silencieux : résas whitelistées à provisionner (CI ∈ [J-1, J+lookahead],
+    CO ≥ today, non annulées) SANS row cache active, classées par cause :
       - lock       : serrure non résolue (anormal sur whitelist, tout horizon)
       - precheckin : pas de mapping Duve = formulaire pas rempli (bruit auto-résolu
                      avant J-1 → n'alerte qu'à CI ≤ J+1)
@@ -635,6 +646,13 @@ def _whitelisted_gaps() -> list[dict]:
       ON am.mews_reservation_number = CAST(m.reservation_number AS STRING)
     WHERE LOWER(m.resource_id) IN UNNEST(@wl)
       AND m.checkin_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
+      -- Même borne basse que `_resa_to_provision` (26/08) : l'alerte promet « un code
+      -- aurait dû être généré », ce qui n'est vrai que dans la fenêtre où la création
+      -- a lieu. Au-delà, la machine ne tentera plus rien et répéter le constat chaque
+      -- jour n'apprend rien à personne — c'est le défaut « état par défaut accusateur ».
+      -- Le séjour en cours sans code reste visible en 6.1 (`pin_state`, qui porte les
+      -- séjours commencés depuis le 24/08). ⚠ Fenêtre de rattrapage humain = J et J+1.
+      AND m.checkin_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
       AND m.checkout_date >= CURRENT_DATE()
       AND COALESCE(m.is_cancelled, FALSE) = FALSE
       AND am.mews_reservation_number IS NULL
