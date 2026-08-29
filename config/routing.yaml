@@ -156,6 +156,19 @@ triggers:
       - type: email_digest
         bucket: fraude
 
+  # Réservation d'une personne signalée par la RC (2026-08-29). La liste est
+  # tenue par Emilia depuis 6.7 (mode record, dwh_inputs.record_edits) : c'est
+  # un verdict humain déjà rendu, pas un signal statistique — d'où le mail dès
+  # que la résa apparaît, sans attendre l'approche du check-in.
+  # ⚠ Ne part QUE sur un rapprochement exact (customer_id) ou fort (email /
+  # téléphone). Un homonyme ne mail jamais : 458 noms sont partagés par 957
+  # profils en base, « Rachel Williams » désigne 2 personnes distinctes.
+  blacklist_resa:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: fraude
+
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
   # 6 fois/jour → 1 mail/jour). Le scheduler merveil-action-engine-4h est
