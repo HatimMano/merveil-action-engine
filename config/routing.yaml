@@ -87,11 +87,14 @@ digest_buckets:
   blacklist:
     # Réservation d'une personne signalée par la RC (2026-08-29).
     # ⚠ Bucket DISTINCT de `fraude` uniquement pour la liste de diffusion :
-    # Emilia + Hatim, sans Philippe (arbitrage 29/08 — une personne blacklistée
+    # RC + direction, SANS Philippe (arbitrage 29/08 — une personne blacklistée
     # est un sujet RC/accueil, pas une écriture comptable ; à rouvrir si le
     # besoin apparaît). Les destinataires se règlent PAR BUCKET, il n'existe pas
     # d'override par trigger dans le dispatcher — d'où ce bucket plutôt qu'un
     # paramètre sur l'action.
+    # ⚠ Ces adresses sont des adresses d'ENVOI : `raphael@archides.fr` (comme au
+    # bucket beyond) et non `raphael.elie@archides.fr`, qui est son compte IAP
+    # côté dashboard. Les deux coexistent, ne pas les aligner à la volée.
     # ⚠ flush_with OBLIGATOIRE sur tout bucket satellite : sans lui le bucket
     # est bufferisé puis JETÉ sans erreur (incident data_quality 2026-07-17).
     flush_with: 2h
@@ -100,6 +103,8 @@ digest_buckets:
     default_recipients:
       - emilia@archides.fr
       - hatim@archides.fr
+      - mickael@archides.fr
+      - raphael@archides.fr
 
 # ============================================================================
 # Triggers
