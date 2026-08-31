@@ -95,6 +95,11 @@ digest_buckets:
     # ⚠ Ces adresses sont des adresses d'ENVOI : `raphael@archides.fr` (comme au
     # bucket beyond) et non `raphael.elie@archides.fr`, qui est son compte IAP
     # côté dashboard. Les deux coexistent, ne pas les aligner à la volée.
+    # ⚠ `hello@merveil.co` (2026-08-31, demande Hatim) = la boîte partagée de la
+    # RC, seul destinataire hors domaine archides.fr de tous les buckets. C'est
+    # elle qui met l'alerte devant l'agent d'astreinte plutôt que devant une
+    # personne nommée en congés — mais elle est aussi lue par des externes
+    # (OnePilot) : ne jamais y router un bucket portant un code de porte.
     # ⚠ flush_with OBLIGATOIRE sur tout bucket satellite : sans lui le bucket
     # est bufferisé puis JETÉ sans erreur (incident data_quality 2026-07-17).
     flush_with: 2h
@@ -102,6 +107,7 @@ digest_buckets:
     subject_prefix: "[Merveil Blacklist]"
     default_recipients:
       - emilia@archides.fr
+      - hello@merveil.co
       - hatim@archides.fr
       - mickael@archides.fr
       - raphael@archides.fr
