@@ -196,6 +196,14 @@ triggers:
       - type: email_digest
         bucket: data_quality
 
+  # Fraîcheur du flux checklists Breezeway (job merveil-etl-breezeway-details,
+  # daily 6h30). Piège visé : scheduler sans run.invoker = silence total.
+  breezeway_details_stale:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: data_quality
+
   # ── Fraude / chargebacks (2026-08-15) ─────────────────────────────────────
   # Un litige non contesté est perdu d'office et on a 48 h pour les preuves :
   # sur 19 chargebacks 2026 (40 033 €), un seul a été récupéré.
