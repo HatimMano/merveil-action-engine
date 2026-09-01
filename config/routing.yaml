@@ -66,34 +66,57 @@ digest_buckets:
       - raphael@archides.fr
       - mickael@archides.fr
 
-  fraude:
-    # Chargebacks et doubles sorties. Destinataires (2026-08-18) : Emilia monte
-    # le dossier de preuve et porte la relation OTA, Philippe passe l'écriture et
-    # suit le 411, Hatim en copie technique. ⚠ Emilia reçoit déjà une notification
-    # Mews de son côté — doublon assumé : le mail d'ici porte le contexte séjour
-    # (appart, dates, remboursement éventuel) que Mews ne donne pas.
+  chargeback:
+    # ⭐ SPLIT du bucket `fraude` le 2026-09-01 (demande Hatim). Les deux buckets
+    # ne diffèrent QUE par la liste de diffusion — comme `blacklist` vs `fraude`,
+    # et pour la même raison : les destinataires se règlent PAR BUCKET, il
+    # n'existe pas d'override par trigger dans le dispatcher.
+    # ⛔ Ce qui les sépare : un chargeback est un fait ACCOMPLI, à traiter en
+    # back-office (Emilia monte le dossier de preuve sous 48 h et porte la
+    # relation OTA, Philippe passe l'écriture et suit le 411). Les agents
+    # OnePilot n'ont aucun geste à poser dessus → `externe-onepilot@merveil.co`
+    # est volontairement ABSENT ici, alors qu'il est destinataire de `fraude`
+    # (où le geste est un appel : vérifier puis annuler avant l'arrivée).
+    # ⚠ Ne pas y remettre OnePilot « pour information » : ce mail porte des noms
+    # de clients ET des montants de litige, vers un compte PARTAGÉ externe, pour
+    # une action qu'ils ne feront pas.
+    # ⚠ Emilia reçoit déjà une notification Mews de son côté — doublon assumé :
+    # le mail d'ici porte le contexte séjour (appart, dates, remboursement
+    # éventuel) que Mews ne donne pas.
     # ⚠ flush_with OBLIGATOIRE sur tout bucket satellite : sans lui le bucket est
     # bufferisé puis JETÉ sans erreur (incident data_quality, 2026-07-17).
-    # Flushé par le job 2h : `trigger_new_chargeback` a 48 h pour agir, le daily
-    # perdrait la moitié de la fenêtre.
+    # Flushé par le job 2h : `new_chargeback` a 48 h pour agir, le daily perdrait
+    # la moitié de la fenêtre.
+    flush_with: 2h
+    send_if_empty: false
+    subject_prefix: "[Merveil Chargeback]"
+    default_recipients:
+      - emilia@archides.fr
+      - philippe@archides.fr
+      - hatim@archides.fr
+      - hello@merveil.co
+
+  fraude:
+    # Suspicion de fraude AVANT l'arrivée — le geste est un APPEL, pas une
+    # écriture : vérifier l'identité puis annuler la résa. Les chargebacks (fait
+    # accompli, back-office) sont partis dans le bucket `chargeback` le 01/09.
+    # ⚠ flush_with OBLIGATOIRE (cf. bucket chargeback ci-dessus).
     flush_with: 2h
     send_if_empty: false
     subject_prefix: "[Merveil Fraude]"
     # ⚠ `externe-onepilot@merveil.co` (2026-09-01, demande Hatim) : les agents
     # OnePilot prennent les appels — sur un test de cartes, c'est eux qui
-    # vérifient/annulent au téléphone. 2ᵉ destinataire hors @archides.fr (après
-    # hello@merveil.co au bucket blacklist) : compte PARTAGÉ, le mail porte des
-    # noms de clients et des montants — assumé, décidé explicitement.
+    # vérifient/annulent au téléphone. C'est LA raison d'être du split : ils sont
+    # destinataires ici et nulle part ailleurs côté fraude.
     # ⚠ `hello@merveil.co` (2026-09-01, demande Hatim) : la boîte partagée de la
-    # RC, alignée sur le bucket blacklist — c'est elle qui met l'alerte devant
-    # l'agent d'astreinte plutôt que devant une personne nommée en congés. Le
-    # chargeback et le test de cartes appellent le même geste RC (vérifier,
-    # annuler, monter le dossier de preuve dans les 48 h). Chevauche
-    # partiellement `externe-onepilot@` (les agents OnePilot lisent aussi
-    # hello@) : doublon assumé, les deux boîtes n'ont pas la même astreinte.
-    # ⛔ Ce bucket ne porte AUCUN code de porte — c'est la condition qui rend
-    # ces deux adresses hors domaine acceptables ici. Ne jamais y router un
-    # trigger serrures.
+    # RC, alignée sur les buckets blacklist et chargeback — c'est elle qui met
+    # l'alerte devant l'agent d'astreinte plutôt que devant une personne nommée
+    # en congés. Chevauche partiellement `externe-onepilot@` (les agents OnePilot
+    # lisent aussi hello@) : doublon assumé, les deux boîtes n'ont pas la même
+    # astreinte.
+    # ⛔ Ce bucket ne porte AUCUN code de porte — c'est la condition qui rend ces
+    # deux adresses hors domaine acceptables ici. Ne jamais y router un trigger
+    # serrures.
     default_recipients:
       - emilia@archides.fr
       - philippe@archides.fr
@@ -180,15 +203,16 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: fraude
+        bucket: chargeback
 
   # On a remboursé ET subi le chargeback : le même litige payé deux fois.
   # 3 cas trouvés en reprenant 2026 (2 831,50 €), aucun repéré à l'époque.
+  # Même bucket que new_chargeback : c'est le même litige, vu par l'autre bout.
   payment_double_exit:
     enabled: true
     actions:
       - type: email_digest
-        bucket: fraude
+        bucket: chargeback
 
   # Suspicion fraude AVANT l'arrivée (2026-08-19) : ≥2 signaux parmi
   # {direct réservé ≤72h, échecs CB direct, nom de la pièce ≠ nom résa}.
