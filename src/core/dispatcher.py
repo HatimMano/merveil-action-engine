@@ -28,6 +28,7 @@ from google.cloud import bigquery
 from src.handlers import SkipAction
 from src.handlers.asana_task import AsanaTaskHandler
 from src.handlers.breezeway_tasks import BreezewayTasksHandler
+from src.handlers.blacklist_add import BlacklistAddHandler
 from src.handlers.email_digest import EmailDigestHandler
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ DIGEST_TTL_HOURS = {
 HANDLER_REGISTRY = {
     "asana_task": AsanaTaskHandler,
     "breezeway_task": BreezewayTasksHandler,
+    "blacklist_add": BlacklistAddHandler,
     # email_digest est géré séparément (fan-in via buffer)
 }
 

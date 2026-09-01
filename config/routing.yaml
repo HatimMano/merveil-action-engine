@@ -213,6 +213,12 @@ triggers:
     actions:
       - type: email_digest
         bucket: fraude
+      # ⭐ Auto-blacklist (2026-09-01, décision Hatim) : la machine crée la fiche
+      # 6.7 elle-même (gravite=vigilance, jamais interdiction — elle PROPOSE,
+      # l'interdiction reste humaine). Le fraudeur s'auto-annule en ~30 min :
+      # la fiche est ce qui prolonge la détection au-delà des 48 h du signal
+      # jumelle. 1 fiche par profil Mews, liées entre elles par la note.
+      - type: blacklist_add
 
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
