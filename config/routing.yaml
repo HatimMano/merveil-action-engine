@@ -479,6 +479,24 @@ triggers:
       - type: email_digest
         bucket: daily
 
+  # Code fixe RETIRÉ de la serrure alors qu'il ouvrait encore (`ISEO_ARGO_16`,
+  # émis par la serrure = accusé de retrait). Le champ code du logement dans
+  # Duve ne bouge pas tout seul : tant que personne ne le met à jour, il sert au
+  # client un code que la serrure ne connaît plus. Né de la purge du 31/08
+  # 15h51-15h55 UTC — 4 codes très utilisés retirés, **zéro alerte**, trou vu le
+  # lendemain à la main (`docs/audit/codes-fixes-*-2026-09-01.xlsx`).
+  # Calibré sur 45 j : 415 ARGO_16 → 13 après exclusion des codes de SÉJOUR
+  # (purgés au départ, fonctionnement normal), soit ~9/mois, tous réels.
+  # ⭐ Les rotations volontaires sonnent aussi, et c'est voulu : une rotation
+  # dont on oublie le champ Duve met le client à la porte exactement comme une
+  # purge par erreur. Bucket daily : le geste est « vérifier Duve », pas une
+  # urgence nocturne, et le property_id porte la date (1 alerte par retrait).
+  iseo_code_fixe_supprime:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: daily
+
   iseo_etl_stale:
     enabled: true
     actions:

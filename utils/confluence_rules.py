@@ -485,6 +485,7 @@ RULES = [
             "iseo_gateway_offline",
             "iseo_clavier_muet",
             "iseo_quota_licence",
+            "iseo_code_fixe_supprime",
         ],
         domaine="Serrures & accès",
         niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
@@ -531,6 +532,18 @@ RULES = [
             "(utilisateurs, serrures, invitations). Alerte à 90 % (critique à 96 %) : au plafond, "
             "<strong>plus aucun code ne peut être posé, sur tout le parc</strong> (vécu le 15/08 : 3 heures "
             "sans programmation).",
+            "Depuis le <strong>1<sup>er</sup> septembre 2026</strong> : <strong>code fixe supprimé alors "
+            "qu'il servait encore</strong>. Quand un code permanent est retiré d'une serrure, la serrure "
+            "elle-même le confirme — mais <strong>le code affiché au client dans Duve ne change pas tout "
+            "seul</strong>. Tant que personne ne le met à jour, le client reçoit un code que la porte ne "
+            "connaît plus. L'alerte se déclenche si le code retiré avait ouvert dans les 30 derniers jours, "
+            "et devient critique s'il ne reste plus <strong>aucun</strong> code permanent sur le logement "
+            "(plus de secours à dicter au téléphone). Elle sonne aussi sur les <strong>rotations "
+            "volontaires</strong>, et c'est voulu : une rotation dont on oublie le champ Duve laisse le "
+            "client devant la porte exactement comme une suppression par erreur. Le geste demandé est "
+            "toujours le même — <strong>vérifier le code du logement dans Duve</strong>. Déclencheur : la "
+            "purge du 31 août, quatre codes très utilisés retirés d'un coup, aucune alerte, écart repéré le "
+            "lendemain à la main.",
         ],
         exemple=[
             "Trois alertes réelles du 18-19/08/2026, une par famille : "
