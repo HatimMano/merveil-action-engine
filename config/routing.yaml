@@ -197,6 +197,17 @@ triggers:
       - type: email_digest
         bucket: blacklist
 
+  # Test de cartes (2026-09-01, ADR) : ≥2 refus carte pour MOTIF DE FRAUDE
+  # (FRAUD / Issuer Suspected Fraud) sur une résa Site direct à venir, dernier
+  # refus < 48 h. La seule alerte fraude qui DEMANDE un geste immédiat : la RC
+  # vérifie puis ANNULE (accord direction 31/08 — rien d'automatisé, jamais).
+  # Backtest 12 mois : 9 résas, toutes la campagne du 07-19/08, 0 faux positif.
+  test_cartes:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: fraude
+
   # ── Alertes consolidées dans le daily (2026-05-30) ────────────────────────
   # Anciennement bucket 4h. Bascule daily pour réduire le bruit (60 alertes ×
   # 6 fois/jour → 1 mail/jour). Le scheduler merveil-action-engine-4h est

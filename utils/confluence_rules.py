@@ -638,7 +638,7 @@ RULES = [
         space="CXSXJ",
         titre="Fraude — usurpation d'identité & chargebacks",
         slug="fraude-alertes",
-        triggers=["fraude_identite", "new_chargeback", "payment_double_exit"],
+        triggers=["fraude_identite", "new_chargeback", "payment_double_exit", "test_cartes"],
         domaine="Finance — Fraude & litiges",
         niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
         owner="Emilia (dossier & relation OTA) / Philippe (écriture comptable)",
@@ -646,6 +646,11 @@ RULES = [
         source="trigger_fraude_identite → int_reservations__risk · trigger_new_chargeback / trigger_payment_double_exit → paiements Mews",
         dashboard_url="https://direction.archides.fr/ops-front?tab=contestations",
         quoi=[
+            "<strong>🚨 Test de cartes</strong> (depuis le 1ᵉʳ septembre 2026) : une réservation directe dont "
+            "la banque a refusé <strong>deux cartes ou plus pour motif de FRAUDE</strong> déclenche un mail "
+            "immédiat qui demande un geste : <strong>la RC vérifie puis ANNULE la réservation</strong> (accord "
+            "direction du 31/08 — on a le droit, même réservée 2 jours avant). Rien n'est automatisé. "
+            "⚠ Si un remboursement est fait : toujours sur la carte d'origine, jamais par virement.",
             "<strong>Suspicion d'usurpation avant l'arrivée</strong> : la machine croise trois signaux — "
             "réservation directe au dernier moment · échec de carte avant un paiement accepté (sur une "
             "réservation directe) · nom du formulaire ou de la pièce différent du nom de la réservation. "
