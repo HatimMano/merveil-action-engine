@@ -84,10 +84,21 @@ digest_buckets:
     # vérifient/annulent au téléphone. 2ᵉ destinataire hors @archides.fr (après
     # hello@merveil.co au bucket blacklist) : compte PARTAGÉ, le mail porte des
     # noms de clients et des montants — assumé, décidé explicitement.
+    # ⚠ `hello@merveil.co` (2026-09-01, demande Hatim) : la boîte partagée de la
+    # RC, alignée sur le bucket blacklist — c'est elle qui met l'alerte devant
+    # l'agent d'astreinte plutôt que devant une personne nommée en congés. Le
+    # chargeback et le test de cartes appellent le même geste RC (vérifier,
+    # annuler, monter le dossier de preuve dans les 48 h). Chevauche
+    # partiellement `externe-onepilot@` (les agents OnePilot lisent aussi
+    # hello@) : doublon assumé, les deux boîtes n'ont pas la même astreinte.
+    # ⛔ Ce bucket ne porte AUCUN code de porte — c'est la condition qui rend
+    # ces deux adresses hors domaine acceptables ici. Ne jamais y router un
+    # trigger serrures.
     default_recipients:
       - emilia@archides.fr
       - philippe@archides.fr
       - hatim@archides.fr
+      - hello@merveil.co
       - externe-onepilot@merveil.co
 
   blacklist:
