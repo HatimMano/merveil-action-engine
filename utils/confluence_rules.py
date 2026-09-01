@@ -649,8 +649,14 @@ RULES = [
             "<strong>🚨 Test de cartes</strong> (depuis le 1ᵉʳ septembre 2026) : une réservation directe dont "
             "la banque a refusé <strong>deux cartes ou plus pour motif de FRAUDE</strong> déclenche un mail "
             "immédiat qui demande un geste : <strong>la RC vérifie puis ANNULE la réservation</strong> (accord "
-            "direction du 31/08 — on a le droit, même réservée 2 jours avant). Rien n'est automatisé. "
-            "⚠ Si un remboursement est fait : toujours sur la carte d'origine, jamais par virement.",
+            "direction du 31/08 — on a le droit, même réservée 2 jours avant). L'annulation n'est jamais "
+            "automatisée. ⚠ Si un remboursement est fait : toujours sur la carte d'origine, jamais par virement.",
+            "<strong>La machine blackliste elle-même</strong> (01/09) : chaque test de cartes crée aussi la fiche "
+            "6.7 Blacklist automatiquement — en <em>vigilance</em>, jamais en interdiction (la machine propose, "
+            "l'interdiction reste un verdict humain). Les profils multiples du même individu sont liés entre eux "
+            "dans les notes. Et un client qui revient sous le <strong>même nom</strong> avec un nouvel email "
+            "déclenche l'alerte blacklist si sa réservation porte elle-même un comportement de fraude — le mail "
+            "dit alors « HOMONYME, vérifier l'identité », jamais « c'est lui ».",
             "<strong>Suspicion d'usurpation avant l'arrivée</strong> : la machine croise trois signaux — "
             "réservation directe au dernier moment · échec de carte avant un paiement accepté (sur une "
             "réservation directe) · nom du formulaire ou de la pièce différent du nom de la réservation. "
