@@ -79,10 +79,16 @@ digest_buckets:
     flush_with: 2h
     send_if_empty: false
     subject_prefix: "[Merveil Fraude]"
+    # ⚠ `externe-onepilot@merveil.co` (2026-09-01, demande Hatim) : les agents
+    # OnePilot prennent les appels — sur un test de cartes, c'est eux qui
+    # vérifient/annulent au téléphone. 2ᵉ destinataire hors @archides.fr (après
+    # hello@merveil.co au bucket blacklist) : compte PARTAGÉ, le mail porte des
+    # noms de clients et des montants — assumé, décidé explicitement.
     default_recipients:
       - emilia@archides.fr
       - philippe@archides.fr
       - hatim@archides.fr
+      - externe-onepilot@merveil.co
 
   blacklist:
     # Réservation d'une personne signalée par la RC (2026-08-29).
