@@ -37,6 +37,17 @@ PROJECT_ID = os.getenv("GCP_PROJECT_ID", "merveil-data-warehouse")
 TRIGGERS_TABLE = f"{PROJECT_ID}.action_engine.triggers"
 DISPATCHED_TABLE = f"{PROJECT_ID}.action_engine.dispatched_actions"
 
+# Garde-fou fraîcheur triggers : `triggers` est un UNION ALL incrémental — un seul
+# trigger_* en erreur met tout le modèle en SKIP et plus AUCUNE alerte ne part,
+# sans que rien ne le signale (c'est l'alerting lui-même qui tombe — incident du
+# 01/09 : chaîne muette toute la journée). L'observable fiable est le dernier MERGE
+# réussi sur la table dans INFORMATION_SCHEMA.JOBS (bat toutes les 2h même à
+# 0 ligne insérée ; last_modified_time, lui, ne bouge pas sur un MERGE vide).
+# 4.5h = 2 cascades manquées. Le mail part en direct via le mailer, jamais via la
+# table (c'est précisément elle qui est morte).
+TRIGGERS_STALE_MAX_HOURS = float(os.getenv("TRIGGERS_STALE_MAX_HOURS", "4.5"))
+TRIGGERS_STALE_ALERT_TO = os.getenv("TRIGGERS_STALE_ALERT_TO", "hatim@archides.fr")
+
 # TTL par bucket pour les actions email_digest (en heures)
 DIGEST_TTL_HOURS = {
     "2h": 4,   # serrures : run toutes les 2h, re-alerte max toutes les 4h (dédup)
@@ -77,6 +88,57 @@ class TriggerDispatcher:
                 raise ValueError(f"Handler inconnu : {action_type}")
             self._handlers[action_type] = cls()
         return self._handlers[action_type]
+
+    # ── Étape 0 : Garde-fou — la chaîne d'alertes est-elle vivante ? ─────────
+
+    def _check_triggers_freshness(self):
+        """Alerte en direct si `action_engine.triggers` n'a plus été construite
+        depuis > TRIGGERS_STALE_MAX_HOURS (dernier MERGE réussi, cf. constante).
+        Stateless : re-alerte ~toutes les 12h tant que ce n'est pas réparé
+        (formule sur l'âge — le job tourne toutes les 2h, la fenêtre d'envoi
+        fait 2h). Best-effort : un échec du check ne bloque jamais le dispatch."""
+        try:
+            rows = list(self.bq.query(f"""
+                SELECT MAX(end_time) AS last_build
+                FROM `{PROJECT_ID}.region-eu`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+                WHERE destination_table.dataset_id = 'action_engine'
+                  AND destination_table.table_id = 'triggers'
+                  AND state = 'DONE' AND error_result IS NULL
+                  AND creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 DAY)
+            """).result())
+            last_build = rows[0].last_build if rows else None
+            if last_build is None:
+                age_h = 72.0  # aucun build sur 3 jours : pire cas, on alerte
+            else:
+                age_h = (datetime.now(timezone.utc) - last_build).total_seconds() / 3600
+            if age_h < TRIGGERS_STALE_MAX_HOURS:
+                return
+            past = age_h - TRIGGERS_STALE_MAX_HOURS
+            if past % 12.0 >= 2.0:
+                logger.warning(f"triggers gelée depuis {age_h:.1f}h — déjà alerté, prochain rappel au palier 12h")
+                return
+            from src.core.mailer import build_email, send_mail
+            when = last_build.strftime("%d/%m %H:%M UTC") if last_build else "inconnu (>3j)"
+            body = build_email(
+                "Chaîne d'alertes muette — action_engine.triggers gelée",
+                subtitle=f"Dernier build réussi : {when} ({age_h:.1f}h)",
+                severity="critical",
+                intro=(
+                    "La table <b>action_engine.triggers</b> n'a plus été reconstruite "
+                    f"depuis <b>{age_h:.1f}h</b> (cadence normale : 2h). Cause typique : "
+                    "un modèle <code>trigger_*</code> en erreur SQL → le UNION ALL "
+                    "<code>triggers</code> passe en SKIP → <b>plus aucune alerte ne part</b>, "
+                    "y compris celles qui signalent les pannes.<br><br>"
+                    "Diagnostic : logs du dernier run <code>merveil-dbt-run</code> "
+                    "(chercher ERROR/SKIP), puis corriger le trigger fautif et rebuilder."
+                ),
+            )
+            send_mail(
+                f"[Merveil IT] 🔴 Alertes muettes — triggers gelée depuis {age_h:.0f}h",
+                body, TRIGGERS_STALE_ALERT_TO, html=True,
+            )
+        except Exception as e:
+            logger.warning(f"check fraîcheur triggers échoué (non-fatal) : {e}")
 
     # ── Étape 1 : Résolution des actions terminées côté externe ─────────────
 
@@ -402,6 +464,7 @@ class TriggerDispatcher:
                   indépendamment de freq.
         """
         logger.info(f"=== TriggerDispatcher start (freq={freq}) ===")
+        self._check_triggers_freshness()
         flush_buckets = self._buckets_for_freq(freq) if freq else []
 
         # 1. Résolutions
