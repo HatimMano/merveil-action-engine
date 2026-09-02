@@ -257,6 +257,7 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 - `dispatched_actions` (BQ table append-only) : log par (trigger, property_id, action_type, status). Cooldown via `status='open'`.
 
 **Flux exécution** (`src/core/dispatcher.py::TriggerDispatcher.run`) :
+0. ⭐ **Garde-fou « chaîne d'alertes muette » (2026-09-02, ADR)** — `_check_triggers_freshness()` : âge du **dernier MERGE réussi** sur `action_engine.triggers` via `INFORMATION_SCHEMA.JOBS_BY_PROJECT` (bat toutes les 2h même à 0 ligne insérée ; ⚠ `last_modified_time` ne bouge PAS sur un MERGE vide — réfuté par mesure, ne pas y revenir). Âge > `TRIGGERS_STALE_MAX_HOURS` (4.5 = 2 cascades manquées) → mail CRITICAL **direct via le mailer** à `TRIGGERS_STALE_ALERT_TO` (défaut hatim), jamais via la table (c'est elle qui est morte). Rappel stateless ~12h. Motivé par l'incident 01/09 : un trigger_* en erreur SQL → `triggers` SKIP → zéro alerte de la journée, rien ne le signalait. IAM : exige `roles/bigquery.resourceViewer` sur `action-engine-sa` (accordé 02/09 — les MERGE sont lancés par la SA dbt). Testé en prod dans les 2 sens (silencieux à frais, mail au seuil forcé).
 1. Résoudre les Breezeway tasks completed (webhook) → `dispatched_actions` status=resolved
 2. Résoudre les digests expirés (TTL 4h/24h/168h selon bucket) → resolved
 3. Charger triggers + dispatched_actions ouverts (1 query chacun)
