@@ -532,18 +532,26 @@ RULES = [
             "(utilisateurs, serrures, invitations). Alerte à 90 % (critique à 96 %) : au plafond, "
             "<strong>plus aucun code ne peut être posé, sur tout le parc</strong> (vécu le 15/08 : 3 heures "
             "sans programmation).",
-            "Depuis le <strong>1<sup>er</sup> septembre 2026</strong> : <strong>code fixe supprimé alors "
-            "qu'il servait encore</strong>. Quand un code permanent est retiré d'une serrure, la serrure "
-            "elle-même le confirme — mais <strong>le code affiché au client dans Duve ne change pas tout "
-            "seul</strong>. Tant que personne ne le met à jour, le client reçoit un code que la porte ne "
-            "connaît plus. L'alerte se déclenche si le code retiré avait ouvert dans les 30 derniers jours, "
-            "et devient critique s'il ne reste plus <strong>aucun</strong> code permanent sur le logement "
-            "(plus de secours à dicter au téléphone). Elle sonne aussi sur les <strong>rotations "
+            "Depuis le <strong>1<sup>er</sup> septembre 2026</strong> : <strong>code permanent supprimé "
+            "alors qu'il servait encore</strong>. Quand un code permanent disparaît, <strong>le code "
+            "affiché au client dans Duve ne change pas tout seul</strong> : tant que personne ne le met à "
+            "jour, le client reçoit un code qui n'existe plus. Déclencheur : la purge du 31 août, quatre "
+            "codes très utilisés retirés d'un coup, aucune alerte, écart repéré le lendemain à la main.",
+            "La surveillance regarde <strong>deux endroits, et il en faut deux</strong> : la "
+            "<strong>serrure</strong> elle-même, qui confirme le retrait — c'est la preuve la plus solide, "
+            "mais elle n'existe que si la serrure remonte encore son journal ; et l'<strong>inventaire "
+            "Sofia</strong>, où l'on voit le code disparaître même quand la serrure est muette. Sans ce "
+            "second regard, les trois logements les plus exposés du parc passaient au travers : un "
+            "appartement <strong>sans passerelle</strong> (aucun journal, aucune ouverture à distance) "
+            "dont le code supprimé était encore envoyé à un client attendu trois jours plus tard, et deux "
+            "autres derrière une passerelle en panne alors que leur code servait plusieurs fois par jour. "
+            "Une serrure dont le journal est mort ne peut pas signaler son propre problème.",
+            "L'alerte devient <strong>critique</strong> quand la réception n'a plus de recours : soit il ne "
+            "reste plus <strong>aucun</strong> code permanent à dicter au téléphone, soit la serrure ne "
+            "peut être ni observée ni ouverte à distance. Elle sonne aussi sur les <strong>rotations "
             "volontaires</strong>, et c'est voulu : une rotation dont on oublie le champ Duve laisse le "
             "client devant la porte exactement comme une suppression par erreur. Le geste demandé est "
-            "toujours le même — <strong>vérifier le code du logement dans Duve</strong>. Déclencheur : la "
-            "purge du 31 août, quatre codes très utilisés retirés d'un coup, aucune alerte, écart repéré le "
-            "lendemain à la main.",
+            "toujours le même — <strong>vérifier le code du logement dans Duve</strong>.",
         ],
         exemple=[
             "Trois alertes réelles du 18-19/08/2026, une par famille : "
