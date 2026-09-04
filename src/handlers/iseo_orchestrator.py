@@ -174,6 +174,10 @@ DEFAULT_CO_HOUR = os.environ.get("ISEO_DEFAULT_CO_HOUR", "11:00")
 # mesurés le 25/08). 18:00 = ce que promet le produit (arbitrage Hatim 21/08).
 LATE_CO_HOUR = os.environ.get("ISEO_LATE_CO_HOUR", "18:00")
 PIN_COLLISION_RETRIES = 8
+# Retry push (04/09) : au-delà de N pushes non appliqués depuis le dernier APPLIED, on
+# arrête de relancer à chaque run — c'est un cas pour le restart manuel + escalade ISEO.
+# 36 = 3 jours à 1 push/2 h. OPE18 avait 17 échecs et est passé au 2ᵉ push (après restart).
+ISEO_RETRY_PUSH_MAX = int(os.environ.get("ISEO_RETRY_PUSH_MAX", "36"))
 
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
@@ -1857,6 +1861,43 @@ def _load_whitelist() -> set:
     return ALLOWED_PROPERTY_IDS
 
 
+def _stuck_gateways_to_retry() -> list[dict]:
+    """Passerelles `push_stuck` portant au moins un appart de la whitelist (seed dbt),
+    encore sous le plafond de tentatives. Même périmètre que `trigger_iseo_gateway_push_stuck`."""
+    q = f"""
+    SELECT ph.gateway_id, ph.gateway_name, ph.last_push_status,
+           COALESCE(ph.n_pushes_since_applied, 0) AS n_pushes_since_applied,
+           STRING_AGG(DISTINCT l.apartment_code ORDER BY l.apartment_code) AS apartments
+    FROM `{GATEWAY_PUSH_HEALTH_TABLE}` ph
+    JOIN `{SMART_LOCKS_TABLE}` l ON l.gateway_id = ph.gateway_id
+    JOIN `{WHITELIST_TABLE}` w ON w.apartment_code = l.apartment_code
+    WHERE ph.push_stuck
+      AND COALESCE(ph.n_pushes_since_applied, 0) < @max_pushes
+    GROUP BY 1, 2, 3, 4
+    ORDER BY 1
+    """
+    job = _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("max_pushes", "INT64", ISEO_RETRY_PUSH_MAX)]))
+    return [dict(r) for r in job.result()]
+
+
+def _retry_push(gw: dict) -> tuple[bool, Optional[str]]:
+    """Ré-émet un CREDENTIALS_UPDATED — le contournement OFFICIEL donné par ISEO le 04/09
+    (« forces a global credential synchronization »). Leur plateforme ne ré-émet JAMAIS un
+    push FAILED (seul IN_TRANSIT est renvoyé, 10×), donc sans ce geste un code reste
+    NOT_UPDATED à vie. ⚠ Pas de GATEWAY_RESTART ici : il coupe l'ouverture à distance
+    ~5 min, et le job a un task-timeout de 300 s — le restart + la salve de 6 restent
+    manuels (`merveil-etl-v2/utils/iseo_unstick_gateway.py`). Fire-and-forget : le
+    résultat se lit au snapshot ETL suivant (`push_health`), pas ici."""
+    if ISEO_SHADOW_MODE:
+        return False, "skipped: shadow"
+    r = _sofia("POST", f"/api/v2/gateways/{gw['gateway_id']}/notifications",
+               {"type": "CONFIGURATION", "payloadType": "CREDENTIALS_UPDATED"})
+    if r.status_code >= 300:
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    return True, None
+
+
 def run() -> None:
     """Wrapper : tout crash → alerte mail + exit non-zero (visible Cloud Run)."""
     try:
@@ -2024,10 +2065,31 @@ def _run_inner() -> None:
         else:
             errors.append(f"purge {row.get('ext_id')}: {err}")
 
+    # 5. Retry push des passerelles coincées (04/09) — 1 CREDENTIALS_UPDATED par run et
+    # par passerelle `push_stuck` intégrée. Campagne manuelle du 04/09 : 8/11 débloquées,
+    # toutes en ≤ 4 pushes → à 1 push/2 h la plupart repartent dans la journée, sans
+    # geste humain. Le garde-fou `gateway_dead` reste tel quel : on ne pousse un code
+    # qu'après un APPLIED constaté par l'ETL.
+    to_retry = _stuck_gateways_to_retry()
+    if to_retry:
+        logger.info(f"🔁 {len(to_retry)} passerelle(s) coincée(s) à relancer (< {ISEO_RETRY_PUSH_MAX} tentatives)")
+    retried = 0
+    for gw in to_retry:
+        try:
+            success, err = _retry_push(gw)
+        except Exception as e:
+            success, err = False, f"exception: {e}"
+        if success:
+            retried += 1
+            logger.info(f"  🔁 gw {gw['gateway_id']} ({gw['apartments']}) — {gw['last_push_status']}, "
+                        f"{gw['n_pushes_since_applied']} échec(s) → CREDENTIALS_UPDATED ré-émis")
+        elif not str(err).startswith("skipped"):
+            errors.append(f"retry push gw {gw['gateway_id']} ({gw['apartments']}): {err}")
+
     logger.info("=" * 70)
     logger.info(f"DONE — provision ok={ok} skip={skip} | hold[{ISEO_HOLD_MODE}]={held} | "
                 f"resync={resynced} | duve-retry={retry} | archived={archived} | "
-                f"purged={purged} | erreurs={len(errors)}")
+                f"purged={purged} | retry-push={retried} | erreurs={len(errors)}")
     logger.info("=" * 70)
 
     # ⚠ PAS de mail dédié ici (retiré le 20/08, il sonnait toutes les 2 h pour la
