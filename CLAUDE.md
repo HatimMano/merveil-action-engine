@@ -303,6 +303,13 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 ### ⚠ Buckets digest — `flush_with` obligatoire pour les buckets custom (fix 2026-07-17)
 `run(freq)` ne flushe que le bucket **homonyme** de FREQ + les buckets déclarant `flush_with: <freq>` dans `routing.yaml`. **Bug silencieux corrigé le 17/07** : le bucket `data_quality` (gouvernance, `dbt_test_failure`, `finance_flow_stale`) n'avait AUCUN `flush_with` → bufferisé puis jeté à chaque run daily, **0 mail envoyé depuis sa création** (vérifié `dispatched_actions` : aucune ligne bucket=data_quality). Tout nouveau bucket à destinataires dédiés DOIT porter `flush_with: daily` (ou `2h`/`4h`). Buckets satellites actuels : `data_quality` (Hatim, gouvernance) + `beyond` (hatim+raphael+mickael, trigger `beyond_gap_filled`) + **`chargeback`** (`flush_with: 2h`, triggers `new_chargeback` + `payment_double_exit`) + **`fraude`** (`flush_with: 2h`, triggers `fraude_identite` + `test_cartes`) + **`blacklist`** (`flush_with: 2h`, trigger `blacklist_resa`). Le TTL des satellites = défaut 24h (`DIGEST_TTL_HOURS`).
 
+### ⚡ Le job `2h` et le job `iseo` peuvent tourner HORS de leurs horaires (voie rapide, 2026-09-06)
+Le webhook-gateway (`src/core/fastlane.py`) lance `merveil-action-engine-iseo` puis
+`merveil-action-engine-2h` après un dbt ciblé (flush de webhooks Mews, ou pré-checkin ≤ J+3). Rien à
+changer ici : les deux sont idempotents (dedup `dispatched_actions` par property_id + jour ; get-or-
+create par extId côté Sofia). ⚠ Ne pas raisonner « le bucket 2h flushe à :50 » — il flushe à :50 **et**
+à chaque voie rapide, jamais deux fois le même trigger.
+
 ### Buckets `chargeback` et `fraude` — split du 2026-09-01 (ADR)
 
 Un seul bucket `fraude` portait les 4 triggers jusqu'au 01/09. Il a été **scindé en deux**, qui ne diffèrent **que par la liste de diffusion** — comme `blacklist` vs `fraude`, et pour la même raison mécanique : **les destinataires se règlent PAR BUCKET**, le dispatcher n'a aucun override par trigger (`_flush_digest` lit `digest_buckets[b].default_recipients`, jamais `params.recipients`). Un bucket est donc la seule unité de routage disponible.
