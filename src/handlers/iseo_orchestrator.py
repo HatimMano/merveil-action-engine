@@ -563,7 +563,13 @@ def _resa_to_provision() -> list[dict]:
     WITH {_STAYS_CTE},
     active AS (
       SELECT DISTINCT duve_reservation_id
-      FROM `{PIN_CACHE_TABLE}` WHERE archived_at IS NULL
+      FROM `{PIN_CACHE_TABLE}`
+      WHERE archived_at IS NULL
+         -- ⛔ Révocation humaine (6.1 / Vision 360, 06/09, ADR) : la ligne est
+         -- archivée (le code n'existe plus chez Sofia) mais le stay est toujours
+         -- live — sans cette clause, le run suivant RECRÉERAIT un code à la
+         -- personne qu'on vient de couper. Bornée au séjour révoqué (CO ≥ today).
+         OR (revoked_at IS NOT NULL AND checkout_date >= CURRENT_DATE())
     )
     SELECT
       s.canonical_duve AS duve_reservation_id,
@@ -617,7 +623,11 @@ def _whitelisted_gaps() -> list[dict]:
     active_by_mews AS (
       SELECT DISTINCT mews_reservation_number
       FROM `{PIN_CACHE_TABLE}`
-      WHERE archived_at IS NULL AND mews_reservation_number IS NOT NULL
+      WHERE (archived_at IS NULL
+             -- Code révoqué par un humain (06/09) : l'absence de code est VOULUE,
+             -- le mail « aurait dû être généré » n'a rien à en dire.
+             OR (revoked_at IS NOT NULL AND checkout_date >= CURRENT_DATE()))
+        AND mews_reservation_number IS NOT NULL
     )
     SELECT m.reservation_number, m.resource_id, m.customer_name, m.checkin_date,
            m.checkout_date, lk.apartment_code,

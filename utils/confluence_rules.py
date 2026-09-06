@@ -456,6 +456,13 @@ RULES = [
             "réservation, le code généré et les codes de l'appartement (bouton « Afficher les codes »), les "
             "heures de validité, et le <strong>bouton d'ouverture à distance</strong> — la RC peut dépanner "
             "pendant l'appel, sans quitter la page.",
+            "<strong>Révoquer un code</strong> (depuis le 6 septembre 2026) : bouton « Révoquer le code » "
+            "sur la réservation en 6.1 et sur sa fiche 360 (comptes internes seulement). Le code de séjour "
+            "est supprimé <strong>immédiatement</strong> de la serrure, le geste est journalisé au nom de la "
+            "personne, et la machine ne le recrée pas. C'est LE geste quand la RC décide de couper l'accès "
+            "d'un client (fraude avérée, blacklist) : une fiche blacklist seule ne coupe rien, et l'annulation "
+            "dans Mews ne retire le code qu'au run suivant (jusqu'à 2 h). ⚠ Le code fixe de l'appartement "
+            "reste dans la serrure — le changer est un geste séparé, dans Sofia.",
         ],
         exemple=[
             "Réservation arrivant vendredi sur un appartement basculé : mardi, la machine pose un code unique "
@@ -678,6 +685,12 @@ RULES = [
             "dans les notes. Et un client qui revient sous le <strong>même nom</strong> avec un nouvel email "
             "déclenche l'alerte blacklist si sa réservation porte elle-même un comportement de fraude — le mail "
             "dit alors « HOMONYME, vérifier l'identité », jamais « c'est lui ».",
+            "<strong>Le mail blacklist distingue deux situations</strong> (depuis le 6 septembre 2026) : "
+            "« 🆕 Nouvelle résa d'un client blacklisté » = la personne revient, la RC découvre ; "
+            "« 📌 Fiche posée après la résa » = la RC vient de signaler un client déjà en séjour ou attendu — "
+            "la situation est le plus souvent déjà connue, et le mail rappelle si son <strong>code d'accès "
+            "est encore actif</strong> (à révoquer en 6.1). Dès la création de la fiche, la page 6.7 affiche "
+            "d'ailleurs sans attendre les réservations en cours de la personne.",
             "<strong>Suspicion d'usurpation avant l'arrivée</strong> : la machine croise trois signaux — "
             "réservation directe au dernier moment · échec de carte avant un paiement accepté (sur une "
             "réservation directe) · nom du formulaire ou de la pièce différent du nom de la réservation. "
