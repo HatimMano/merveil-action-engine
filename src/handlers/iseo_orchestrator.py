@@ -192,6 +192,16 @@ ISEO_VERIFY_RETRY_AFTER_MIN = int(os.environ.get("ISEO_VERIFY_RETRY_AFTER_MIN", 
 ISEO_WRITE_RETRY_MAX = int(os.environ.get("ISEO_WRITE_RETRY_MAX", "3"))
 ISEO_VERIFY_MAX_PER_RUN = int(os.environ.get("ISEO_VERIFY_MAX_PER_RUN", "200"))
 
+# Chantier E (07/09, décision Hatim) : le code est créé à J-3 pour TOUT séjour intégré,
+# pré-checkin fait ou pas. Sans résa Duve, la ligne de cache est keyée `M<n° résa Mews>`
+# (extIds `MERVEIL_RESA - M<n°>`…) et le push Duve part seul à l'arrivée du formulaire.
+# Garde-fou quota Luckey (2 éléments par séjour, saturation = plus AUCUNE création,
+# intégrés compris) : au-dessus de ce seuil d'éléments utilisés on ne crée plus pour
+# les séjours SANS formulaire (= statu quo pour eux, jamais pire).
+ISEO_QUOTA_MAX_USED_NO_FORM = int(os.environ.get("ISEO_QUOTA_MAX_USED_NO_FORM", "590"))
+WALLET_TABLE = os.environ.get(
+    "ISEO_WALLET_TABLE", "merveil-data-warehouse.staging.stg_iseo__wallet")
+
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
 
@@ -429,10 +439,28 @@ _STAYS_CTE = f"""
     {_LOCKS_CTE},
     {_PAYMENTS_CTE},
     duve_stay AS (
-      SELECT duve_reservation_id, duve_property_id,
-             primary_guest_external_id AS mews_customer_id, checkin_date AS duve_ci
-      FROM `{DUVE_CHECKIN_STG_TABLE}`
-      WHERE primary_guest_external_id IS NOT NULL
+      SELECT duve_reservation_id, duve_property_id, mews_customer_id, duve_ci
+      FROM (
+        SELECT duve_reservation_id, duve_property_id,
+               primary_guest_external_id AS mews_customer_id, checkin_date AS duve_ci,
+               received_at
+        FROM `{DUVE_CHECKIN_STG_TABLE}`
+        WHERE primary_guest_external_id IS NOT NULL
+        UNION ALL
+        -- ⭐ Voie rapide du formulaire (07/09, chantier E) : le raw est écrit par le
+        -- webhook à la seconde, le staging est INCRÉMENTAL (~2 h). Sans cette
+        -- branche, un pré-checkin reçu à 14h ne rattachait sa résa Duve au stay —
+        -- donc ne déclenchait le push du code créé à J-3 — qu'à 16h15.
+        SELECT reservation_id, property_id,
+               (SELECT JSON_VALUE(g, '$.externalId')
+                  FROM UNNEST(JSON_QUERY_ARRAY(_raw_payload, '$.resource.guestProfiles')) g
+                  WHERE JSON_VALUE(g, '$.isPrimary') = 'true' LIMIT 1),
+               DATE(SAFE_CAST(checkin_date AS TIMESTAMP)),
+               received_at
+        FROM `{RAW_DUVE_CHECKIN_TABLE}`
+        WHERE received_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 DAY)
+      )
+      WHERE mews_customer_id IS NOT NULL
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY duve_reservation_id ORDER BY received_at DESC) = 1
     ),
@@ -585,7 +613,12 @@ def _resa_to_provision() -> list[dict]:
          OR (revoked_at IS NOT NULL AND checkout_date >= CURRENT_DATE())
     )
     SELECT
-      s.canonical_duve AS duve_reservation_id,
+      -- ⭐ Chantier E (07/09) : sans résa Duve, la clé du stay est `M<n° résa Mews>`
+      -- (le n° de la 1re résa du stay). Même clé pour les extIds Sofia. Quand le
+      -- formulaire arrive, la ligne garde sa clé M : c'est `_resa_duve_retry` qui
+      -- résout les duve du stay en direct et pousse le code.
+      COALESCE(s.canonical_duve, CONCAT('M', s.mews_reservation_number)) AS duve_reservation_id,
+      (s.canonical_duve IS NULL) AS no_duve,
       s.duve_property_id, s.lock_id, s.lock_tag_id, s.apartment_code, s.gateway_dead,
       s.customer_name, s.mews_reservation_number,
       s.stay_ci AS checkin_date, s.stay_co AS checkout_date,
@@ -594,7 +627,7 @@ def _resa_to_provision() -> list[dict]:
       s.payment_unpaid, s.member_duve_ids, s.balance_due,
       s.min_lead_hours, s.direct_last_minute, s.direct_unpaid
     FROM stays s
-    WHERE s.canonical_duve IS NOT NULL
+    WHERE s.mews_reservation_number IS NOT NULL
       AND s.stay_ci <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
       -- ⭐ Borne BASSE (25-26/08, ADR) : on ne CRÉE plus un code après le lendemain
       -- de l'arrivée. Tant que le gate paiement bloquait la création, c'est
@@ -611,9 +644,25 @@ def _resa_to_provision() -> list[dict]:
       AND NOT EXISTS (SELECT 1 FROM active a WHERE a.duve_reservation_id = s.canonical_duve)
       AND NOT EXISTS (SELECT 1 FROM UNNEST(s.member_duve_ids) md
                       JOIN active a ON a.duve_reservation_id = md)
+      -- Le stay a déjà son code créé SANS formulaire (clé M) : quand le Duve arrive,
+      -- canonical_duve se remplit mais la ligne active reste keyée M — sans ce
+      -- test, on fabriquerait un 2ᵉ code au même séjour.
+      AND NOT EXISTS (SELECT 1 FROM active a
+                      WHERE a.duve_reservation_id = CONCAT('M', s.mews_reservation_number))
     ORDER BY s.stay_ci
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
+
+
+def _wallet_used() -> Optional[int]:
+    """Éléments Luckey utilisés au dernier snapshot (None si illisible → pas de garde)."""
+    try:
+        rows = list(_bq().query(
+            f"SELECT num_elements_used FROM `{WALLET_TABLE}` LIMIT 1").result())
+        return int(rows[0].num_elements_used) if rows else None
+    except Exception as e:
+        logger.warning(f"⚠️ wallet illisible ({e}) — garde quota inactive")
+        return None
 
 
 def _whitelisted_gaps() -> list[dict]:
@@ -709,6 +758,10 @@ def _resa_to_archive() -> list[dict]:
     WITH {_STAYS_CTE},
     stay_members AS (
       SELECT md AS duve_reservation_id FROM stays, UNNEST(member_duve_ids) md
+      UNION ALL
+      -- Chantier E : la ligne keyée M<n°> est vivante tant que son stay Mews l'est.
+      SELECT CONCAT('M', mews_reservation_number) FROM stays
+      WHERE mews_reservation_number IS NOT NULL
     )
     SELECT c.duve_reservation_id, c.iseo_invitation_id, c.shadow_mode
     FROM `{PIN_CACHE_TABLE}` c
@@ -757,6 +810,7 @@ def _resa_to_resync() -> list[dict]:
       s.min_lead_hours, s.direct_last_minute, s.direct_unpaid, s.balance_due
     FROM cache c
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
+                 OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
     LEFT JOIN cred cr ON cr.duve_reservation_id = c.duve_reservation_id
     WHERE s.stay_ci != c.cache_ci OR s.stay_co != c.cache_co OR c.iseo_invitation_id IS NULL
        -- ⭐ Drift d'HEURES : un service d'arrivée/départ acheté APRÈS le
@@ -859,22 +913,38 @@ def _resa_duve_retry() -> list[dict]:
     rétention libérée (`released_at` posé) redevient éligible et part au run d'après.
     """
     q = f"""
-    SELECT duve_reservation_id, pin_value, invitation_link, stay_member_duve_ids
-    FROM `{PIN_CACHE_TABLE}`
-    WHERE archived_at IS NULL AND provisioned_at IS NOT NULL AND duve_pushed_at IS NULL
-      AND (hold_reason IS NULL OR released_at IS NOT NULL)
+    WITH {_STAYS_CTE},
+    cache AS (
+      SELECT duve_reservation_id, pin_value, invitation_link, stay_member_duve_ids,
+             mews_reservation_number
+      FROM `{PIN_CACHE_TABLE}`
+      WHERE archived_at IS NULL AND provisioned_at IS NOT NULL AND duve_pushed_at IS NULL
+        AND (hold_reason IS NULL OR released_at IS NOT NULL)
+    )
+    -- ⭐ Chantier E : les duve du stay sont résolus EN DIRECT (une ligne keyée M n'en
+    -- avait aucun à la création). Dès que le formulaire arrive, `stays` porte le
+    -- duve → push au run suivant (≤ 10 min, ou 2-3 min via l'event-driven).
+    SELECT c.duve_reservation_id, c.pin_value, c.invitation_link, c.stay_member_duve_ids,
+           ANY_VALUE(s.member_duve_ids) AS live_member_duve_ids
+    FROM cache c
+    LEFT JOIN stays s
+      ON s.canonical_duve = c.duve_reservation_id
+      OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
+    GROUP BY 1, 2, 3, 4
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
 
 
-def _mark_duve_pushed(duve_resa_id: str) -> None:
+def _mark_duve_pushed(duve_resa_id: str, member_csv: Optional[str] = None) -> None:
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
-    SET duve_pushed_at = CURRENT_TIMESTAMP(), last_error = NULL
+    SET duve_pushed_at = CURRENT_TIMESTAMP(), last_error = NULL,
+        stay_member_duve_ids = COALESCE(@members, stay_member_duve_ids)
     WHERE duve_reservation_id = @id AND archived_at IS NULL
     """
     _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id)])).result()
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
+        bigquery.ScalarQueryParameter("members", "STRING", member_csv)])).result()
 
 
 def _mark_archived(duve_resa_id: str, error: Optional[str] = None) -> None:
@@ -1200,6 +1270,11 @@ def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
         suite = ("Après vérification de l'identité, lire le code sur le dashboard et "
                  "l'envoyer au client. En cas de doute, ne rien envoyer et faire "
                  "annuler la réservation.")
+    elif row.get("no_duve"):
+        titre, sujet = "Réservation à risque — code créé, non transmis", "⚠️ Résa à risque (sans pré-checkin)"
+        etat = ("Le client n'a <strong>pas rempli son pré-checkin</strong> : le code existe côté "
+                "serrure et en 6.1, mais <strong>rien ne lui a été envoyé</strong>. Il partira "
+                "seul s'il remplit le formulaire.")
     else:
         titre, sujet = "Réservation à risque — code déjà envoyé", "⚠️ Résa à risque (code envoyé)"
         etat = ("La porte de validation est en <strong>mode observation</strong> : le code "
@@ -1283,12 +1358,18 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     # D. Duve push (code clavier + lien) — à TOUS les duve du stay (back-to-back),
     #    SAUF si la porte retient : le code existe alors côté Sofia (donc lisible au
     #    dashboard et révocable) mais le client ne le voit pas.
-    members = row.get("member_duve_ids") or [duve_resa_id]
+    members = [] if row.get("no_duve") else (row.get("member_duve_ids") or [duve_resa_id])
     hold = row.get("hold_reason")  # posé par le caller (déjà évalué pour le log)
     if hold and ISEO_HOLD_MODE == "on":
         duve_ok, duve_err = False, None
         logger.warning(f"🔒 HOLD {duve_resa_id} ({row.get('apartment_code')}) — {hold} "
                        f"→ code créé, PAS envoyé à Duve")
+    elif not members:
+        # Chantier E : pas de pré-checkin → rien où pousser. Le code existe (6.1 le
+        # porte, la RC peut le dicter) et partira seul à l'arrivée du formulaire.
+        duve_ok, duve_err = False, None
+        logger.info(f"📝 {duve_resa_id} ({row.get('apartment_code')}, {row.get('customer_name')}) "
+                    f"— code créé SANS pré-checkin, push Duve à l'arrivée du formulaire")
     else:
         duve_ok, duve_err = _duve_push_all(members, pin_value, link or "")
         if not duve_ok:
@@ -1312,6 +1393,8 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
         _notify_hold(row, hold)  # `observe` compris — cf. docstring de _notify_hold
     if hold and ISEO_HOLD_MODE == "on":
         return True, None  # rétention volontaire : ce n'est PAS une erreur de run
+    if not members:
+        return True, None  # code créé sans formulaire : pas une erreur non plus
     if not duve_ok:
         return False, f"Sofia OK mais Duve KO: {duve_err}"
     return True, None
@@ -1598,7 +1681,10 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     #    (la porte laisse passer), recevoir le code à J-3, puis avancer les dates à
     #    aujourd'hui — le resync repousserait le code sans aucun contrôle. Une
     #    rétention déjà libérée à la main n'est pas re-fermée (released_at présent).
-    members = row.get("member_duve_ids") or [duve_resa_id]
+    members = [m for m in (row.get("member_duve_ids") or []) if m]
+    if not members and not duve_resa_id.startswith("M"):
+        members = [duve_resa_id]
+    row["no_duve"] = not members
     hold = None
     if not row.get("cache_released"):
         hold = _evaluate_hold(row)
@@ -1606,6 +1692,8 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
         duve_ok, duve_err = False, None
         logger.warning(f"🔒 HOLD au resync {duve_resa_id} ({row.get('apartment_code')}) — "
                        f"{hold} → nouveau lien PAS envoyé à Duve")
+    elif not members:
+        duve_ok, duve_err = False, None  # clé M sans formulaire : rien où pousser
     else:
         duve_ok, duve_err = _duve_push_all(members, pin_value, link or "")
 
@@ -1628,7 +1716,7 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     if hold and ISEO_HOLD_MODE == "on":
         logger.info(f"🔄 resync {duve_resa_id} window → {ci_str}→{co_str} (code retenu)")
         return True, None
-    if not duve_ok:
+    if not duve_ok and duve_err is not None:
         return False, f"resync Sofia OK mais Duve KO: {duve_err}"
     logger.info(f"🔄 resync {duve_resa_id} window → {ci_str}→{co_str}")
     return True, None
@@ -1983,7 +2071,19 @@ def _run_inner() -> None:
     to_provision = _resa_to_provision()
     logger.info(f"📋 {len(to_provision)} résa(s) à provisionner (CI dans 0-{LOOKAHEAD_DAYS}j, pas encore couvertes)")
     ok = skip = held = 0
+    n_no_form = sum(1 for r in to_provision if r.get("no_duve"))
+    wallet_used = _wallet_used() if n_no_form else None
+    if n_no_form:
+        logger.info(f"📝 {n_no_form} séjour(s) sans pré-checkin à créer (chantier E) — "
+                    f"wallet {wallet_used}/600, garde à {ISEO_QUOTA_MAX_USED_NO_FORM}")
     for row in to_provision:
+        if row.get("no_duve") and wallet_used is not None \
+                and wallet_used >= ISEO_QUOTA_MAX_USED_NO_FORM:
+            skip += 1
+            logger.warning(f"🚫 QUOTA {wallet_used}/600 ≥ {ISEO_QUOTA_MAX_USED_NO_FORM} — pas de "
+                           f"création sans formulaire pour {row.get('customer_name')} "
+                           f"({row.get('apartment_code')}, CI {row.get('checkin_date')})")
+            continue
         # ⚠⚠ HyperGate morte = NE PAS PROVISIONNER. Le code partirait dans Duve sans
         # jamais atteindre la serrure (qui stocke ses codes en local et ne les reçoit
         # que par la passerelle) → le client se présente avec un code qui ne s'ouvre
@@ -2035,6 +2135,8 @@ def _run_inner() -> None:
             _log_hold_decision(row, row["hold_reason"], "provision", outcome)
         if success:
             ok += 1
+            if wallet_used is not None:
+                wallet_used += 2  # user + device (+ invitation) par séjour créé
         elif str(err).startswith("skipped"):
             skip += 1
         else:
@@ -2076,14 +2178,24 @@ def _run_inner() -> None:
     retry = 0
     if not ISEO_SHADOW_MODE:
         for row in _resa_duve_retry():
-            members = (row.get("stay_member_duve_ids") or row["duve_reservation_id"]).split(",")
+            key = row["duve_reservation_id"]
+            members = [m for m in (row.get("live_member_duve_ids") or []) if m] \
+                or [m for m in (row.get("stay_member_duve_ids") or "").split(",") if m]
+            if not members:
+                if key.startswith("M"):
+                    continue  # code créé sans formulaire, toujours pas de Duve : rien où pousser
+                members = [key]
             done, err = _duve_push_all(members, row.get("pin_value") or "",
                                        row.get("invitation_link") or "")
             if done:
-                _mark_duve_pushed(row["duve_reservation_id"])
+                _mark_duve_pushed(key, ",".join(members))
                 retry += 1
+                if key.startswith("M"):
+                    logger.info(f"📨 {key} — formulaire arrivé, code poussé à Duve ({', '.join(members)})")
+                    for d in members:
+                        _purge_native_duplicate(d)
             else:
-                errors.append(f"duve-retry {row['duve_reservation_id']}: {err}")
+                errors.append(f"duve-retry {key}: {err}")
 
     # 3. Archive (CO passé / annulée)
     to_archive = _resa_to_archive()
