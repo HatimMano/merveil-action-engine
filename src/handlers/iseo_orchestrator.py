@@ -953,17 +953,19 @@ def _resa_duve_retry() -> list[dict]:
     q = f"""
     WITH {_STAYS_CTE},
     cache AS (
+      -- ⭐ Depuis le 07/09 les RETENUES sont incluses (plus de filtre hold_reason) :
+      -- la porte est ré-évaluée à chaque run et une rétention dont TOUS les critères
+      -- sont levés (paiement encaissé, fiche blacklist levée…) est libérée seule.
       SELECT duve_reservation_id, pin_value, invitation_link, stay_member_duve_ids,
-             mews_reservation_number
+             mews_reservation_number, hold_reason, released_at
       FROM `{PIN_CACHE_TABLE}`
       WHERE archived_at IS NULL AND provisioned_at IS NOT NULL AND duve_pushed_at IS NULL
-        AND (hold_reason IS NULL OR released_at IS NOT NULL)
     )
     -- ⭐ Chantier E : les duve du stay sont résolus EN DIRECT (une ligne keyée M n'en
     -- avait aucun à la création). Dès que le formulaire arrive, `stays` porte le
     -- duve → push au run suivant (≤ 10 min, ou 2-3 min via l'event-driven).
     SELECT c.duve_reservation_id, c.pin_value, c.invitation_link, c.stay_member_duve_ids,
-           c.mews_reservation_number,
+           c.mews_reservation_number, c.hold_reason AS cache_hold, c.released_at AS cache_released,
            ANY_VALUE(s.member_duve_ids)      AS live_member_duve_ids,
            -- Signaux de la porte, pour la RÉ-ÉVALUER à l'arrivée du formulaire sur une
            -- clé M : le pré-checkin apporte des signaux (âges → groupe jeune, nom de la
@@ -986,9 +988,20 @@ def _resa_duve_retry() -> list[dict]:
     LEFT JOIN stays s
       ON s.canonical_duve = c.duve_reservation_id
       OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
-    GROUP BY 1, 2, 3, 4, 5
+    GROUP BY 1, 2, 3, 4, 5, 6, 7
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
+
+
+def _mark_released(duve_resa_id: str, by: str) -> None:
+    q = f"""
+    UPDATE `{PIN_CACHE_TABLE}`
+    SET released_at = CURRENT_TIMESTAMP(), released_by = @by
+    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    """
+    _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
+        bigquery.ScalarQueryParameter("by", "STRING", by)])).result()
 
 
 def _mark_held(duve_resa_id: str, hold_reason: str, member_csv: Optional[str] = None) -> None:
@@ -2269,7 +2282,19 @@ def _run_inner() -> None:
                 if key.startswith("M"):
                     continue  # code créé sans formulaire, toujours pas de Duve : rien où pousser
                 members = [key]
-            if key.startswith("M"):
+            if row.get("cache_hold") and not row.get("cache_released"):
+                # ⭐ Rétention en cours : la porte est RÉ-ÉVALUÉE à chaque run. Si plus
+                # aucun critère ne tient (paiement encaissé, fiche levée, dates
+                # changées…), le code part seul — sans geste RC ni mail. Sinon on
+                # attend [Livrer]. Ne s'applique pas à une libération manuelle.
+                still = _evaluate_hold(row) if ISEO_HOLD_MODE == "on" else None
+                if still:
+                    continue
+                _mark_released(key, "auto:criteres_leves")
+                _log_hold_decision(row, row["cache_hold"], "auto_release", "released")
+                logger.info(f"🔓 {key} ({row.get('apartment_code')}) — critères levés "
+                            f"(était : {row['cache_hold']}) → code poussé à Duve")
+            elif key.startswith("M"):
                 # ⭐ Le formulaire vient d'arriver : la porte est évaluée ICI, avec les
                 # signaux qu'il apporte (groupe jeune, nom de pièce…). Une rétention
                 # bloque le push exactement comme au provisioning ; la RC livre en 6.1.
