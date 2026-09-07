@@ -190,6 +190,7 @@ ISEO_RETRY_PUSH_MAX = int(os.environ.get("ISEO_RETRY_PUSH_MAX", "36"))
 ISEO_VERIFY_AFTER_MIN = int(os.environ.get("ISEO_VERIFY_AFTER_MIN", "3"))
 ISEO_VERIFY_RETRY_AFTER_MIN = int(os.environ.get("ISEO_VERIFY_RETRY_AFTER_MIN", "10"))
 ISEO_WRITE_RETRY_MAX = int(os.environ.get("ISEO_WRITE_RETRY_MAX", "3"))
+ISEO_VERIFY_MAX_PER_RUN = int(os.environ.get("ISEO_VERIFY_MAX_PER_RUN", "200"))
 
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
@@ -1801,81 +1802,122 @@ def _rows_to_verify() -> list[dict]:
       AND c.iseo_device_id IS NOT NULL
       AND c.provisioned_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @after MINUTE)
       AND c.checkout_date >= CURRENT_DATE('Europe/Paris')
+    -- Les plus anciens d'abord ; plafond de sûreté (task-timeout 300 s). Plus aucun
+    -- appel API par ligne depuis la recette du 07/09 (listing + UPDATE par lot).
     ORDER BY c.provisioned_at
+    LIMIT @cap
     """
     job = _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("after", "INT64", ISEO_VERIFY_AFTER_MIN)]))
+        bigquery.ScalarQueryParameter("after", "INT64", ISEO_VERIFY_AFTER_MIN),
+        bigquery.ScalarQueryParameter("cap", "INT64", ISEO_VERIFY_MAX_PER_RUN)]))
     return [dict(r) for r in job.result()]
 
 
-def _mark_lock_written(duve_resa_id: str) -> None:
+def _device_states() -> dict[str, str]:
+    """{device id: credentialRule.state} pour TOUT l'inventaire, en 2-3 appels paginés
+    (Spring : page/pageSize → content/totalPages, même chemin que l'ETL `iseo.py`).
+    ⚠ C'est la SEULE lecture qui porte `state` : `GET /standardDevices/{id}` répond
+    400 et `/extId/{ext}` renvoie un DTO SANS `credentialRule.state` (recette 07/09 :
+    98/98 « rule_state=? », tous relancés à tort)."""
+    states: dict[str, str] = {}
+    page = 0
+    while True:
+        r = _sofia("GET", f"/api/v2/standardDevices?page={page}&pageSize=200")
+        if r.status_code != 200:
+            raise RuntimeError(f"list devices page={page}: HTTP {r.status_code}: {r.text[:120]}")
+        payload = r.json() or {}
+        items = payload.get("content", []) if isinstance(payload, dict) else payload
+        for it in items:
+            st = ((it.get("credentialRule") or {}).get("state") or "")
+            states[str(it.get("id"))] = str(st).upper()
+        total_pages = payload.get("totalPages") if isinstance(payload, dict) else None
+        if not items or total_pages is None or page + 1 >= total_pages:
+            break
+        page += 1
+    return states
+
+
+def _mark_lock_written(duve_resa_ids: list[str]) -> None:
+    # ⚠ Un UPDATE BQ coûte ~2-3 s : par lot, jamais par ligne (98 lignes × 2 requêtes
+    # = task-timeout dépassé au 1er passage du 07/09).
+    if not duve_resa_ids:
+        return
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
     SET lock_written_at = CURRENT_TIMESTAMP()
-    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    WHERE duve_reservation_id IN UNNEST(@ids) AND archived_at IS NULL
     """
     _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id)])).result()
+        bigquery.ArrayQueryParameter("ids", "STRING", duve_resa_ids)])).result()
 
 
-def _bump_write_retries(duve_resa_id: str) -> None:
+def _bump_write_retries(duve_resa_ids: list[str]) -> None:
+    if not duve_resa_ids:
+        return
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
     SET write_retries = COALESCE(write_retries, 0) + 1
-    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    WHERE duve_reservation_id IN UNNEST(@ids) AND archived_at IS NULL
     """
     _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id)])).result()
+        bigquery.ArrayQueryParameter("ids", "STRING", duve_resa_ids)])).result()
 
 
 def _verify_writes() -> tuple[int, int, int, list[str]]:
-    """Phase « verify » (chantier C) : lit `credentialRule.state` de chaque device créé
-    et pas encore accusé. UPDATED → `lock_written_at`. Sinon, passé le délai de retry,
-    ré-émet un CREDENTIALS_UPDATED sur la passerelle de la serrure et incrémente
-    `write_retries` — à ISEO_WRITE_RETRY_MAX, dbt rend `non_ecrit` (6.1 : dicter le code
-    fixe). On continue de VÉRIFIER après le plafond (le GET est gratuit) : quand la
-    passerelle repart (salve manuelle, chantier G), l'accusé arrive et l'état redevient
-    `delivre` tout seul. Retourne (écrits, relancés, en attente, erreurs)."""
+    """Phase « verify » (chantier C) : confronte chaque device créé et pas encore
+    accusé à `credentialRule.state` lu sur l'inventaire Sofia (un listing par run).
+    UPDATED → `lock_written_at`. Sinon, passé le délai de retry, ré-émet UN
+    CREDENTIALS_UPDATED PAR PASSERELLE concernée et incrémente `write_retries` des
+    résas derrière — à ISEO_WRITE_RETRY_MAX, dbt rend `non_ecrit` (6.1 : dicter le
+    code fixe). On continue de VÉRIFIER après le plafond : quand la passerelle repart
+    (salve manuelle, chantier G), l'accusé arrive et l'état redevient `delivre` seul.
+    Retourne (écrits, relancés, en attente, erreurs)."""
     written = retried = pending = 0
     errors: list[str] = []
+    rows = _rows_to_verify()
+    if not rows:
+        return 0, 0, 0, []
+    states = _device_states()
+    written_ids: list[str] = []
+    bumped_ids: list[str] = []
+    gateways: dict[str, list[str]] = {}
     now = datetime.now(timezone.utc)
-    for row in _rows_to_verify():
+    for row in rows:
         tag = f"{row.get('mews_reservation_number')} ({row.get('apartment_code')})"
+        dev_id = str(row["iseo_device_id"])
+        if dev_id not in states:
+            # Device disparu côté Sofia (supprimé à la main) : `iseo_reconciliation`
+            # (MISSING_IN_SOFIA) le porte, pas nous.
+            pending += 1
+            continue
+        if states[dev_id] == "UPDATED":
+            written_ids.append(row["duve_reservation_id"])
+            written += 1
+            continue
+        age_min = (now - row["provisioned_at"]).total_seconds() / 60
+        if age_min < ISEO_VERIFY_RETRY_AFTER_MIN or row["write_retries"] >= ISEO_WRITE_RETRY_MAX:
+            pending += 1
+            continue
+        if row.get("gateway_id") is None:
+            logger.warning(f"⚠️ verify {tag}: serrure sans passerelle connue — rien à relancer")
+        else:
+            gateways.setdefault(str(row["gateway_id"]), []).append(tag)
+        bumped_ids.append(row["duve_reservation_id"])
+        retried += 1
+        logger.warning(f"⚠️ verify {tag}: rule_state={states[dev_id] or '?'} après {age_min:.0f} min "
+                       f"→ relance {row['write_retries'] + 1}/{ISEO_WRITE_RETRY_MAX}")
+    for gw_id, tags in gateways.items():
         try:
-            # ⚠ GET /standardDevices/{id} répond 400 chez Sofia (vérifié 07/09 : 98/98) —
-            # seul /extId/{ext} existe en unitaire (même constat dans
-            # iseo_fix_gou71_credential.py). Le device de séjour porte l'extId
-            # `MERVEIL_RESA - <duve_reservation_id>` (cf. _provision / _resync).
-            g = _sofia("GET", f"/api/v2/standardDevices/extId/MERVEIL_RESA - {row['duve_reservation_id']}")
-            if g.status_code == 404:
-                # Device disparu côté Sofia (supprimé à la main) : rien à vérifier ici,
-                # c'est `iseo_reconciliation` (MISSING_IN_SOFIA) qui le porte.
-                pending += 1
-                continue
-            if g.status_code != 200:
-                errors.append(f"verify {tag}: GET device {g.status_code}: {g.text[:120]}")
-                continue
-            state = ((g.json().get("credentialRule") or {}).get("state") or "").upper()
-            if state == "UPDATED":
-                _mark_lock_written(row["duve_reservation_id"])
-                written += 1
-                continue
-            age_min = (now - row["provisioned_at"]).total_seconds() / 60
-            if age_min < ISEO_VERIFY_RETRY_AFTER_MIN or row["write_retries"] >= ISEO_WRITE_RETRY_MAX:
-                pending += 1
-                continue
-            if row.get("gateway_id") is not None:
-                ok, err = _retry_push({"gateway_id": row["gateway_id"]})
-                if not ok and not str(err).startswith("skipped"):
-                    errors.append(f"verify {tag}: retry push gw {row['gateway_id']}: {err}")
-            else:
-                logger.warning(f"⚠️ verify {tag}: serrure sans passerelle connue — rien à relancer")
-            _bump_write_retries(row["duve_reservation_id"])
-            retried += 1
-            logger.warning(f"⚠️ verify {tag}: rule_state={state or '?'} après {age_min:.0f} min "
-                           f"→ relance {row['write_retries'] + 1}/{ISEO_WRITE_RETRY_MAX}")
+            ok, err = _retry_push({"gateway_id": gw_id})
+            if not ok and not str(err).startswith("skipped"):
+                errors.append(f"verify: retry push gw {gw_id} ({', '.join(tags[:3])}): {err}")
         except Exception as e:
-            errors.append(f"verify {tag}: exception: {e}")
+            errors.append(f"verify: retry push gw {gw_id}: exception: {e}")
+    try:
+        _mark_lock_written(written_ids)
+        _bump_write_retries(bumped_ids)
+    except Exception as e:
+        errors.append(f"verify: écriture cache échouée ({e}) — {len(written_ids)} accusé(s) perdus, revus au prochain run")
     return written, retried, pending, errors
 
 
