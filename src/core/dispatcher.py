@@ -49,12 +49,24 @@ TRIGGERS_STALE_MAX_HOURS = float(os.getenv("TRIGGERS_STALE_MAX_HOURS", "4.5"))
 TRIGGERS_STALE_ALERT_TO = os.getenv("TRIGGERS_STALE_ALERT_TO", "hatim@archides.fr")
 
 # TTL par bucket pour les actions email_digest (en heures)
+# ⚠ Indexé par BUCKET (c'est `_resolve_expired_digests(bucket)` qui lit ici), pas
+# par freq : les buckets satellites (`flush_with`) doivent avoir leur propre clé,
+# sinon défaut 24 h — et 24 h est PILE la fenêtre de chargement de `_load_triggers`
+# (`_dbt_loaded_at` < 24 h) : la clé de dédup se rouvre alors que le trigger est
+# encore chargeable → un rejeu, un seul, ~24 h après le premier envoi (Muguerza
+# 05/09 16:51 → 06/09 18:51). Tout TTL doit donc être > 24 h, sauf pour les
+# buckets où la répétition est voulue (2h/4h : serrures).
 DIGEST_TTL_HOURS = {
     "2h": 4,   # serrures : run toutes les 2h, re-alerte max toutes les 4h (dédup)
     "4h": 4,
     "daily": 24,
     "weekly": 168,
     "monthly": 720,
+    # Satellites flush_with 2h : un fait (fraude, chargeback, blacklist) s'annonce
+    # une fois ; le rejeu n'apporte rien à l'astreinte (décision Hatim 07/09).
+    "fraude": 72,
+    "chargeback": 72,
+    "blacklist": 72,
 }
 
 # Registry des handlers

@@ -74,7 +74,7 @@ Cf. [[project_iseo_integration_2026]] + `Archides/to_do_20_06.md`.
 - ⚠ **Garde-fou anti-boucle d'alerte** (`_hold_already_notified`) : en mode `observe` le cache ne porte PAS de `hold_reason`, donc la garde `cache_hold` du resync était **inopérante** et chaque resync renvoyait le mail. Invisible tant que la porte ne retenait que ~12 directs/mois ; en y versant le paiement (tous canaux), le resync devenait un émetteur régulier. La question « a-t-on déjà prévenu ? » se pose **AVANT** `_log_hold_decision`, sinon la query voit la ligne qu'on vient d'écrire et le mail ne part jamais.
 - **Aval** : `bloque_paiement` retiré de `pin_state` (`dash_ops_arrivals`), absorbé par `retenu` + colonne `pin_hold_motif` ; `dash_360_resa_fleet` repointé ; miroir `dash_ops_hold_simulation` aligné (`critere_paiement`). Colonne `payment_unpaid` ajoutée à `iseo_raw.hold_decisions`.
 - ⚠ **Ordre de déploiement : action-engine AVANT dbt.** L'inverse fait tomber les résas impayées dans `manquant`, qui affirme « aurait dû être généré ».
-- ⚠ La cause `paiement` du mail quotidien « résas sans code » devient **inatteignable** — elle est gardée comme **détecteur de régression** : si elle se remet à compter, un blocage a été réintroduit avant la création.
+- ⚠ La cause `paiement` de `_whitelisted_gaps` (log par run, ex-mail quotidien « résas sans code ») devient **inatteignable** — elle est gardée comme **détecteur de régression** : si elle se remet à compter, un blocage a été réintroduit avant la création.
 
 ⚠️⚠️ **GARDE-FOU HYPERGATE — 2026-08-19 (ADR), ÉTENDU LE 2026-08-25.**
 
@@ -121,7 +121,7 @@ Version d'origine du garde-fou (connexion) : Une serrure ISEO stocke ses codes *
 
 **Alerting** : `run()` est un wrapper qui envoie un **mail** (`ISEO_ALERT_TO`, infra Gmail `alerts-gmail-sa-key` via Secret Manager + DWD) — récap si ≥1 erreur (provision/retry/archive), CRASH + exit non-zero si exception. ⚠️ délimiteur env `^;^` dans `deploy.sh` (les emails contiennent `@`).
 
-**Mail quotidien « résas sans code » (refondu 2026-08-05)** : `_whitelisted_gaps()` classe chaque résa whitelistée à provisionner (CI ≤ J+lookahead, sans row cache active) par **cause** : `lock` (serrure non résolue, anormal) · `precheckin` (pas de mapping Duve, n'alerte qu'à CI ≤ J+1 — bruit auto-résolu avant) · `paiement` (gate volontaire : tous les paiements `Failed`, aucun `Charged` — VCC Expedia/VRBO typiquement) · `autre` (**le vrai signal** : provisionnable en apparence mais toujours pas de code — invisible de l'ancien mail qui ne voyait que no_duve/no_lock). Mail **HTML** (`_build_gaps_html`, style aligné brief annulations : KPIs par cause + 1 table par section + hint), sujet 🔴 si ≥1 lock/autre, envoyé 1×/jour au run de 8h Paris, destinataire = `ISEO_ALERT_TO` (hatim seul). Même sémantique que `pin_state` de `dash_ops_arrivals` (6.1) — garder les deux alignés.
+**Trous silencieux `_whitelisted_gaps()` (refondu 2026-08-05, ⛔ mail supprimé 2026-09-07)** : classe chaque résa whitelistée à provisionner (CI ∈ [J-1, J+lookahead], sans row cache active) par **cause** : `lock` (serrure non résolue, anormal) · `gateway` (HyperGate qui n'écrit plus) · `precheckin` (pas de mapping Duve, ne compte qu'à CI ≤ J+1 — bruit auto-résolu avant) · `paiement` (détecteur de régression, doit rester à 0) · `autre` (provisionnable en apparence mais toujours pas de code — le vrai signal). **Loggé en warning à chaque run, plus aucun mail.** Le mail HTML « 🔴 ISEO — N résa(s) sans code » (1×/jour, hatim seul) était gardé par `datetime.now(PARIS_TZ).hour == 8` — une garde qui supposait UN run dans l'heure 8 (scheduler :45). Depuis le déclenchement event-driven par le gateway (03/09, chaque `preCheckInDone`), chaque run entre 8h et 9h le renvoyait : 1 mail le 05/09, 2 le 06/09, **4 le 07/09** (08:02, 08:11, 08:21, 08:31). Décision Hatim 07/09 : rien d'urgent dedans, tout est en 6.1 (`pin_state`), la passerelle morte a ses triggers dbt (`iseo_gateway_offline`/`push_stuck`), la porte dormante a `iseo_pin_missing` → mail retiré (`_GAP_REASONS` + `_build_gaps_html` supprimés). ⚠ Leçon : **une garde horaire n'est pas une idempotence** — tout envoi « 1×/jour » dans ce job doit s'appuyer sur un état (table), le job pouvant tourner N fois par heure. Même sémantique que `pin_state` de `dash_ops_arrivals` (6.1) — garder les deux alignés.
 
 **État cutover (22/06)** : live sur **7 apparts**. Les 5 d'origine AVEC guest tag (OUR12-1D, TBG52-1D, TBG52-1G, SEB23-3F, SEB23-3G) + **CLE7-0D** (1er appart **via fallback guest tag 132094**, validé E2E en prod le 22/06 : device+invitation+lien+Duve OK) + **MRI16-0D** (guest tag propre). `ISEO_SHADOW_MODE=false`. Restent hors whitelist : ABO58, POC5, SEB44 (tagless → prochain paquet fallback).
 
@@ -436,6 +436,13 @@ BigQuery `CONCAT(a, b, NULL, c)` retourne **NULL** dès qu'un seul argument est 
 `rule_daily_alert_digest` emits `property_id = CURRENT_DATE` → max 1 email per day.
 All rules: if an `open` trigger already exists for `(rule_name, property_id)` in
 `action_engine.action_triggers`, the action is skipped.
+
+⚠ **TTL des digests = par BUCKET, et > 24 h obligatoire (2026-09-07)** : `_resolve_expired_digests(bucket)`
+lit `DIGEST_TTL_HOURS[bucket]`, défaut 24 h. Or `_load_triggers` recharge un trigger pendant 24 h après son
+`_dbt_loaded_at` → avec un TTL de 24 h la clé de dédup se rouvre alors que le trigger est encore chargeable, et
+il repart UNE fois (Muguerza : 05/09 16:51 → 06/09 18:51). Les satellites `fraude`/`chargeback`/`blacklist` sont
+désormais à 72 h ; tout nouveau bucket `flush_with` doit avoir sa clé. Deuxième moitié du même incident côté
+dbt : `detected_at` doit porter la date de l'événement, pas `CURRENT_TIMESTAMP()` (cf. dbt/CLAUDE.md).
 If no alerts in `dash_alerts`, the handler raises `SkipAction` (not logged as an error).
 
 The email digest triggers are never auto-resolved (no associated Breezeway task) —

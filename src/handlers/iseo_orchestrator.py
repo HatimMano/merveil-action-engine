@@ -686,124 +686,6 @@ def _whitelisted_gaps() -> list[dict]:
     return [dict(r.items()) for r in _bq().query(q, job_config=cfg).result()]
 
 
-# Mail quotidien « résas sans code » — 1 section par cause, style aligné sur le
-# brief annulations (cancellations_brief.py). Destinataire = ISEO_ALERT_TO.
-_GAP_REASONS = {
-    "autre": {
-        "label": "⚠ Aurait dû être généré — à investiguer",
-        "hint":  "Whitelisté, pre-checkin fait, paiement OK, serrure OK… mais aucun code. "
-                 "Vérifier le tab 7.8 et les logs de l'orchestrateur.",
-        "bg": "#fef2f2", "fg": "#dc2626",
-    },
-    "gateway": {
-        "label": "HyperGate qui n'écrit plus dans la serrure",
-        "hint":  "Un code généré n'atteindrait PAS la serrure (elle ne les reçoit que par "
-                 "la passerelle) et le client trouverait porte close — c'est ce qui a bloqué "
-                 "4 clients dehors sur LAO4-0G entre le 23/07 et le 12/08. On ne génère donc "
-                 "rien : Duve sert le code fixe, qui fonctionne. DEUX causes possibles, et "
-                 "elles n'appellent pas le même geste. (1) La passerelle ne répond plus "
-                 "depuis > 24 h → se déplacer, elle ne se redémarre plus à distance. "
-                 "(2) Elle répond mais son dernier push de codes n'a pas abouti → tenter "
-                 "d'abord `utils/iseo_unstick_gateway.py --gateway <id>` (redémarrage + "
-                 "réémission), ça a débloqué 8 passerelles sur 13 depuis le 24/08 ; si six "
-                 "tentatives échouent, escalader à Sofia. Le détail est dans le tab 7.7 et "
-                 "dans `docs/iseo-vision.md` §12.",
-        "bg": "#fef2f2", "fg": "#dc2626",
-    },
-    "lock": {
-        "label": "Serrure non résolue",
-        "hint":  "Appart whitelisté sans lock/lockTag mappé — anormal, à corriger côté Sofia.",
-        "bg": "#fef2f2", "fg": "#dc2626",
-    },
-    "paiement": {
-        "label": "Paiement échoué — provision retenue",
-        "hint":  "Tous les paiements Mews en Failed, aucun Charged (gate volontaire, "
-                 "souvent VCC Expedia/VRBO pas encore chargeable). Le code fixe couvre.",
-        "bg": "#fffbeb", "fg": "#b45309",
-    },
-    "precheckin": {
-        "label": "Pre-checkin non rempli (CI ≤ J+1)",
-        "hint":  "Pas de mapping Duve sans formulaire → relancer le guest. "
-                 "Le code fixe couvre en attendant.",
-        "bg": "#fffbeb", "fg": "#b45309",
-    },
-}
-
-
-def _build_gaps_html(gaps: list[dict], paris_today: str) -> str:
-    counts = {k: sum(1 for g in gaps if g["reason"] == k) for k in _GAP_REASONS}
-    kpis = "".join(
-        f'<div style="display:inline-block;background:#fff;border:1px solid #e2e8f0;'
-        f'border-radius:6px;padding:10px 16px;margin:0 8px 8px 0">'
-        f'<div style="font-size:11px;color:#64748b;text-transform:uppercase">{cfg["label"]}</div>'
-        f'<div style="font-size:22px;font-weight:700;color:{cfg["fg"] if counts[k] else "#059669"}">{counts[k]}</div>'
-        f'</div>'
-        for k, cfg in _GAP_REASONS.items()
-    )
-
-    sections = ""
-    for k, cfg in _GAP_REASONS.items():
-        items = [g for g in gaps if g["reason"] == k]
-        if not items:
-            continue
-        rows_html = "".join(
-            f'<tr style="border-bottom:1px solid #f1f5f9">'
-            f'<td style="padding:8px 12px;font-size:13px;color:#334155"><strong>{g.get("customer_name") or "—"}</strong></td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;font-family:monospace">{g.get("apartment_code") or g.get("resource_id") or "—"}</td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#64748b;white-space:nowrap">{g.get("checkin_date")} → {g.get("checkout_date")}</td>'
-            f'<td style="padding:8px 12px;font-size:12px;color:#64748b">{g.get("reservation_number")}</td>'
-            f'</tr>'
-            for g in items
-        )
-        sections += (
-            f'<div style="margin-top:20px">'
-            f'<div style="display:inline-block;background:{cfg["bg"]};color:{cfg["fg"]};'
-            f'padding:3px 10px;border-radius:4px;font-size:13px;font-weight:600">'
-            f'{cfg["label"]} · {len(items)}</div>'
-            f'<p style="font-size:12px;color:#94a3b8;margin:6px 0 8px">{cfg["hint"]}</p>'
-            f'<table style="width:100%;border-collapse:collapse;background:white;'
-            f'border:1px solid #e2e8f0;border-radius:6px;overflow:hidden">'
-            f'<thead><tr style="background:#f8fafc;text-align:left">'
-            f'<th style="padding:8px 12px;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600">Guest</th>'
-            f'<th style="padding:8px 12px;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600">Appart</th>'
-            f'<th style="padding:8px 12px;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600">Séjour</th>'
-            f'<th style="padding:8px 12px;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600">Résa</th>'
-            f'</tr></thead><tbody>{rows_html}</tbody></table>'
-            f'</div>'
-        )
-
-    return f"""
-<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
-<body style="background:#f8fafc;padding:24px;font-family:-apple-system,Segoe UI,sans-serif;color:#0f172a">
-  <div style="max-width:820px;margin:0 auto">
-    <h1 style="font-size:22px;margin:0 0 4px">Codes d'accès ISEO — {paris_today}</h1>
-    <p style="color:#64748b;font-size:14px;margin:0 0 20px">
-      Résas whitelistées à provisionner (CI ≤ J+{LOOKAHEAD_DAYS}) toujours sans code, par cause.
-    </p>
-    <div style="margin-bottom:12px">{kpis}</div>
-    {sections}
-    <div style="margin-top:24px">
-      <a href="https://direction.archides.fr/ops-front?tab=arrivals"
-         style="background:#4f46e5;color:white;padding:10px 20px;border-radius:6px;
-                text-decoration:none;font-size:14px;font-weight:600;display:inline-block">
-        Voir les arrivées (6.1) →
-      </a>
-      <a href="https://direction.archides.fr/ops-back?tab=pin_pipeline"
-         style="margin-left:8px;color:#4f46e5;padding:10px 12px;font-size:14px;
-                text-decoration:none;font-weight:600;display:inline-block">
-        Pipeline PIN (7.8)
-      </a>
-    </div>
-    <p style="font-size:11px;color:#94a3b8;margin-top:32px">
-      Mail généré automatiquement (run orchestrateur ~08:45 Paris, 1×/jour) ·
-      merveil-action-engine-iseo · les états par arrivée sont aussi dans 6.1 (« Code d'accès ISEO »).
-    </p>
-  </div>
-</body></html>
-"""
-
-
 def _resa_to_archive() -> list[dict]:
     """Rows actives à archiver : plus aucun stay live ne contient le duve du cache.
     `member_resas` exclut les annulées et les CO < today → un duve absent de TOUT stay
@@ -2001,9 +1883,13 @@ def _run_inner() -> None:
             errors.append(f"provision {row['duve_reservation_id']} ({row.get('apartment_code')}): {err}")
 
     # 1a. Trous silencieux : résas whitelistées à provisionner toujours sans code,
-    # classées par cause (lock / precheckin / paiement / autre). Loggés à CHAQUE run
-    # mais mail 1×/jour seulement (run ~08:45 Paris) — un precheckin se résout souvent
-    # seul quand le guest fait son formulaire, inutile de spammer toutes les 2h.
+    # classées par cause (lock / gateway / precheckin / paiement / autre). Loggés à
+    # CHAQUE run, en warning. ⛔ Plus de mail depuis le 07/09 : le mail « 1×/jour »
+    # était gardé par `hour == 8`, et depuis que le gateway lance le job à chaque
+    # preCheckInDone (03/09), chaque run entre 8h et 9h le renvoyait (4 mails le
+    # 07/09). Décision Hatim : rien d'urgent dedans — les états par arrivée sont en
+    # 6.1 (`pin_state`), la passerelle morte a son trigger dbt, la porte dormante
+    # a `iseo_pin_missing`. Le log par run suffit pour investiguer un « autre ».
     gaps = _whitelisted_gaps()
     for g in gaps:
         logger.warning(
@@ -2105,8 +1991,8 @@ def _run_inner() -> None:
     # ⚠ PAS de mail dédié ici (retiré le 20/08, il sonnait toutes les 2 h pour la
     # même réservation). Une passerelle morte est un état PERSISTANT : le répéter huit
     # fois par nuit n'ajoute rien et apprend au lecteur à ignorer l'expéditeur. La cause
-    # est désormais portée par le mail quotidien « résas sans code » (`_whitelisted_gaps`,
-    # cause `gateway`) — un seul mail, au bon endroit, avec les autres causes.
+    # est portée par `_whitelisted_gaps` (cause `gateway`, log par run) et par le
+    # trigger dbt `iseo_gateway_offline` / `iseo_gateway_push_stuck` (digest 2h).
     if errors:
         body = build_email(
             "ISEO orchestrator — erreurs",
@@ -2127,11 +2013,3 @@ def _run_inner() -> None:
         )
         _send_alert(f"⚠️ ISEO orchestrator — {len(errors)} erreur(s)", body, html=True)
 
-    # Gaps : mail 1×/jour (run du matin ~08:45 Paris), séparé des erreurs dures qui,
-    # elles, alertent à chaque run. Évite le spam sur un gap qui se résout tout seul.
-    if gaps and datetime.now(PARIS_TZ).hour == 8:
-        n_urgent = sum(1 for g in gaps if g["reason"] in ("autre", "lock", "gateway"))
-        subject = (f"{'🔴' if n_urgent else 'ℹ️'} ISEO — {len(gaps)} résa(s) sans code"
-                   + (f" dont {n_urgent} à investiguer" if n_urgent else ""))
-        paris_today = datetime.now(PARIS_TZ).strftime("%A %d %B %Y")
-        _send_alert(subject, _build_gaps_html(gaps[:50], paris_today), html=True)
