@@ -1275,6 +1275,8 @@ def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
         etat = ("Le client n'a <strong>pas rempli son pré-checkin</strong> : le code existe côté "
                 "serrure et en 6.1, mais <strong>rien ne lui a été envoyé</strong>. Il partira "
                 "seul s'il remplit le formulaire.")
+        suite = ("Vérifier l'identité si le client se présente sans avoir rempli le formulaire. "
+                 "En cas de doute, ne pas dicter le code et faire annuler la réservation.")
     else:
         titre, sujet = "Réservation à risque — code déjà envoyé", "⚠️ Résa à risque (code envoyé)"
         etat = ("La porte de validation est en <strong>mode observation</strong> : le code "
