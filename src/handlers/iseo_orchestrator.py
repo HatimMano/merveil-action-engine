@@ -1842,7 +1842,16 @@ def _verify_writes() -> tuple[int, int, int, list[str]]:
     for row in _rows_to_verify():
         tag = f"{row.get('mews_reservation_number')} ({row.get('apartment_code')})"
         try:
-            g = _sofia("GET", f"/api/v2/standardDevices/{row['iseo_device_id']}")
+            # ⚠ GET /standardDevices/{id} répond 400 chez Sofia (vérifié 07/09 : 98/98) —
+            # seul /extId/{ext} existe en unitaire (même constat dans
+            # iseo_fix_gou71_credential.py). Le device de séjour porte l'extId
+            # `MERVEIL_RESA - <duve_reservation_id>` (cf. _provision / _resync).
+            g = _sofia("GET", f"/api/v2/standardDevices/extId/MERVEIL_RESA - {row['duve_reservation_id']}")
+            if g.status_code == 404:
+                # Device disparu côté Sofia (supprimé à la main) : rien à vérifier ici,
+                # c'est `iseo_reconciliation` (MISSING_IN_SOFIA) qui le porte.
+                pending += 1
+                continue
             if g.status_code != 200:
                 errors.append(f"verify {tag}: GET device {g.status_code}: {g.text[:120]}")
                 continue
@@ -2106,7 +2115,15 @@ def _run_inner() -> None:
     # fois par nuit n'ajoute rien et apprend au lecteur à ignorer l'expéditeur. La cause
     # est portée par `_whitelisted_gaps` (cause `gateway`, log par run) et par le
     # trigger dbt `iseo_gateway_offline` / `iseo_gateway_push_stuck` (digest 2h).
-    if errors:
+    # Les erreurs vont TOUJOURS au log (avant le 07/09 elles ne vivaient que dans le
+    # mail). Le mail, lui, ne part qu'aux runs des minutes ≥ :40 — cadence 10 min
+    # oblige, sinon une panne Sofia = 6 mails/h ; une erreur persistante est de
+    # toute façon retentée à chaque run et ressort au :40.
+    for e in errors:
+        logger.warning(f"⚠️ {e}")
+    if errors and datetime.now(PARIS_TZ).minute < 40:
+        logger.info(f"{len(errors)} erreur(s) — mail différé au prochain run ≥ :40")
+    elif errors:
         body = build_email(
             "ISEO orchestrator — erreurs",
             subtitle=datetime.now(PARIS_TZ).strftime("%d/%m/%Y %H:%M"),
