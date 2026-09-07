@@ -179,6 +179,18 @@ PIN_COLLISION_RETRIES = 8
 # 36 = 3 jours à 1 push/2 h. OPE18 avait 17 échecs et est passé au 2ᵉ push (après restart).
 ISEO_RETRY_PUSH_MAX = int(os.environ.get("ISEO_RETRY_PUSH_MAX", "36"))
 
+# Vérification post-écriture (chantier C, 07/09) : un code « délivré » n'est pas un code
+# ÉCRIT — l'accusé est `credentialRule.state = UPDATED` sur le device Sofia, que rien ne
+# lisait avant le polling ETL 2 h (alerte `code_non_propage` à 12 h). On le lit en direct
+# ISEO_VERIFY_AFTER_MIN après la création ; sans accusé à ISEO_VERIFY_RETRY_AFTER_MIN on
+# ré-émet un CREDENTIALS_UPDATED sur SA passerelle (≤ ISEO_WRITE_RETRY_MAX fois), et
+# dbt/6.1 rendent l'état `non_ecrit` (« dicter le code fixe »). ⛔ Aucun mail : la RC
+# lit 6.1 chaque matin (filtre « Problème »), le geste est le même quelle que soit la
+# cause (décision Hatim 07/09). Le job tourne toutes les 10 min pour ça.
+ISEO_VERIFY_AFTER_MIN = int(os.environ.get("ISEO_VERIFY_AFTER_MIN", "3"))
+ISEO_VERIFY_RETRY_AFTER_MIN = int(os.environ.get("ISEO_VERIFY_RETRY_AFTER_MIN", "10"))
+ISEO_WRITE_RETRY_MAX = int(os.environ.get("ISEO_WRITE_RETRY_MAX", "3"))
+
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
 
@@ -1773,6 +1785,91 @@ def _stuck_gateways_to_retry() -> list[dict]:
     return [dict(r) for r in job.result()]
 
 
+def _rows_to_verify() -> list[dict]:
+    """Lignes de cache actives, créées depuis ≥ ISEO_VERIFY_AFTER_MIN, sans accusé
+    d'écriture en serrure. La passerelle vient de la serrure du cache (pas du tag)."""
+    q = f"""
+    SELECT c.duve_reservation_id, c.mews_reservation_number, c.apartment_code,
+           c.iseo_device_id, c.provisioned_at,
+           COALESCE(c.write_retries, 0) AS write_retries,
+           l.gateway_id
+    FROM `{PIN_CACHE_TABLE}` c
+    LEFT JOIN `{SMART_LOCKS_TABLE}` l
+      ON CAST(l.lock_id AS STRING) = CAST(c.iseo_lock_id AS STRING)
+    WHERE c.archived_at IS NULL
+      AND c.lock_written_at IS NULL
+      AND c.iseo_device_id IS NOT NULL
+      AND c.provisioned_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @after MINUTE)
+      AND c.checkout_date >= CURRENT_DATE('Europe/Paris')
+    ORDER BY c.provisioned_at
+    """
+    job = _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("after", "INT64", ISEO_VERIFY_AFTER_MIN)]))
+    return [dict(r) for r in job.result()]
+
+
+def _mark_lock_written(duve_resa_id: str) -> None:
+    q = f"""
+    UPDATE `{PIN_CACHE_TABLE}`
+    SET lock_written_at = CURRENT_TIMESTAMP()
+    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    """
+    _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id)])).result()
+
+
+def _bump_write_retries(duve_resa_id: str) -> None:
+    q = f"""
+    UPDATE `{PIN_CACHE_TABLE}`
+    SET write_retries = COALESCE(write_retries, 0) + 1
+    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    """
+    _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id)])).result()
+
+
+def _verify_writes() -> tuple[int, int, int, list[str]]:
+    """Phase « verify » (chantier C) : lit `credentialRule.state` de chaque device créé
+    et pas encore accusé. UPDATED → `lock_written_at`. Sinon, passé le délai de retry,
+    ré-émet un CREDENTIALS_UPDATED sur la passerelle de la serrure et incrémente
+    `write_retries` — à ISEO_WRITE_RETRY_MAX, dbt rend `non_ecrit` (6.1 : dicter le code
+    fixe). On continue de VÉRIFIER après le plafond (le GET est gratuit) : quand la
+    passerelle repart (salve manuelle, chantier G), l'accusé arrive et l'état redevient
+    `delivre` tout seul. Retourne (écrits, relancés, en attente, erreurs)."""
+    written = retried = pending = 0
+    errors: list[str] = []
+    now = datetime.now(timezone.utc)
+    for row in _rows_to_verify():
+        tag = f"{row.get('mews_reservation_number')} ({row.get('apartment_code')})"
+        try:
+            g = _sofia("GET", f"/api/v2/standardDevices/{row['iseo_device_id']}")
+            if g.status_code != 200:
+                errors.append(f"verify {tag}: GET device {g.status_code}: {g.text[:120]}")
+                continue
+            state = ((g.json().get("credentialRule") or {}).get("state") or "").upper()
+            if state == "UPDATED":
+                _mark_lock_written(row["duve_reservation_id"])
+                written += 1
+                continue
+            age_min = (now - row["provisioned_at"]).total_seconds() / 60
+            if age_min < ISEO_VERIFY_RETRY_AFTER_MIN or row["write_retries"] >= ISEO_WRITE_RETRY_MAX:
+                pending += 1
+                continue
+            if row.get("gateway_id") is not None:
+                ok, err = _retry_push({"gateway_id": row["gateway_id"]})
+                if not ok and not str(err).startswith("skipped"):
+                    errors.append(f"verify {tag}: retry push gw {row['gateway_id']}: {err}")
+            else:
+                logger.warning(f"⚠️ verify {tag}: serrure sans passerelle connue — rien à relancer")
+            _bump_write_retries(row["duve_reservation_id"])
+            retried += 1
+            logger.warning(f"⚠️ verify {tag}: rule_state={state or '?'} après {age_min:.0f} min "
+                           f"→ relance {row['write_retries'] + 1}/{ISEO_WRITE_RETRY_MAX}")
+        except Exception as e:
+            errors.append(f"verify {tag}: exception: {e}")
+    return written, retried, pending, errors
+
+
 def _retry_push(gw: dict) -> tuple[bool, Optional[str]]:
     """Ré-émet un CREDENTIALS_UPDATED — le contournement OFFICIEL donné par ISEO le 04/09
     (« forces a global credential synchronization »). Leur plateforme ne ré-émet JAMAIS un
@@ -1819,6 +1916,17 @@ def _run_inner() -> None:
                 f"whitelist={len(ALLOWED_PROPERTY_IDS)} property_ids depuis le seed BQ)")
     logger.info("=" * 70)
     errors: list[str] = []
+
+    # 0. Vérification post-écriture (chantier C) — avant tout : c'est ce qui justifie
+    # la cadence 10 min, et un code créé au run précédent doit être accusé ici.
+    try:
+        v_written, v_retried, v_pending, v_errors = _verify_writes()
+    except Exception as e:
+        v_written = v_retried = v_pending = 0
+        v_errors = [f"verify: {e}"]
+    errors.extend(v_errors)
+    if v_written or v_retried or v_pending:
+        logger.info(f"🔎 verify — écrits={v_written} relancés={v_retried} en attente={v_pending}")
 
     # 1. Provision (J-3)
     to_provision = _resa_to_provision()
@@ -1966,7 +2074,11 @@ def _run_inner() -> None:
     # toutes en ≤ 4 pushes → à 1 push/2 h la plupart repartent dans la journée, sans
     # geste humain. Le garde-fou `gateway_dead` reste tel quel : on ne pousse un code
     # qu'après un APPLIED constaté par l'ETL.
-    to_retry = _stuck_gateways_to_retry()
+    # ⚠ Cadence 10 min depuis le 07/09 : sans garde, ce serait jusqu'à 12 pushes par
+    # passerelle entre deux snapshots ETL (le compteur `n_pushes_since_applied` ne
+    # bouge qu'à `:00`). On ne relance qu'à partir de :40 → :40, :45 (scheduler 2h) et
+    # :50, soit ≤ 3 pushes / 2 h — la campagne du 04/09 débloquait en ≤ 4 pushes.
+    to_retry = _stuck_gateways_to_retry() if datetime.now(PARIS_TZ).minute >= 40 else []
     if to_retry:
         logger.info(f"🔁 {len(to_retry)} passerelle(s) coincée(s) à relancer (< {ISEO_RETRY_PUSH_MAX} tentatives)")
     retried = 0
@@ -1983,7 +2095,8 @@ def _run_inner() -> None:
             errors.append(f"retry push gw {gw['gateway_id']} ({gw['apartments']}): {err}")
 
     logger.info("=" * 70)
-    logger.info(f"DONE — provision ok={ok} skip={skip} | hold[{ISEO_HOLD_MODE}]={held} | "
+    logger.info(f"DONE — verify écrits={v_written}/relancés={v_retried} | "
+                f"provision ok={ok} skip={skip} | hold[{ISEO_HOLD_MODE}]={held} | "
                 f"resync={resynced} | duve-retry={retry} | archived={archived} | "
                 f"purged={purged} | retry-push={retried} | erreurs={len(errors)}")
     logger.info("=" * 70)
