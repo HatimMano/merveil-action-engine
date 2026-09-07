@@ -23,11 +23,11 @@
 digest_buckets:
   2h:
     # Serrures — sécurité accès guest. Job merveil-action-engine-2h toutes les 2h.
-    # TODO recipients : passer sur l'alias ops-front quand connu.
+    # Hatim seul (décision 07/09) : ce bucket ne porte que des triggers ISEO,
+    # alerte_ventes@ n'a aucun geste dessus. Routage RC/ops à décider plus tard.
     send_if_empty: false
     subject_prefix: "[Merveil Serrures]"
     default_recipients:
-      - alerte_ventes@archides.fr
       - hatim@archides.fr
   4h:
     send_if_empty: true
@@ -36,10 +36,43 @@ digest_buckets:
       - alerte_ventes@archides.fr
       - hatim@archides.fr
   daily:
+    # ⛔ COUPÉ le 07/09 (décision Hatim) : 66-97 alertes/jour, illisible, personne
+    # n'agissait dessus. `enabled: false` = le dispatcher bufferise puis SKIP le
+    # flush (rien n'est écrit dans dispatched_actions). Les triggers restent
+    # actifs et lisibles au dashboard (360 fleet, table triggers). Les buckets
+    # satellites `flush_with: daily` (data_quality, beyond, gouvernance, iseo) ne
+    # sont PAS concernés — ils restent flushés par le job daily.
+    enabled: false
     send_if_empty: false
     subject_prefix: "[Merveil Daily]"
     default_recipients:
       - alerte_ventes@archides.fr
+      - hatim@archides.fr
+
+  iseo:
+    # Serrures — état du parc (passerelles, clavier muet, codes fixes, licence).
+    # Sorti du Daily le 07/09 : ces alertes portaient des consignes techniques
+    # (`iseo_unstick_gateway.py --gateway N`) devant alerte_ventes@. Hatim seul
+    # pour le moment (décision 07/09) ; élargir à l'ops quand un geste leur revient.
+    flush_with: daily
+    send_if_empty: false
+    subject_prefix: "[Merveil ISEO]"
+    default_recipients:
+      - hatim@archides.fr
+
+  gouvernance:
+    # Violations de contrat sur les données de référence (DWH Feed) — routé à
+    # l'OWNER du domaine (Emilia pour ops_apparts) + Hatim, décision 07/09. Le
+    # mail répétait 14 jours de suite « 6 violations, responsable Emilia » à Hatim
+    # seul. Cadence : 1 mail par CHANGEMENT d'état (property_id = domaine|hash des
+    # violations côté dbt) + rappel hebdo (TTL 168 h dans DIGEST_TTL_HOURS).
+    # ⚠ Un seul domaine aujourd'hui ; un 2ᵉ domaine avec un autre owner → bucket
+    # par owner (les destinataires se règlent par bucket).
+    flush_with: daily
+    send_if_empty: false
+    subject_prefix: "[Merveil Gouvernance]"
+    default_recipients:
+      - emilia@archides.fr
       - hatim@archides.fr
 
   data_quality:
@@ -51,7 +84,7 @@ digest_buckets:
     # le bucket était bufferisé puis jeté — 0 mail envoyé depuis sa création).
     flush_with: daily
     send_if_empty: false
-    subject_prefix: "[Merveil Gouvernance]"
+    subject_prefix: "[Merveil Data Quality]"
     default_recipients:
       - hatim@archides.fr
 
@@ -160,12 +193,13 @@ triggers:
 
   # ── Gouvernance données fixes (POC 2026-06-30) ────────────────────────────
   # Violation de contrat détectée par dbt (dash_governance_contracts) sur les
-  # données de référence du DWH Feed. 1 alerte/domaine/jour, routée à l'owner.
+  # données de référence du DWH Feed. 1 alerte/domaine/changement d'état (07/09),
+  # routée à l'owner via le bucket `gouvernance` (Emilia + Hatim).
   data_contract_breach:
     enabled: true
     actions:
       - type: email_digest
-        bucket: data_quality
+        bucket: gouvernance
 
   # ── Tests dbt (chantier tests 2026-07-03) ──────────────────────────────────
   # Échecs de `dbt test` post-run (dbt_raw.test_runs, 1 trigger agrégé/jour).
@@ -450,7 +484,7 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
+        bucket: iseo
 
   # Saturation de la licence Luckey.
   # ⚠ Passé de `2h` à `daily` le 19/08 (demande Hatim) : la saturation est un ÉTAT,
@@ -463,7 +497,7 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
+        bucket: iseo
 
   # Code DWH accepté par Sofia mais jamais écrit dans la serrure (rule_state
   # NOT_UPDATED > 12 h) alors que le séjour approche — le client tapera un code
@@ -477,7 +511,7 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
+        bucket: iseo
 
   # Code fixe RETIRÉ de la serrure alors qu'il ouvrait encore (`ISEO_ARGO_16`,
   # émis par la serrure = accusé de retrait). Le champ code du logement dans
@@ -495,7 +529,7 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
+        bucket: iseo
 
   iseo_etl_stale:
     enabled: true
@@ -520,7 +554,7 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
+        bucket: iseo
 
   # Passerelle qui RÉPOND au cloud mais n'écrit plus les codes dans ses serrures.
   # ⚠ Ne fait PAS doublon avec `iseo_gateway_offline` : celui-ci lit la connexion,
@@ -533,7 +567,7 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
+        bucket: iseo
 
   # ── Trésorerie ────────────────────────────────────────────────────────────
   # Compte bancaire sous son seuil (seed treasury_thresholds). Le message propose

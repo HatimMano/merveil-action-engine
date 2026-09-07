@@ -64,9 +64,19 @@ DIGEST_TTL_HOURS = {
     "monthly": 720,
     # Satellites flush_with 2h : un fait (fraude, chargeback, blacklist) s'annonce
     # une fois ; le rejeu n'apporte rien à l'astreinte (décision Hatim 07/09).
-    "fraude": 72,
     "chargeback": 72,
     "blacklist": 72,
+    # fraude : `fraude_identite` pose `detected_at = CURRENT_TIMESTAMP()` sur un
+    # ÉTAT (CI ∈ [J-1, J+30]) → une ligne par jour, même clé (résa + signature des
+    # flags). On ne peut pas y mettre la date du fait (la date du combo n'existe
+    # pas, et created_at peut être > 7 j = hors fenêtre de chargement) → c'est le
+    # TTL qui porte le « une fois par fait » : 31 j = la fenêtre du trigger. Un
+    # combo qui GROSSIT change la signature, donc la clé → re-sonne (voulu).
+    # Mesuré avant : Siobhan McGrane, 5 mails identiques du 03 au 07/09.
+    "fraude": 744,
+    # gouvernance : 1 mail par changement d'état (clé = domaine|hash violations)
+    # + rappel hebdo tant que rien ne bouge.
+    "gouvernance": 168,
 }
 
 # Registry des handlers
@@ -315,6 +325,12 @@ class TriggerDispatcher:
                     continue
                 self._digest_buffer.setdefault(bucket, []).append((trigger, params))
                 logger.debug(f"Bufferisé pour digest[{bucket}] : {trigger_name}/{property_id}")
+                # ⚠ Dédup INTRA-run : `triggers` pose une ligne par jour pour une
+                # alerte à état (trigger_id porte DATE(detected_at)) ; deux lignes
+                # (hier soir + ce matin) pour la même clé sont chargées ensemble et
+                # partaient TOUTES LES DEUX (Daily du 07/09 : HyperGate TIL14-5G et
+                # SEB23 listées 2×). open_keys ne voyait que dispatched_actions.
+                open_keys.add(key)
             else:
                 # Action directe (asana, breezeway)
                 try:
@@ -338,6 +354,7 @@ class TriggerDispatcher:
                         status="open",
                     )
                     logger.info(f"[OK] {trigger_name} → {action_type} | external_id={external_id}")
+                    open_keys.add(key)
                 except SkipAction as e:
                     logger.info(f"[SKIP] {trigger_name} → {action_type} : {e}")
                 except Exception as e:
@@ -363,6 +380,13 @@ class TriggerDispatcher:
         subject_prefix = bucket_conf.get("subject_prefix", "[Merveil]")
         default_recipients = bucket_conf.get("default_recipients", [])
 
+        # Bucket coupé (`enabled: false`, cas du Daily depuis le 07/09) : on ne
+        # flush pas ET on n'écrit rien dans dispatched_actions — si on le rallume,
+        # seuls les triggers de la fenêtre 24 h de _load_triggers repartent.
+        if bucket_conf.get("enabled", True) is False:
+            logger.info(f"Digest[{bucket}] désactivé (enabled: false) → "
+                        f"{len(triggers_in_bucket)} trigger(s) ignoré(s)")
+            return
         if not triggers_in_bucket and not send_if_empty:
             logger.info(f"Digest[{bucket}] vide et send_if_empty=False → skip")
             return

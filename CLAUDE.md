@@ -443,6 +443,33 @@ lit `DIGEST_TTL_HOURS[bucket]`, défaut 24 h. Or `_load_triggers` recharge un tr
 il repart UNE fois (Muguerza : 05/09 16:51 → 06/09 18:51). Les satellites `fraude`/`chargeback`/`blacklist` sont
 désormais à 72 h ; tout nouveau bucket `flush_with` doit avoir sa clé. Deuxième moitié du même incident côté
 dbt : `detected_at` doit porter la date de l'événement, pas `CURRENT_TIMESTAMP()` (cf. dbt/CLAUDE.md).
+
+⭐ **Audit « alertes inutiles » du 07/09 (après-midi, décisions Hatim) — 4 changements de routage + 2 fixes dispatcher** :
+- ⛔ **Bucket `daily` COUPÉ** (`enabled: false` dans routing.yaml, supporté par `_flush_digest` : bufferisé puis skip,
+  rien dans `dispatched_actions`) — 66-97 alertes/jour à `alerte_ventes@`, personne n'agissait. Les 17 triggers routés
+  dessus restent actifs (table `triggers`, 360 fleet). Le rallumer = retirer la ligne ; seuls les triggers de la
+  fenêtre 24 h repartent.
+- **Bucket `iseo`** (flush_with daily, `[Merveil ISEO]`, **Hatim seul**) : les 6 triggers ISEO qui étaient dans le
+  Daily (clavier_muet, quota_licence, code_non_propage, code_fixe_supprime, gateway_offline, gateway_push_stuck) —
+  ils portaient des consignes `iseo_unstick_gateway.py` devant les commerciaux. **Bucket `2h` → Hatim seul** aussi
+  (il ne porte que de l'ISEO). Élargir à l'ops quand un geste leur revient.
+- **Bucket `gouvernance`** (flush_with daily, Emilia + Hatim) pour `data_contract_breach` : le mail « 6 violations,
+  responsable Emilia » partait 14 jours de suite à Hatim seul. Côté dbt `property_id = domaine|hash(violations)`
+  → 1 mail par changement d'état + rappel hebdo (TTL 168 h). `data_quality` renommé `[Merveil Data Quality]`.
+- **`fraude` TTL = 744 h (31 j = la fenêtre de `fraude_identite`)** : `detected_at = CURRENT_TIMESTAMP()` sur un
+  état → 1 ligne/jour, même clé (résa + signature) → Siobhan McGrane, 5 mails identiques du 03 au 07/09. La date
+  du fait n'existe pas (et `created_at` peut être > 7 j = hors `_load_triggers`), donc c'est le TTL qui porte le
+  « une fois par (résa, signature) » ; un combo qui grossit change la clé et re-sonne (voulu). ⚠ Vaut aussi pour
+  `test_cartes` (même bucket, clé = n° résa) : pas de 2ᵉ mail sur la même résa avant 31 j — acceptable, la RC
+  annule au 1ᵉʳ.
+- **Dédup intra-run** (`open_keys.add(key)` après bufferisation et après action directe) : deux lignes `triggers`
+  (hier soir + ce matin, `trigger_id` porte la date) pour la même clé étaient chargées ensemble et partaient
+  TOUTES LES DEUX — Daily du 07/09 : HyperGate TIL14-5G et SEB23 listées 2×.
+- **`superhost_risk`** : `property_id = appart|semaine ISO` (état 3 mois glissants, 37 apparts identiques chaque jour).
+- 📌 **Backlog accepté (Hatim 07/09) — consolidation « 3 mails pour une résa à risque »** : hold orchestrateur
+  (`⚠️ Résa à risque`, immédiat, hello+hatim) → `fraude_identite` (digest 2h, Emilia/Philippe/hello/OnePilot) →
+  `blacklist_resa`. Cas Desbarres, Muguerza, Rouet (Emilia : « déjà annulée avant l'alerte »). Chantier, pas un
+  patch : un seul canal « résa à risque » événementiel, avec les signaux agrégés.
 If no alerts in `dash_alerts`, the handler raises `SkipAction` (not logged as an error).
 
 The email digest triggers are never auto-resolved (no associated Breezeway task) —
