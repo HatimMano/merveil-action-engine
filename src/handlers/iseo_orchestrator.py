@@ -473,7 +473,11 @@ _STAYS_CTE = f"""
         PARTITION BY duve_reservation_id ORDER BY received_at DESC) = 1
     ),
     risk_flags AS (
-      SELECT reservation_id, LOGICAL_OR(COALESCE(is_fraud_combo, FALSE)) AS fraud_combo
+      SELECT reservation_id,
+             LOGICAL_OR(COALESCE(is_fraud_combo, FALSE))  AS fraud_combo,
+             -- Groupe jeune (≥ 2 adultes, tous ≤ 25 ans, âges du pré-checkin Duve) —
+             -- critère de porte depuis le 07/09 (demande Hatim). Signal FORT de 6.7.
+             LOGICAL_OR(COALESCE(f_groupe_jeune, FALSE)) AS young_group
       FROM `{RISK_TABLE}` GROUP BY reservation_id
     ),
     blacklist_flags AS (
@@ -529,6 +533,7 @@ _STAYS_CTE = f"""
                   <= {ISEO_HOLD_BALANCE_MAX_LEAD_HOURS})                 AS direct_unpaid,
              -- Chantier D (07/09) : 3 critères de plus, tous canaux.
              COALESCE(rk.fraud_combo, FALSE)                              AS fraud_combo,
+             COALESCE(rk.young_group, FALSE)                              AS young_group,
              COALESCE(bl.blacklist_confirmed, FALSE)                      AS blacklist_confirmed,
              -- Réservé LE JOUR de l'arrivée (heure Paris), quel que soit le canal :
              -- le critère « jour J » de D. Utile parce que A+B évaluent à la minute.
@@ -586,6 +591,7 @@ _STAYS_CTE = f"""
         LOGICAL_OR(direct_last_minute)                                               AS direct_last_minute,
         LOGICAL_OR(direct_unpaid)                                                    AS direct_unpaid,
         LOGICAL_OR(fraud_combo)                                                      AS fraud_combo,
+        LOGICAL_OR(young_group)                                                      AS young_group,
         LOGICAL_OR(blacklist_confirmed)                                              AS blacklist_confirmed,
         LOGICAL_OR(same_day_booking)                                                 AS same_day_booking
       FROM islands
@@ -612,6 +618,7 @@ _STAYS_CTE = f"""
         purchased_early_checkin_hour, has_purchased_late_checkout,
         mews_reservation_number, payment_unpaid, balance_due, min_lead_hours,
         direct_last_minute, direct_unpaid, fraud_combo, blacklist_confirmed, same_day_booking,
+        young_group,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)                 AS member_duve_ids,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)[SAFE_OFFSET(0)] AS canonical_duve
       FROM stay_duve
@@ -620,7 +627,7 @@ _STAYS_CTE = f"""
                earliest_checkin_hour, latest_checkout_hour, purchased_early_checkin_hour,
                has_purchased_late_checkout, mews_reservation_number,
                payment_unpaid, balance_due, min_lead_hours, direct_last_minute,
-               direct_unpaid, fraud_combo, blacklist_confirmed, same_day_booking
+               direct_unpaid, fraud_combo, blacklist_confirmed, same_day_booking, young_group
     )"""
 
 
@@ -655,7 +662,7 @@ def _resa_to_provision() -> list[dict]:
       s.purchased_early_checkin_hour, s.has_purchased_late_checkout,
       s.payment_unpaid, s.member_duve_ids, s.balance_due,
       s.min_lead_hours, s.direct_last_minute, s.direct_unpaid,
-      s.fraud_combo, s.blacklist_confirmed, s.same_day_booking
+      s.fraud_combo, s.blacklist_confirmed, s.same_day_booking, s.young_group
     FROM stays s
     WHERE s.mews_reservation_number IS NOT NULL
       AND s.stay_ci <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
@@ -838,7 +845,7 @@ def _resa_to_resync() -> list[dict]:
       s.earliest_checkin_hour, s.latest_checkout_hour,
       s.purchased_early_checkin_hour, s.has_purchased_late_checkout, s.member_duve_ids,
       s.min_lead_hours, s.direct_last_minute, s.direct_unpaid, s.balance_due,
-      s.fraud_combo, s.blacklist_confirmed, s.same_day_booking
+      s.fraud_combo, s.blacklist_confirmed, s.same_day_booking, s.young_group
     FROM cache c
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
                  OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
@@ -956,14 +963,46 @@ def _resa_duve_retry() -> list[dict]:
     -- avait aucun à la création). Dès que le formulaire arrive, `stays` porte le
     -- duve → push au run suivant (≤ 10 min, ou 2-3 min via l'event-driven).
     SELECT c.duve_reservation_id, c.pin_value, c.invitation_link, c.stay_member_duve_ids,
-           ANY_VALUE(s.member_duve_ids) AS live_member_duve_ids
+           c.mews_reservation_number,
+           ANY_VALUE(s.member_duve_ids)      AS live_member_duve_ids,
+           -- Signaux de la porte, pour la RÉ-ÉVALUER à l'arrivée du formulaire sur une
+           -- clé M : le pré-checkin apporte des signaux (âges → groupe jeune, nom de la
+           -- pièce → combo fraude) que la création à J-3 n'avait pas.
+           ANY_VALUE(s.customer_name)        AS customer_name,
+           ANY_VALUE(s.apartment_code)       AS apartment_code,
+           ANY_VALUE(s.duve_property_id)     AS duve_property_id,
+           ANY_VALUE(s.stay_ci)              AS checkin_date,
+           ANY_VALUE(s.stay_co)              AS checkout_date,
+           ANY_VALUE(s.payment_unpaid)       AS payment_unpaid,
+           ANY_VALUE(s.balance_due)          AS balance_due,
+           ANY_VALUE(s.min_lead_hours)       AS min_lead_hours,
+           ANY_VALUE(s.direct_last_minute)   AS direct_last_minute,
+           ANY_VALUE(s.direct_unpaid)        AS direct_unpaid,
+           ANY_VALUE(s.fraud_combo)          AS fraud_combo,
+           ANY_VALUE(s.blacklist_confirmed)  AS blacklist_confirmed,
+           ANY_VALUE(s.same_day_booking)     AS same_day_booking,
+           ANY_VALUE(s.young_group)          AS young_group
     FROM cache c
     LEFT JOIN stays s
       ON s.canonical_duve = c.duve_reservation_id
       OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
-    GROUP BY 1, 2, 3, 4
+    GROUP BY 1, 2, 3, 4, 5
     """
     return [dict(r.items()) for r in _bq().query(q).result()]
+
+
+def _mark_held(duve_resa_id: str, hold_reason: str, member_csv: Optional[str] = None) -> None:
+    """Rétention posée APRÈS la création (clé M dont le formulaire vient d'arriver)."""
+    q = f"""
+    UPDATE `{PIN_CACHE_TABLE}`
+    SET hold_reason = @hold, held_at = COALESCE(held_at, CURRENT_TIMESTAMP()),
+        stay_member_duve_ids = COALESCE(@members, stay_member_duve_ids)
+    WHERE duve_reservation_id = @id AND archived_at IS NULL
+    """
+    _bq().query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("id", "STRING", duve_resa_id),
+        bigquery.ScalarQueryParameter("hold", "STRING", hold_reason),
+        bigquery.ScalarQueryParameter("members", "STRING", member_csv)])).result()
 
 
 def _mark_duve_pushed(duve_resa_id: str, member_csv: Optional[str] = None) -> None:
@@ -1193,6 +1232,8 @@ def _evaluate_hold(row: dict) -> Optional[str]:
         motifs.append("client blacklisté (rapprochement confirmé)")
     if row.get("same_day_booking"):
         motifs.append("réservé le jour de l'arrivée")
+    if row.get("young_group"):
+        motifs.append("groupe jeune (≥ 2 adultes ≤ 25 ans)")
     return " + ".join(motifs) if motifs else None
 
 
@@ -2228,6 +2269,21 @@ def _run_inner() -> None:
                 if key.startswith("M"):
                     continue  # code créé sans formulaire, toujours pas de Duve : rien où pousser
                 members = [key]
+            if key.startswith("M"):
+                # ⭐ Le formulaire vient d'arriver : la porte est évaluée ICI, avec les
+                # signaux qu'il apporte (groupe jeune, nom de pièce…). Une rétention
+                # bloque le push exactement comme au provisioning ; la RC livre en 6.1.
+                hold = _evaluate_hold(row)
+                if hold and ISEO_HOLD_MODE == "on":
+                    _mark_held(key, hold, ",".join(members))
+                    row["no_duve"] = False
+                    _log_hold_decision(row, hold, "form_arrival", "held")
+                    _notify_hold(row, hold, suffix=" — au pré-checkin")
+                    logger.warning(f"🔒 HOLD au formulaire {key} ({row.get('apartment_code')}) — {hold} "
+                                   f"→ code PAS envoyé à Duve")
+                    continue
+                if hold:
+                    _log_hold_decision(row, hold, "form_arrival", "pushed_observe")
             done, err = _duve_push_all(members, row.get("pin_value") or "",
                                        row.get("invitation_link") or "")
             if done:
