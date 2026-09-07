@@ -201,6 +201,14 @@ ISEO_VERIFY_MAX_PER_RUN = int(os.environ.get("ISEO_VERIFY_MAX_PER_RUN", "200"))
 ISEO_QUOTA_MAX_USED_NO_FORM = int(os.environ.get("ISEO_QUOTA_MAX_USED_NO_FORM", "590"))
 WALLET_TABLE = os.environ.get(
     "ISEO_WALLET_TABLE", "merveil-data-warehouse.staging.stg_iseo__wallet")
+# Chantier D (07/09) : 3 critères de porte de plus, lus sur les modèles dbt qui
+# portent déjà le verdict (pas de recalcul ici) — combo fraude (`is_fraud_combo`,
+# calibré par backtest 19/08) et blacklist confirmée (rapprochement exact/fort).
+RISK_TABLE = os.environ.get(
+    "RISK_TABLE", "merveil-data-warehouse.intermediate_reservations.int_reservations__risk")
+BLACKLIST_MATCH_TABLE = os.environ.get(
+    "BLACKLIST_MATCH_TABLE",
+    "merveil-data-warehouse.intermediate_reservations.int_reservations__blacklist_match")
 
 
 # ── Sofia auth (singleton) ────────────────────────────────────────────────────
@@ -464,6 +472,16 @@ _STAYS_CTE = f"""
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY duve_reservation_id ORDER BY received_at DESC) = 1
     ),
+    risk_flags AS (
+      SELECT reservation_id, LOGICAL_OR(COALESCE(is_fraud_combo, FALSE)) AS fraud_combo
+      FROM `{RISK_TABLE}` GROUP BY reservation_id
+    ),
+    blacklist_flags AS (
+      SELECT reservation_id,
+             LOGICAL_OR(COALESCE(is_blacklist_confirme, FALSE)
+                        AND COALESCE(is_actionnable, FALSE)) AS blacklist_confirmed
+      FROM `{BLACKLIST_MATCH_TABLE}` GROUP BY reservation_id
+    ),
     member_resas AS (
       SELECT m.reservation_id, m.reservation_number, m.customer_id, m.customer_name,
              m.resource_id, m.checkin_date, m.checkout_date,
@@ -508,10 +526,18 @@ _STAYS_CTE = f"""
                   >= {ISEO_HOLD_MIN_BALANCE_RATIO} * NULLIF(pay.amount_due, 0)
               AND TIMESTAMP_DIFF(TIMESTAMP(DATETIME(m.checkin_date, TIME '15:00:00')),
                                  m.created_at, HOUR)
-                  <= {ISEO_HOLD_BALANCE_MAX_LEAD_HOURS})                 AS direct_unpaid
+                  <= {ISEO_HOLD_BALANCE_MAX_LEAD_HOURS})                 AS direct_unpaid,
+             -- Chantier D (07/09) : 3 critères de plus, tous canaux.
+             COALESCE(rk.fraud_combo, FALSE)                              AS fraud_combo,
+             COALESCE(bl.blacklist_confirmed, FALSE)                      AS blacklist_confirmed,
+             -- Réservé LE JOUR de l'arrivée (heure Paris), quel que soit le canal :
+             -- le critère « jour J » de D. Utile parce que A+B évaluent à la minute.
+             (DATE(m.created_at, 'Europe/Paris') = m.checkin_date)        AS same_day_booking
       FROM `{MEWS_FCT_TABLE}` m
       LEFT JOIN locks lk    ON lk.duve_property_id = m.resource_id
       LEFT JOIN payments pay ON pay.reservation_id = m.reservation_id
+      LEFT JOIN risk_flags rk      ON rk.reservation_id = m.reservation_id
+      LEFT JOIN blacklist_flags bl ON bl.reservation_id = m.reservation_id
       WHERE COALESCE(m.is_cancelled, FALSE) = FALSE
         AND m.checkout_date >= CURRENT_DATE()
     ),
@@ -558,7 +584,10 @@ _STAYS_CTE = f"""
         -- back-to-back, une seule résa suspecte suffit à demander une validation.
         MIN(lead_hours)                                                              AS min_lead_hours,
         LOGICAL_OR(direct_last_minute)                                               AS direct_last_minute,
-        LOGICAL_OR(direct_unpaid)                                                    AS direct_unpaid
+        LOGICAL_OR(direct_unpaid)                                                    AS direct_unpaid,
+        LOGICAL_OR(fraud_combo)                                                      AS fraud_combo,
+        LOGICAL_OR(blacklist_confirmed)                                              AS blacklist_confirmed,
+        LOGICAL_OR(same_day_booking)                                                 AS same_day_booking
       FROM islands
       GROUP BY customer_id, resource_id, island_id
     ),
@@ -582,7 +611,7 @@ _STAYS_CTE = f"""
         stay_ci, stay_co, earliest_checkin_hour, latest_checkout_hour,
         purchased_early_checkin_hour, has_purchased_late_checkout,
         mews_reservation_number, payment_unpaid, balance_due, min_lead_hours,
-        direct_last_minute, direct_unpaid,
+        direct_last_minute, direct_unpaid, fraud_combo, blacklist_confirmed, same_day_booking,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)                 AS member_duve_ids,
         ARRAY_AGG(duve_reservation_id IGNORE NULLS ORDER BY duve_ci)[SAFE_OFFSET(0)] AS canonical_duve
       FROM stay_duve
@@ -591,7 +620,7 @@ _STAYS_CTE = f"""
                earliest_checkin_hour, latest_checkout_hour, purchased_early_checkin_hour,
                has_purchased_late_checkout, mews_reservation_number,
                payment_unpaid, balance_due, min_lead_hours, direct_last_minute,
-               direct_unpaid
+               direct_unpaid, fraud_combo, blacklist_confirmed, same_day_booking
     )"""
 
 
@@ -625,7 +654,8 @@ def _resa_to_provision() -> list[dict]:
       s.earliest_checkin_hour, s.latest_checkout_hour,
       s.purchased_early_checkin_hour, s.has_purchased_late_checkout,
       s.payment_unpaid, s.member_duve_ids, s.balance_due,
-      s.min_lead_hours, s.direct_last_minute, s.direct_unpaid
+      s.min_lead_hours, s.direct_last_minute, s.direct_unpaid,
+      s.fraud_combo, s.blacklist_confirmed, s.same_day_booking
     FROM stays s
     WHERE s.mews_reservation_number IS NOT NULL
       AND s.stay_ci <= DATE_ADD(CURRENT_DATE(), INTERVAL {LOOKAHEAD_DAYS} DAY)
@@ -807,7 +837,8 @@ def _resa_to_resync() -> list[dict]:
       s.stay_ci AS live_ci, s.stay_co AS live_co,
       s.earliest_checkin_hour, s.latest_checkout_hour,
       s.purchased_early_checkin_hour, s.has_purchased_late_checkout, s.member_duve_ids,
-      s.min_lead_hours, s.direct_last_minute, s.direct_unpaid, s.balance_due
+      s.min_lead_hours, s.direct_last_minute, s.direct_unpaid, s.balance_due,
+      s.fraud_combo, s.blacklist_confirmed, s.same_day_booking
     FROM cache c
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
                  OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
@@ -1153,6 +1184,15 @@ def _evaluate_hold(row: dict) -> Optional[str]:
         bal = row.get("balance_due")
         detail = f" ({bal:.0f} € dus)" if bal is not None else ""
         motifs.append(f"paiement refusé, rien d'encaissé{detail}")
+    # Chantier D (07/09, décision Hatim) — 3 critères de plus, tous canaux. Les deux
+    # premiers sont des verdicts dbt déjà calibrés (backtest 19/08 · rapprochement
+    # exact/fort 29/08), le 3ᵉ est le « jour J » que A+B rendent évaluable à la minute.
+    if row.get("fraud_combo"):
+        motifs.append("combo fraude (≥2 signaux, cf. 6.7)")
+    if row.get("blacklist_confirmed"):
+        motifs.append("client blacklisté (rapprochement confirmé)")
+    if row.get("same_day_booking"):
+        motifs.append("réservé le jour de l'arrivée")
     return " + ".join(motifs) if motifs else None
 
 
@@ -1267,9 +1307,10 @@ def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
         titre, sujet = "Code d'accès retenu — à valider", "🔒 Code retenu à valider"
         etat = ("Le code a été <strong>créé côté serrure mais volontairement pas envoyé</strong> "
                 "au client : il ne le voit pas dans son application.")
-        suite = ("Après vérification de l'identité, lire le code sur le dashboard et "
-                 "l'envoyer au client. En cas de doute, ne rien envoyer et faire "
-                 "annuler la réservation.")
+        suite = ("Après vérification (identité, paiement), cliquer <strong>Livrer le code</strong> "
+                 "en 6.1 : il part dans la Guest App immédiatement. En cas de doute, "
+                 "<strong>Révoquer</strong> et faire annuler la réservation. Le code reste "
+                 "lisible en 6.1 si le client appelle.")
     elif row.get("no_duve"):
         titre, sujet = "Réservation à risque — code créé, non transmis", "⚠️ Résa à risque (sans pré-checkin)"
         etat = ("Le client n'a <strong>pas rempli son pré-checkin</strong> : le code existe côté "
