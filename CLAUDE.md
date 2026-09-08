@@ -295,7 +295,7 @@ gcloud scheduler jobs create http merveil-action-engine-daily \
 | dispo_daily_summary | email_digest@daily | ✅ | ~2 |
 | gap_pricing_summary | email_digest@daily | ✅ | ~3 |
 | beyond_surcote_gap | email_digest@daily | ✅ | ~22 |
-| beyond_gap_filled | email_digest@daily | ✅ | rare (🎉 gap 1N vendu sous fenêtre DWH — fenêtre 24h sur created_at) |
+| beyond_gap_filled | email_digest@daily | ✅ | rare (🎉 gap **1N ou 2N** vendu sous fenêtre DWH — fenêtre 24h sur created_at). ⚠ **Libellé corrigé le 08/09** : le message était figé sur « Gap 1N » + la seule `gap_date` depuis l'origine → depuis l'activation des cibles 2N (10/08) il annonçait « Gap 1N, nuit du J » sur des fenêtres de 2 nuits (constat Hatim sur les 2 alertes du 08/09 : ROU14-1D 11→12/09 et RIC75-0G 08→09/09). Taille et plage lues dans `nb_nuits`/`gap_end_date`, et les montants portent « /nuit » + le total en 2N (`filled_adr`, `min_price`, `max_price` sont TOUS par nuit — en 2N le plancher est déjà divisé par 2). |
 | budget_landing_gap | email_digest@daily | ✅ | 0-2 (mois courant <90% dès le 10 · M+1 OTB <50% dès le 15) |
 | champagne_direct | breezeway_task | ❌ disabled | ~5 |
 | low_review_cleanliness | breezeway_task | ✅ (placeholder) | 0 |
