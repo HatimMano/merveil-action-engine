@@ -1813,16 +1813,24 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
         hold = _evaluate_hold(row)
 
     # ⛔⛔ UNE FOIS LE CODE LIVRÉ, LA PORTE NE PEUT PLUS RIEN RETENIR (09/09).
-    # La porte retient le PUSH DUVE, pas le code. Quand `duve_pushed_at` est déjà
-    # posé, le client a le code dans sa Guest App — et un message Duve est FIGÉ, on
-    # ne le reprend pas. Pire, le resync a déjà élargi la fenêtre côté Sofia à
-    # l'étape 2 et le PUT conserve le MÊME PIN : le code du client fonctionne sur
-    # les nouvelles dates, que l'on pousse le lien ou non. Retenir ici ne protégeait
-    # donc rien ; ça ne faisait que (a) remettre `duve_pushed_at` à NULL via
-    # `_save_resynced(duve_ok=False)`, donc afficher « retenu » en 6.1 sur un client
-    # qui a son code et l'a peut-être déjà utilisé, et (b) envoyer un mail
-    # « Livrer le code » pour un code déjà livré. Le geste qui agit sur un code sorti
-    # est **Révoquer** (point 10), pas la porte.
+    # La porte retient le PUSH DUVE, pas le code. Or au resync le PUT conserve le
+    # MÊME PIN et le MÊME code d'invitation : ce qu'on pousserait est identique, au
+    # caractère près, à ce que le champ Duve porte déjà. Retenir revient donc à ne
+    # pas réécrire une valeur inchangée — zéro effet pour le client, qui garde un
+    # code valide sur la fenêtre que l'étape 2 vient d'élargir côté Sofia.
+    # ⚠ Ne PAS justifier ça par « le message Duve est figé » : à terme le message ne
+    # portera que le lien vers la Guest App, qui lit le champ en direct (Hatim,
+    # 09/09) — c'est bien l'égalité des valeurs qui rend la rétention inopérante,
+    # pas l'immuabilité du message.
+    # Retenir ne faisait donc que deux dégâts : (a) `_save_resynced(duve_ok=False)`
+    # remet `duve_pushed_at` à NULL, donc 6.1 affiche « retenu » sur un client qui a
+    # son code et l'a peut-être déjà utilisé ; (b) un mail « Livrer le code » part
+    # pour un code déjà livré. Le geste qui agit sur un code sorti est **Révoquer**
+    # (point 10), pas la porte.
+    # ⚠ SEULE EXCEPTION connue, et elle plaide pour pousser, pas pour retenir : si le
+    # PUT échoue et que `_resync` retombe sur DELETE + re-POST, l'invitation change de
+    # code donc le LIEN change. Ne pas pousser laisserait alors un lien mort dans le
+    # champ Duve — raison de plus pour ne pas retenir ici.
     # ⚠ Mesuré le 09/09 en ajoutant `payment_unpaid` au resync : 1 résa concernée
     # (Matilda Reaburn, 37118, SEN18-2G, Expedia VCC impayée, EN SÉJOUR jusqu'au 10/09).
     deja_livre = bool(row.get("cache_pushed"))
