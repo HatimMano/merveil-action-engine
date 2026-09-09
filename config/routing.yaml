@@ -186,6 +186,12 @@ digest_buckets:
       - hatim@archides.fr
       - mickael@archides.fr
       - raphael@archides.fr
+      # ⭐ 09/09 (décision Hatim) : OnePilot aussi — ils prennent l'appel du client
+      # blacklisté, et depuis la fusion ils reçoivent déjà la rétention « code
+      # retenu · blacklist » à J-3 ; sans ce mail-ci ils découvraient le dossier
+      # après la RC. ⛔ Ce bucket ne porte aucun code de porte (hello@ y est déjà
+      # pour la même raison) — condition à préserver.
+      - externe-onepilot@merveil.co
 
 # ============================================================================
 # Triggers
