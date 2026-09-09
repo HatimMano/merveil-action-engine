@@ -47,6 +47,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
@@ -1332,6 +1333,20 @@ def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
         logger.warning(f"⚠️ hold_decisions : écriture échouée — {type(e).__name__}: {e}")
 
 
+# ⚠⚠ L'onglet 6.1 a pour id `arrivals`, PAS `arrivees` : le lien de ces alertes
+# portait `?tab=arrivees`, qui ne matche aucun onglet — ops-front retombe alors
+# silencieusement sur le PREMIER onglet autorisé (6.0 Disponibilités). Le
+# destinataire atterrissait donc sur une autre page, sans erreur ni indice. Le
+# lien a échappé au test `assert_dashboard_links_valid`, qui ne contrôle que les
+# `action_url` des triggers dbt, pas les URLs codées en dur ici.
+# `day=every` est nécessaire : 6.1 n'affiche par défaut que les arrivées J→J+4,
+# donc un séjour déjà commencé ou plus lointain resterait invisible malgré `q`.
+# `q` filtre sur le nom du client (et son email) — cf. TabArrivals.
+def _lien_arrivees(customer_name: Optional[str]) -> str:
+    base = "https://direction.archides.fr/ops-front?tab=arrivals&day=every"
+    return f"{base}&q={quote(customer_name)}" if customer_name else base
+
+
 def _hold_already_notified(duve_resa_id: str) -> bool:
     """La RC a-t-elle DÉJÀ été prévenue d'une rétention sur cette réservation ?
 
@@ -1415,8 +1430,7 @@ def _notify_hold(row: dict, motif: str, suffix: str = "",
                          esc(row.get("mews_reservation_number"))]]},
         sections_html=('<div style="padding:0 24px 8px;font-size:14px;color:#475569">'
                        f"{suite}</div>"),
-        button=("Voir les arrivées →",
-                "https://direction.archides.fr/ops-front?tab=arrivees"))
+        button=("Voir la réservation en 6.1 →", _lien_arrivees(row.get("customer_name"))))
     send_mail(f"{sujet} — {row.get('customer_name')} ({apt})",
               html, ISEO_HOLD_ALERT_TO, html=True, sender=GMAIL_SENDER)
 
