@@ -70,10 +70,8 @@ MEWS_FCT_TABLE = os.environ.get(
     "MEWS_FCT_TABLE", "merveil-data-warehouse.marts.fct_reservations")
 ISEO_DEVICES_STG_TABLE = os.environ.get(
     "ISEO_DEVICES_STG_TABLE", "merveil-data-warehouse.staging.stg_iseo__standard_devices")
-MEWS_PAYMENTS_TABLE = os.environ.get(
-    "MEWS_PAYMENTS_TABLE", "merveil-data-warehouse.staging.stg_mews__payments")
-MEWS_ORDER_ITEMS_TABLE = os.environ.get(
-    "MEWS_ORDER_ITEMS_TABLE", "merveil-data-warehouse.staging.stg_mews__order_items")
+# ⚠ `MEWS_PAYMENTS_TABLE` / `MEWS_ORDER_ITEMS_TABLE` retirés le 09/09/2026 : la logique
+# paiement est passée dans la vue `int_reservations__payments` (cf. `PAYMENTS_TABLE`).
 SMART_LOCKS_TABLE = os.environ.get(
     "SMART_LOCKS_TABLE", "merveil-data-warehouse.staging.stg_iseo__smart_locks")
 STD_DEVICES_TABLE = os.environ.get(
@@ -366,70 +364,32 @@ _LOCKS_CTE = f"""
 # 9 mesurés le 15/08, dont 2 apparts whitelistés laissés SANS code généré (Jack
 # Spence, encaissé 4 672 € le 02/08 ; Ray Javier, 3 946 € le 06/08).
 #
-# D'où les DEUX chemins ci-dessous, réunis et dédupliqués : par réservation (paiements
-# externes OTA) ET par compte payeur (encaissements carte). Mesuré sur 1 976 séjours en
-# cours ou à venir : l'union voit 129 séjours soldés, la lecture par réservation seule
-# 119, la lecture par compte seule 116 — aucune des deux ne suffit.
+# ⭐ **Depuis le 09/09/2026 cette logique ne vit plus ici** : elle est dans la vue dbt
+# `int_reservations__payments`, SEULE SOURCE du DWH — la porte, 6.1 (`payment_unpaid`),
+# 6.7 (`f_solde_du`), le 360 (`encaisse_ttc`) et la simulation de porte la lisent toutes.
+# Elle avait fini en 5 copies, dont une (le gate de `dash_ops_arrivals`) déjà divergente :
+# la porte pouvait retenir pour non-paiement un séjour que 6.1 affichait réglé.
+# La vue ajoute un TROISIÈME chemin de rattachement, le **bill mono-résa** : quand la
+# carte du client est refusée et que la RC re-passe l'encaissement sur le compte de
+# facturation OTA, le paiement n'a ni `reservation_id` ni compte `Customer` (cas Ariel
+# Taylor 59579, 09/09 : refusée à 06:57, encaissée 48 s plus tard sur un compte
+# `Company`) — mais il porte le bill des order items. Mesuré sur CI −120 j → +30 j :
+# 40 des 60 résas que la porte disait « impayées » étaient intégralement réglées.
 #
-# ⚠ `amount_charged` est le total encaissé sur le COMPTE (il peut couvrir plusieurs
-# séjours) → un `balance` négatif veut dire « rien à devoir », pas un avoir.
+# ⚠ C'est une VUE sur des vues de staging : la porte voit un encaissement dès que l'ETL
+# l'a écrit, sans attendre la cascade dbt de `:15`. Ne pas la matérialiser en table.
+# ⚠ `amount_charged` peut couvrir plusieurs séjours (chemin par compte) → un `balance`
+# négatif veut dire « rien à devoir », pas un avoir.
+# ⚠ Alias `balance` conservé : `_STAYS_CTE` et `_whitelisted_gaps` lisent `pay.balance`.
+PAYMENTS_TABLE = os.environ.get(
+    "PAYMENTS_TABLE",
+    "merveil-data-warehouse.intermediate_reservations.int_reservations__payments")
+
 _PAYMENTS_CTE = f"""
-    resa_accounts AS (
-      SELECT reservation_id,
-             COALESCE(payer_account_id, customer_id) AS account_id,
-             SUM(amount_gross)                       AS due
-      FROM `{MEWS_ORDER_ITEMS_TABLE}`
-      WHERE NOT is_canceled AND reservation_id IS NOT NULL
-      GROUP BY reservation_id, account_id
-    ),
-    charged AS (
-      SELECT payment_id, account_id, account_type, reservation_id, amount_gross
-      FROM `{MEWS_PAYMENTS_TABLE}`
-      WHERE state = 'Charged' AND type <> 'GhostPayment'
-    ),
-    -- Chemin 1 : le paiement porte la réservation. C'est le cas des `ExternalPayment`
-    -- OTA (Booking/Airbnb encaissent et Mews trace le règlement sur le compte Company).
-    charged_by_reservation AS (
-      SELECT ra.reservation_id, c.payment_id, c.amount_gross
-      FROM (SELECT DISTINCT reservation_id FROM resa_accounts) ra
-      JOIN charged c ON c.reservation_id = ra.reservation_id
-    ),
-    -- Chemin 2 : le paiement porte le COMPTE payeur. C'est le cas de tous les
-    -- encaissements carte réussis — ils n'ont PAS de reservation_id. Restreint aux
-    -- comptes `Customer` : les comptes `Company` sont les comptes OTA, qui agrègent
-    -- TOUS les versements (5,2 M€ côté Airbnb) et rendraient chaque résa créditrice.
-    charged_by_account AS (
-      SELECT ra.reservation_id, c.payment_id, c.amount_gross
-      FROM resa_accounts ra
-      JOIN charged c ON c.account_id = ra.account_id AND c.account_type = 'Customer'
-    ),
-    -- Union DÉDUPLIQUÉE par payment_id : un paiement peut porter les deux clés,
-    -- sommer les deux agrégats doublerait le montant encaissé.
-    charged_union AS (
-      SELECT DISTINCT * FROM (
-        SELECT * FROM charged_by_reservation
-        UNION ALL
-        SELECT * FROM charged_by_account)
-    ),
-    charged_total AS (
-      SELECT reservation_id, SUM(-amount_gross) AS amount_charged
-      FROM charged_union GROUP BY reservation_id
-    ),
-    resa_failed AS (
-      SELECT reservation_id, COUNTIF(state = 'Failed') AS n_failed
-      FROM `{MEWS_PAYMENTS_TABLE}`
-      WHERE reservation_id IS NOT NULL GROUP BY reservation_id
-    ),
     payments AS (
-      SELECT d.reservation_id,
-             d.amount_due,
-             COALESCE(ct.amount_charged, 0)                  AS amount_charged,
-             d.amount_due - COALESCE(ct.amount_charged, 0)   AS balance,
-             COALESCE(f.n_failed, 0)                         AS n_failed
-      FROM (SELECT reservation_id, SUM(due) AS amount_due
-            FROM resa_accounts GROUP BY reservation_id) d
-      LEFT JOIN charged_total ct USING (reservation_id)
-      LEFT JOIN resa_failed   f  USING (reservation_id)
+      SELECT reservation_id, amount_due, amount_charged,
+             balance_due AS balance, n_failed
+      FROM `{PAYMENTS_TABLE}`
     )"""
 
 
@@ -845,7 +805,17 @@ def _resa_to_resync() -> list[dict]:
       s.earliest_checkin_hour, s.latest_checkout_hour,
       s.purchased_early_checkin_hour, s.has_purchased_late_checkout, s.member_duve_ids,
       s.min_lead_hours, s.direct_last_minute, s.direct_unpaid, s.balance_due,
-      s.fraud_combo, s.blacklist_confirmed, s.same_day_booking, s.young_group
+      s.fraud_combo, s.blacklist_confirmed, s.same_day_booking, s.young_group,
+      -- ⛔⛔ `payment_unpaid` MANQUAIT ICI depuis que le paiement est devenu un critère
+      -- de la porte (25/08) : ce SELECT n'avait pas suivi. `_evaluate_hold` lisait donc
+      -- `row.get("payment_unpaid")` = None à chaque resync, et le critère paiement
+      -- DISPARAISSAIT — un simple resync levait une rétention pour impayé, sans trace.
+      -- Mesuré le 09/09 : Anne Elizabeth Harris (52172), retenue pour 4 500 € impayés,
+      -- a été libérée à 10h01 par le resync déclenché par son achat d'early check-in à
+      -- 255 €. Acheter un service suffisait donc à contourner la porte. C'est la même
+      -- faille que celle documentée pour les dates (réserver à J+5, avancer à J-0), sur
+      -- un autre critère.
+      s.payment_unpaid
     FROM cache c
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
                  OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
@@ -1004,11 +974,23 @@ def _mark_released(duve_resa_id: str, by: str) -> None:
         bigquery.ScalarQueryParameter("by", "STRING", by)])).result()
 
 
-def _mark_held(duve_resa_id: str, hold_reason: str, member_csv: Optional[str] = None) -> None:
-    """Rétention posée APRÈS la création (clé M dont le formulaire vient d'arriver)."""
+def _mark_held(duve_resa_id: str, hold_reason: str, member_csv: Optional[str] = None,
+               reset_release: bool = False) -> None:
+    """Rétention posée APRÈS la création (clé M dont le formulaire vient d'arriver).
+
+    ⚠ `reset_release` (09/09) : efface `released_at`/`released_by` et repart sur un
+    `held_at` neuf. À poser UNIQUEMENT quand le formulaire révèle un motif que la RC
+    n'a pas pu acquitter en cliquant [Livrer]. Sans lui, une ligne portait à la fois
+    `hold_reason` et `released_at` : l'overlay 6.1 (`held_at IS NOT NULL AND
+    released_at IS NULL`) ne la voyait plus comme `retenu` mais comme `attente_form`,
+    le bouton [Livrer] disparaissait du 360 (même condition), et la boucle de retry
+    la re-jugeait à chaque run — un mail toutes les 10 min jusqu'au check-out.
+    """
     q = f"""
     UPDATE `{PIN_CACHE_TABLE}`
-    SET hold_reason = @hold, held_at = COALESCE(held_at, CURRENT_TIMESTAMP()),
+    SET hold_reason = @hold,
+        held_at = {'CURRENT_TIMESTAMP()' if reset_release else 'COALESCE(held_at, CURRENT_TIMESTAMP())'},
+        {'released_at = NULL, released_by = NULL,' if reset_release else ''}
         stay_member_duve_ids = COALESCE(@members, stay_member_duve_ids)
     WHERE duve_reservation_id = @id AND archived_at IS NULL
     """
@@ -1223,31 +1205,68 @@ def _evaluate_hold(row: dict) -> Optional[str]:
     """
     if ISEO_HOLD_MODE == "off":
         return None
-    motifs = []
+    motifs = _hold_motifs(row)
+    return " + ".join(label for _, label in motifs) if motifs else None
+
+
+# Libellés de base des motifs. Le texte affiché y ajoute un détail variable
+# (« (2570 € dus) », « (48h avant l'arrivée) ») — d'où la séparation clé / libellé :
+# comparer deux rétentions se fait sur les CLÉS, jamais sur les libellés. Sans ça,
+# « paiement refusé, rien d'encaissé (2570 € dus) » et le même motif à 2 400 € en
+# paraîtraient deux, et une libération acquittée serait perdue au moindre centime.
+_HOLD_LABELS = {
+    "direct_last_minute":  "direct réservé au dernier moment",
+    "direct_unpaid":       "direct avec solde restant dû",
+    "payment_unpaid":      "paiement refusé, rien d'encaissé",
+    "fraud_combo":         "combo fraude (≥2 signaux, cf. 6.7)",
+    "blacklist_confirmed": "client blacklisté (rapprochement confirmé)",
+    "same_day_booking":    "réservé le jour de l'arrivée",
+    "young_group":         "groupe jeune (≥ 2 adultes ≤ 25 ans)",
+}
+
+
+def _hold_motifs(row: dict) -> list[tuple[str, str]]:
+    """[(clé, libellé affiché)] des motifs qui retiennent CE séjour, dans l'ordre.
+
+    Sépare l'évaluation (ici) de son rendu en chaîne (`_evaluate_hold`) : la boucle de
+    retry a besoin des clés pour distinguer un motif NOUVEAU d'un motif déjà acquitté
+    par la RC au moment où elle a cliqué [Livrer] (cf. `_run_inner`, 09/09).
+    ⚠ Ne pas trier : l'ordre porte la hiérarchie de lecture du mail de rétention.
+    """
+    motifs: list[tuple[str, str]] = []
     if row.get("direct_last_minute"):
         lead = row.get("min_lead_hours")
         detail = f" ({int(lead)}h avant l'arrivée)" if lead is not None else ""
-        motifs.append(f"direct réservé au dernier moment{detail}")
+        motifs.append(("direct_last_minute",
+                       f"{_HOLD_LABELS['direct_last_minute']}{detail}"))
     if row.get("direct_unpaid"):
         bal = row.get("balance_due")
         detail = f" ({bal:.0f} € restants)" if bal is not None else ""
-        motifs.append(f"direct avec solde restant dû{detail}")
+        motifs.append(("direct_unpaid", f"{_HOLD_LABELS['direct_unpaid']}{detail}"))
     if row.get("payment_unpaid"):
         bal = row.get("balance_due")
         detail = f" ({bal:.0f} € dus)" if bal is not None else ""
-        motifs.append(f"paiement refusé, rien d'encaissé{detail}")
+        motifs.append(("payment_unpaid", f"{_HOLD_LABELS['payment_unpaid']}{detail}"))
     # Chantier D (07/09, décision Hatim) — 3 critères de plus, tous canaux. Les deux
     # premiers sont des verdicts dbt déjà calibrés (backtest 19/08 · rapprochement
     # exact/fort 29/08), le 3ᵉ est le « jour J » que A+B rendent évaluable à la minute.
-    if row.get("fraud_combo"):
-        motifs.append("combo fraude (≥2 signaux, cf. 6.7)")
-    if row.get("blacklist_confirmed"):
-        motifs.append("client blacklisté (rapprochement confirmé)")
-    if row.get("same_day_booking"):
-        motifs.append("réservé le jour de l'arrivée")
-    if row.get("young_group"):
-        motifs.append("groupe jeune (≥ 2 adultes ≤ 25 ans)")
-    return " + ".join(motifs) if motifs else None
+    for key in ("fraud_combo", "blacklist_confirmed", "same_day_booking", "young_group"):
+        if row.get(key):
+            motifs.append((key, _HOLD_LABELS[key]))
+    return motifs
+
+
+def _motif_keys(hold_reason: Optional[str]) -> set[str]:
+    """Clés des motifs portés par un `hold_reason` déjà écrit en base.
+
+    Le cache ne stocke que la chaîne ; on retrouve les clés par préfixe de libellé —
+    pas de colonne `hold_keys`, donc pas de DDL. Un libellé inconnu (motif retiré du
+    code depuis) ne matche rien : il sera vu comme « nouveau » et retiendra, ce qui
+    est le sens prudent.
+    """
+    parts = [p.strip() for p in (hold_reason or "").split(" + ") if p.strip()]
+    return {key for part in parts
+            for key, base in _HOLD_LABELS.items() if part.startswith(base)}
 
 
 def _log_hold_decision(row: dict, motif: str, phase: str, outcome: str) -> None:
@@ -2278,28 +2297,62 @@ def _run_inner() -> None:
             key = row["duve_reservation_id"]
             members = [m for m in (row.get("live_member_duve_ids") or []) if m] \
                 or [m for m in (row.get("stay_member_duve_ids") or "").split(",") if m]
-            if not members:
-                if key.startswith("M"):
-                    continue  # code créé sans formulaire, toujours pas de Duve : rien où pousser
-                members = [key]
-            if row.get("cache_hold") and not row.get("cache_released"):
-                # ⭐ Rétention en cours : la porte est RÉ-ÉVALUÉE à chaque run. Si plus
-                # aucun critère ne tient (paiement encaissé, fiche levée, dates
-                # changées…), le code part seul — sans geste RC ni mail. Sinon on
-                # attend [Livrer]. Ne s'applique pas à une libération manuelle.
+            was_held = bool(row.get("cache_hold")) and not row.get("cache_released")
+
+            # ⭐ Rétention en cours : la porte est RÉ-ÉVALUÉE à chaque run. Si plus aucun
+            # critère ne tient (paiement encaissé, fiche levée, dates changées…), le code
+            # part seul — sans geste RC ni mail. Sinon on attend [Livrer].
+            # ⚠ ÉVALUÉ AVANT le test `members` (09/09) : une clé M sans formulaire n'a rien
+            # où pousser, mais l'écran doit cesser d'accuser un paiement qui est arrivé.
+            # Avant, `continue` sur `not members` sautait cette libération, et 6.1 affichait
+            # « retenu · paiement refusé » jusqu'au pré-checkin — ou jusqu'au check-out.
+            if was_held:
                 still = _evaluate_hold(row) if ISEO_HOLD_MODE == "on" else None
                 if still:
                     continue
                 _mark_released(key, "auto:criteres_leves")
                 _log_hold_decision(row, row["cache_hold"], "auto_release", "released")
                 logger.info(f"🔓 {key} ({row.get('apartment_code')}) — critères levés "
-                            f"(était : {row['cache_hold']}) → code poussé à Duve")
-            elif key.startswith("M"):
-                # ⭐ Le formulaire vient d'arriver : la porte est évaluée ICI, avec les
-                # signaux qu'il apporte (groupe jeune, nom de pièce…). Une rétention
-                # bloque le push exactement comme au provisioning ; la RC livre en 6.1.
+                            f"(était : {row['cache_hold']}) → libéré")
+
+            if not members:
+                if key.startswith("M"):
+                    continue  # code créé sans formulaire, toujours pas de Duve : rien où pousser
+                members = [key]
+
+            # ⭐ Le formulaire vient d'arriver sur une clé M : la porte est évaluée ICI, avec
+            # les signaux qu'il apporte (groupe jeune, nom de la pièce…) — ils n'existaient
+            # pas à la création. `was_held` est exclu : une rétention encore active a déjà
+            # été tranchée juste au-dessus (elle a fait `continue`), et une rétention libérée
+            # au même run n'a pas à être re-jugée sur les critères qu'on vient de lever.
+            if key.startswith("M") and not was_held:
                 hold = _evaluate_hold(row)
-                if hold and ISEO_HOLD_MODE == "on":
+                # ⛔ Après une libération MANUELLE (09/09) : ne re-retenir que sur un motif
+                # NOUVEAU. Sinon le formulaire ré-évaluait la porte sur les mêmes critères,
+                # re-posait le hold — `_mark_held` n'effaçant pas `released_at`, l'overlay 6.1
+                # basculait en `attente_form` alors que la résa était retenue — et renvoyait
+                # un mail À CHAQUE RUN (10 min) jusqu'au check-out. La RC a acquitté ce
+                # qu'elle a vu ; ce qu'elle n'a pas pu voir, elle doit le revoir.
+                if hold and row.get("cache_released"):
+                    acquittes = _motif_keys(row.get("cache_hold"))
+                    nouveaux = [(k, label) for k, label in _hold_motifs(row)
+                                if k not in acquittes]
+                    hold = " + ".join(label for _, label in nouveaux) if nouveaux else None
+                    if hold:
+                        # `reset_release` : la rétention repart de zéro (released_at à NULL)
+                        # → 6.1 réaffiche `retenu` et [Livrer] revient, avec le seul motif
+                        # que la RC n'a pas encore tranché.
+                        _mark_held(key, hold, ",".join(members), reset_release=True)
+                        row["no_duve"] = False
+                        _log_hold_decision(row, hold, "form_arrival_new_motif", "held")
+                        _notify_hold(row, hold,
+                                     suffix=" — nouveau motif au pré-checkin, après libération")
+                        logger.warning(f"🔒 RE-HOLD {key} ({row.get('apartment_code')}) — motif "
+                                       f"nouveau : {hold} → code PAS envoyé à Duve")
+                        continue
+                    logger.info(f"🔓 {key} ({row.get('apartment_code')}) — formulaire arrivé, "
+                                f"aucun motif nouveau (acquittés : {row.get('cache_hold')}) → push")
+                elif hold and ISEO_HOLD_MODE == "on":
                     _mark_held(key, hold, ",".join(members))
                     row["no_duve"] = False
                     _log_hold_decision(row, hold, "form_arrival", "held")
@@ -2307,7 +2360,7 @@ def _run_inner() -> None:
                     logger.warning(f"🔒 HOLD au formulaire {key} ({row.get('apartment_code')}) — {hold} "
                                    f"→ code PAS envoyé à Duve")
                     continue
-                if hold:
+                elif hold:
                     _log_hold_decision(row, hold, "form_arrival", "pushed_observe")
             done, err = _duve_push_all(members, row.get("pin_value") or "",
                                        row.get("invitation_link") or "")
