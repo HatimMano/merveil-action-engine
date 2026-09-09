@@ -51,6 +51,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
+import yaml
 from google.cloud import bigquery
 
 from src.core.mailer import build_email, esc, send_mail
@@ -1379,6 +1380,51 @@ def _hold_already_notified(duve_resa_id: str) -> bool:
         return False
 
 
+# ⭐ Fusion avec le mail [Merveil Fraude] (09/09, décision Hatim — cas Adam Jerou
+# 61757 : « 🔒 Code retenu » 12h21 puis « [Merveil Fraude] » 12h50, même résa). Les
+# deux lisent le même `is_fraud_combo` ; quand la porte retient pour ce motif, le
+# trigger dbt `fraude_identite` se tait (anti-join sur `hold_decisions`), et c'est
+# CE mail qui devient le mail fraude : il prend donc les destinataires du bucket
+# `fraude` et le détail des signaux. Lus dans routing.yaml plutôt que recopiés —
+# une seule liste de diffusion à entretenir. Best-effort : en cas d'échec on
+# retombe sur ISEO_HOLD_ALERT_TO, jamais sur un mail non envoyé.
+# ⛔ Compatible avec `hello@` / `externe-onepilot@` (hors domaine) parce que ce
+# mail ne porte AUCUN code de porte — condition du bucket fraude, à préserver.
+def _fraude_recipients() -> list[str]:
+    try:
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "config", "routing.yaml")
+        with open(path) as f:
+            routing = yaml.safe_load(f) or {}
+        return [str(a) for a in routing.get("digest_buckets", {})
+                                         .get("fraude", {})
+                                         .get("default_recipients", [])]
+    except Exception as e:
+        logger.warning(f"⚠️ routing.yaml illisible, destinataires fraude ignorés — {e}")
+        return []
+
+
+def _fraud_reasons(mews_reservation_number: Optional[str]) -> list[str]:
+    """Signaux fraude de la résa, libellés de 6.7 (`risk_reasons`) — le mail fraude
+    les donnait (« Échecs CB ×1 (direct) + … »), le motif de la porte ne dit que
+    « combo fraude (≥2 signaux) ». Best-effort : liste vide en cas d'erreur."""
+    if not mews_reservation_number:
+        return []
+    try:
+        fct = os.environ.get("MEWS_FCT_TABLE", "merveil-data-warehouse.marts.fct_reservations")
+        q = f"""
+        SELECT DISTINCT reason
+        FROM `{RISK_TABLE}` r
+        JOIN `{fct}` f USING (reservation_id), UNNEST(r.risk_reasons) AS reason
+        WHERE CAST(f.reservation_number AS STRING) = @num
+        """
+        cfg = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("num", "STRING", str(mews_reservation_number))])
+        return [r.reason for r in _bq().query(q, job_config=cfg).result()]
+    except Exception as e:
+        logger.warning(f"⚠️ risk_reasons {mews_reservation_number} KO — {type(e).__name__}: {e}")
+        return []
+
+
 def _notify_hold(row: dict, motif: str, suffix: str = "",
                  retenu: Optional[bool] = None) -> None:
     """Prévient la RC qu'une résa est jugée à risque par la porte.
@@ -1419,11 +1465,23 @@ def _notify_hold(row: dict, motif: str, suffix: str = "",
                 "<strong>a bien été envoyé au client</strong>, il peut entrer.")
         suite = ("Vérifier l'identité du client. En cas de doute, faire annuler la "
                  "réservation et changer le code de l'appartement avant l'arrivée.")
+    # Motif fraude → ce mail EST le mail fraude : diffusion du bucket `fraude` +
+    # détail des signaux (cf. _fraude_recipients).
+    to_list = [a.strip() for a in ISEO_HOLD_ALERT_TO.split(",") if a.strip()]
+    detail = ""
+    if "fraud_combo" in _motif_keys(motif):
+        for a in _fraude_recipients():
+            if a not in to_list:
+                to_list.append(a)
+        reasons = _fraud_reasons(row.get("mews_reservation_number"))
+        if reasons:
+            detail = ("<br><strong>Signaux fraude (6.7) :</strong> "
+                      f"{esc(' + '.join(reasons))}")
     html = build_email(
         titre,
         subtitle=f"{row.get('customer_name')} · {apt}{suffix}",
         severity="warning",
-        intro=f"{etat}<br><strong>Motif :</strong> {esc(motif)}",
+        intro=f"{etat}<br><strong>Motif :</strong> {esc(motif)}{detail}",
         table={"headers": ["Client", "Appartement", "Séjour", "Résa Mews"],
                "rows": [[esc(row.get("customer_name")), esc(apt),
                          f"{esc(ci)} → {esc(co)}",
@@ -1432,7 +1490,7 @@ def _notify_hold(row: dict, motif: str, suffix: str = "",
                        f"{suite}</div>"),
         button=("Voir la réservation en 6.1 →", _lien_arrivees(row.get("customer_name"))))
     send_mail(f"{sujet} — {row.get('customer_name')} ({apt})",
-              html, ISEO_HOLD_ALERT_TO, html=True, sender=GMAIL_SENDER)
+              html, ",".join(to_list), html=True, sender=GMAIL_SENDER)
 
 
 def _provision(row: dict) -> tuple[bool, Optional[str]]:
