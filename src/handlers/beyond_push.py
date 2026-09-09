@@ -43,7 +43,20 @@ Garde-fous :
     avec un plancher PLUS HAUT → min relevé (on ne casse jamais un plancher
     équipe) ; un plancher équipe plus bas est bypassé. Le max suit toujours le
     min (max(max, min)) → aucune fenêtre skippée.
-  - bornes de sécurité AVANT tout PATCH : PRICE_FLOOR ≤ min ≤ max ≤ PRICE_CEILING
+  - bornes de sécurité AVANT tout PATCH : PRICE_FLOOR ≤ min ≤ PRICE_CEILING,
+    et min ≤ max ≤ PRICE_CEILING quand un max existe encore
+  - ⛔ PLAFOND MÉTIER RETIRÉ (09/09, décision call 08/09) : `dash_beyond_push_targets`
+    pose `max_price = NULL` sur les 3 cibles → on PATCH un `min` SEUL, sans
+    `max-price`. Beyond l'accepte nativement (sondage read-only 09/09 : 217 des
+    293 règles vivantes portent déjà `max-price: null`). Le plafond théorique
+    reste calculé côté dbt (`max_price_theorique`) pour la surveillance.
+    ⚠⚠ ORDRE DE DÉPLOIEMENT : ce handler d'abord, le modèle dbt ENSUITE. Il est
+    rétro-compatible (un max non-NULL se comporte comme avant), alors que
+    l'inverse est destructeur — l'ancien handler lit `float(NULL or -1)` = -1,
+    le garde-fou bornes écarte alors TOUTES les fenêtres, et comme elles sont
+    possédées le diff les RETIRE de Beyond (75 protections plancher perdues).
+  - PRICE_FLOOR/CEILING est un filet TECHNIQUE, indépendant du plafond métier
+    qu'on vient de retirer : il reste en place, ne pas confondre les deux.
     (défaut 50..5000 €, mêmes bornes que le test dbt ADR). Fenêtre hors bornes →
     écartée de l'état voulu (donc retirée de Beyond si possédée) + erreur mail.
     Couvre aussi bien un target dbt aberrant (coussin cassé par le référentiel
@@ -168,9 +181,15 @@ def _load_targets() -> dict[int, dict[tuple, dict]]:
     for r in rows:
         key = (r["s"], r["e"])
         targets.setdefault(r["listing_id"], {})[key] = {
-            # NULL/0 → -1 : recalé par le garde-fou bornes (skip + mail) au lieu
-            # de crasher le run entier sur float(None).
-            "min": float(r["min_price"] or -1), "max": float(r["max_price"] or -1),
+            # min NULL/0 → -1 : recalé par le garde-fou bornes (skip + mail) au
+            # lieu de crasher le run entier sur float(None).
+            "min": float(r["min_price"] or -1),
+            # ⛔ max NULL = PLAFOND RETIRÉ (09/09) — c'est le cas NOMINAL depuis
+            # que le modèle pose `max_price = NULL` sur les 3 cibles, plus une
+            # anomalie à recaler. On pousse un `min` seul ; Beyond l'accepte
+            # (217 des 293 règles vivantes ont déjà `max-price: null`).
+            # Le plafond théorique reste dans `max_price_theorique`, non poussé.
+            "max": None if r["max_price"] is None else float(r["max_price"]),
             "apartment_code": r["apartment_code"],
         }
     return targets
@@ -276,14 +295,17 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
 
     # Fenêtres voulues. Un plancher équipe plus HAUT relève notre min (on ne
     # casse jamais une règle équipe) ; plus bas → bypassé (règle coussin).
-    # Le max suit le min → jamais de fenêtre incohérente, jamais de skip.
+    # ⛔ max None = plafond retiré : il reste None quoi qu'il arrive. Quand un
+    # max existe encore (fenêtre héritée), il suit le min → jamais de fenêtre
+    # incohérente, jamais de skip.
     final_desired: dict[tuple, dict] = {}
     for (start, end), t in sorted(desired.items()):
         mn, mx = t["min"], t["max"]
         for rule in team_rules:
             if rule.get("min-price") and _overlaps(start, end, rule):
                 mn = max(mn, float(rule["min-price"]))
-        final_desired[(start, end)] = {"min": mn, "max": max(mx, mn)}
+        final_desired[(start, end)] = {
+            "min": mn, "max": None if mx is None else max(mx, mn)}
 
     # Garde-fou bornes prix : jamais de PATCH avec une fenêtre aberrante, quelle
     # que soit son origine (target dbt corrompu, plancher équipe extrême). Fenêtre
@@ -291,9 +313,17 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
     # Beyond : mieux vaut aucune fenêtre qu'une fenêtre fausse) + erreur mail.
     for k in list(final_desired):
         v = final_desired[k]
-        if not (PRICE_FLOOR <= v["min"] <= v["max"] <= PRICE_CEILING):
+        # ⛔ Depuis le 09/09 `max` est None dans le cas nominal : on ne borne
+        # alors QUE le min. Le garde-fou reste entier sur ce qu'il protège —
+        # aucun prix aberrant ne part — mais il ne réclame plus un plafond que
+        # le métier a délibérément retiré. (Il est indépendant du plafond
+        # métier : PRICE_FLOOR/CEILING = filet technique, pas règle coussin.)
+        ok_bornes = (PRICE_FLOOR <= v["min"] <= PRICE_CEILING) and (
+            v["max"] is None or v["min"] <= v["max"] <= PRICE_CEILING)
+        if not ok_bornes:
+            mx_txt = "—" if v["max"] is None else v["max"]
             errs.append({"where": f"{apartment_code} {k[0]}",
-                         "what": f"fenêtre [{v['min']}, {v['max']}] hors bornes "
+                         "what": f"fenêtre [{v['min']}, {mx_txt}] hors bornes "
                                  f"[{PRICE_FLOOR}, {PRICE_CEILING}] — écartée, pas de push"})
             log("skip", "error", k[0], k[1], v["min"], v["max"],
                 error=f"hors bornes [{PRICE_FLOOR}, {PRICE_CEILING}]")
@@ -318,9 +348,18 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
     # Diff état voulu vs nos fenêtres actuelles
     to_add = [k for k in final_desired if k not in ours_current]
     to_remove = [k for k in ours_current if k not in final_desired]
+    # `or 0` écrasait « pas de plafond » et « plafond à 0 » sur la même valeur.
+    # Sans conséquence tant que les deux côtés étaient absents (0 == 0), mais la
+    # comparaison ne disait plus ce qu'elle testait dès que le max devient
+    # facultatif — et un plafond à 0 réel serait passé pour un plafond absent.
+    # On compare donc None à None explicitement.
+    def _max_of(w):
+        v = w.get("max-price")
+        return None if v is None else float(v)
+
     to_update = [k for k in final_desired if k in ours_current and (
         float(ours_current[k].get("min-price") or 0) != final_desired[k]["min"]
-        or float(ours_current[k].get("max-price") or 0) != final_desired[k]["max"])]
+        or _max_of(ours_current[k]) != final_desired[k]["max"])]
 
     if not to_add and not to_remove and not to_update:
         logger.info(f"✓ {apartment_code} ({listing_id}) : {len(final_desired)} fenêtre(s), aucun écart")
