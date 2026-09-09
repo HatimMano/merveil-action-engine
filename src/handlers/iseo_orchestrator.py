@@ -779,6 +779,7 @@ def _resa_to_resync() -> list[dict]:
       SELECT duve_reservation_id, pin_value, iseo_device_id, iseo_invitation_id,
              iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id,
              mews_reservation_number, apartment_code, hold_reason, released_at,
+             duve_pushed_at,
              checkin_date AS cache_ci, checkout_date AS cache_co
       FROM `{PIN_CACHE_TABLE}`
       WHERE archived_at IS NULL AND provisioned_at IS NOT NULL
@@ -799,6 +800,7 @@ def _resa_to_resync() -> list[dict]:
       c.duve_reservation_id, c.pin_value, c.iseo_device_id, c.iseo_invitation_id,
       c.iseo_guest_tag_id, c.iseo_lock_id, c.iseo_lock_tag_id,
       c.cache_ci, c.cache_co, c.hold_reason AS cache_hold, c.released_at AS cache_released,
+      (c.duve_pushed_at IS NOT NULL) AS cache_pushed,
       c.mews_reservation_number, c.apartment_code,
       s.duve_property_id, s.customer_name,
       s.stay_ci AS live_ci, s.stay_co AS live_co,
@@ -1362,7 +1364,8 @@ def _hold_already_notified(duve_resa_id: str) -> bool:
         return False
 
 
-def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
+def _notify_hold(row: dict, motif: str, suffix: str = "",
+                 retenu: Optional[bool] = None) -> None:
     """Prévient la RC qu'une résa est jugée à risque par la porte.
 
     ⚠ Envoyé dans les modes `on` ET `observe` (décision 15/08) : toute rétention
@@ -1371,7 +1374,11 @@ def _notify_hold(row: dict, motif: str, suffix: str = "") -> None:
     qu'une résa avait été jugée à risque. Le mail dit explicitement, dans chaque
     mode, si le client a le code ou non : ce sont deux gestes RC opposés.
     """
-    effectif = ISEO_HOLD_MODE == "on"
+    # ⚠ `retenu` force la variante du mail quand le mode ne suffit plus à la décrire :
+    # au resync d'un code DÉJÀ livré, la porte n'a rien retenu même en mode `on`
+    # (cf. `_resync`) — annoncer « code retenu à valider » enverrait la RC cliquer
+    # [Livrer] sur un code que le client a déjà. Le bon geste est vérifier / révoquer.
+    effectif = (ISEO_HOLD_MODE == "on") if retenu is None else retenu
     apt = row.get("apartment_code") or row.get("duve_property_id")
     # Le provision porte checkin_date/checkout_date, le resync live_ci/live_co.
     ci = row.get("checkin_date") or row.get("live_ci")
@@ -1804,6 +1811,42 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     hold = None
     if not row.get("cache_released"):
         hold = _evaluate_hold(row)
+
+    # ⛔⛔ UNE FOIS LE CODE LIVRÉ, LA PORTE NE PEUT PLUS RIEN RETENIR (09/09).
+    # La porte retient le PUSH DUVE, pas le code. Quand `duve_pushed_at` est déjà
+    # posé, le client a le code dans sa Guest App — et un message Duve est FIGÉ, on
+    # ne le reprend pas. Pire, le resync a déjà élargi la fenêtre côté Sofia à
+    # l'étape 2 et le PUT conserve le MÊME PIN : le code du client fonctionne sur
+    # les nouvelles dates, que l'on pousse le lien ou non. Retenir ici ne protégeait
+    # donc rien ; ça ne faisait que (a) remettre `duve_pushed_at` à NULL via
+    # `_save_resynced(duve_ok=False)`, donc afficher « retenu » en 6.1 sur un client
+    # qui a son code et l'a peut-être déjà utilisé, et (b) envoyer un mail
+    # « Livrer le code » pour un code déjà livré. Le geste qui agit sur un code sorti
+    # est **Révoquer** (point 10), pas la porte.
+    # ⚠ Mesuré le 09/09 en ajoutant `payment_unpaid` au resync : 1 résa concernée
+    # (Matilda Reaburn, 37118, SEN18-2G, Expedia VCC impayée, EN SÉJOUR jusqu'au 10/09).
+    deja_livre = bool(row.get("cache_pushed"))
+    # `live_ci` est la date de début du stay : le séjour a-t-il commencé ?
+    en_sejour = (str(row.get("live_ci") or "9999-12-31")
+                 <= datetime.now(PARIS_TZ).date().isoformat())
+    if hold and deja_livre:
+        # ⚠ On JOURNALISE quand même : le signal est réel (fraude, créance) et doit
+        # rester mesurable — c'est seulement la rétention qui n'a plus de prise.
+        _log_hold_decision(row, hold, "resync", "skipped: code déjà livré")
+        if en_sejour:
+            # Le client est dans l'appartement. « Vérifier avant l'arrivée » n'a plus
+            # d'objet, et aucun geste de la porte ne le fera sortir → pas de mail.
+            # Une fraude avérée sur un séjour en cours passe par 6.7 / la révocation.
+            logger.info(f"⏭️ resync {duve_resa_id} ({row.get('apartment_code')}) — "
+                        f"critères réunis ({hold}) mais code livré ET séjour commencé : "
+                        f"ni rétention ni mail")
+        elif not _hold_already_notified(duve_resa_id):
+            # Séjour à venir : le code est parti, mais la RC doit savoir. Mail dans sa
+            # variante « code déjà envoyé » — elle porte le bon geste (vérifier
+            # l'identité, faire annuler, changer le code), pas « Livrer le code ».
+            _notify_hold(row, hold, suffix=" — code déjà envoyé, à vérifier", retenu=False)
+        hold = None
+
     if hold and ISEO_HOLD_MODE == "on":
         duve_ok, duve_err = False, None
         logger.warning(f"🔒 HOLD au resync {duve_resa_id} ({row.get('apartment_code')}) — "
