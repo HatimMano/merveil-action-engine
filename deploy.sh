@@ -22,6 +22,18 @@ gcloud builds submit \
   --region "$REGION" \
   --project "$PROJECT"
 
+# ⛔ Déployer par DIGEST, jamais par tag (09/09, piège vu 3× dans la journée).
+# `jobs deploy --image …:latest` ne crée AUCUNE révision quand la spec du job
+# porte déjà exactement cette chaîne : le job garde le digest résolu au premier
+# déploiement du jour, et le 2ᵉ build de la journée ne déploie rien — sans
+# erreur. Le job 2h (bucket fraude) a ainsi failli garder un routing.yaml
+# périmé. Avec `@sha256:…` la chaîne change à chaque build → révision garantie.
+DIGEST=$(gcloud artifacts docker images describe "$IMAGE" \
+  --project "$PROJECT" --format='value(image_summary.digest)')
+[ -n "$DIGEST" ] || { echo "⛔ digest introuvable pour $IMAGE"; exit 1; }
+IMAGE="${IMAGE%:latest}@${DIGEST}"
+echo "📌 Image déployée : $IMAGE"
+
 COMMON_ARGS="--image $IMAGE \
   --region $REGION \
   --memory 512Mi \
