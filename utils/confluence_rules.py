@@ -696,7 +696,13 @@ RULES = [
             "réservation directe) · nom du formulaire ou de la pièce différent du nom de la réservation. "
             "<strong>Deux signaux ou plus</strong> → mail « [Merveil Fraude] » sous 2 h (~2 cas/mois). Un "
             "signal isolé ne déclenche jamais de mail : il colore seulement le badge risque du dashboard "
-            "(6.1 / 6.7).",
+            "(6.1 / 6.7). <strong>Depuis le 9 septembre 2026, un seul mail par cas</strong> : sur un "
+            "appartement <strong>intégré ISEO</strong>, quand la porte d'accès a retenu le code pour ce motif, "
+            "c'est le mail « 🔒 Code retenu à valider » qui porte l'alerte (avec le détail des signaux) et "
+            "« [Merveil Fraude] » ne part pas. Ce dernier reste le mail des appartements <strong>non "
+            "intégrés</strong> (aucune rétention de code possible) et des cas où la porte n'a pas pu retenir "
+            "(code déjà livré, serrure non résolue) — il le précise en fin de ligne. Mêmes destinataires "
+            "des deux côtés : hello@, Hatim, OnePilot.",
             "<strong>Nouveau chargeback</strong> : chaque litige bancaire ouvert par un client est signalé "
             "immédiatement. ⏱ <strong>Le dossier de contestation Adyen se dépose sous ~48 h</strong> — "
             "au-delà, le litige est perdu d'office (en 2026 : 1 chargeback récupéré sur 20).",
