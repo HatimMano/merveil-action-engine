@@ -150,9 +150,11 @@ digest_buckets:
     # ⛔ Ce bucket ne porte AUCUN code de porte — c'est la condition qui rend ces
     # deux adresses hors domaine acceptables ici. Ne jamais y router un trigger
     # serrures.
+    # ⭐ 09/09 (décision Hatim) : liste RÉDUITE à hello@ + Hatim + OnePilot, alignée
+    # sur ISEO_HOLD_ALERT_TO — depuis la fusion, le mail de rétention EST le mail
+    # fraude sur les apparts intégrés, et les deux doivent partir aux mêmes gens.
+    # Emilia lit hello@ ; Philippe n'a aucun geste ici (il reste sur `chargeback`).
     default_recipients:
-      - emilia@archides.fr
-      - philippe@archides.fr
       - hatim@archides.fr
       - hello@merveil.co
       - externe-onepilot@merveil.co
