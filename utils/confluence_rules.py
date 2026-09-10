@@ -765,6 +765,36 @@ RULES = [
             "pas six cents.",
         ],
     ),
+    dict(
+        titre="Min-stay : Beyond et Mews doivent dire la même chose",
+        slug="minstay-drift",
+        triggers=["minstay_drift"],
+        domaine="Ventes — Distribution",
+        niveau="N2", niveau_desc="la machine surveille et alerte, l'humain décide",
+        owner="Raphael (à confirmer)",
+        depuis="10 septembre 2026",
+        source="trigger_minstay_drift → int_distribution__minstay_history (restrictions Mews × prix Beyond, appart × nuit)",
+        dashboard_url="https://direction.archides.fr/ventes?tab=controle&view=minstay",
+        quoi=[
+            "Chaque matin (08:00, après le snapshot Beyond de 07:00), la machine lit les <strong>restrictions "
+            "Mews</strong> (le min-stay par appartement et par date que Beyond y pousse, et que Mews transmet à "
+            "Rentals United puis aux OTAs) et les compare, nuit par nuit sur 180 jours, au min-stay que "
+            "<strong>Beyond</strong> demande.",
+            "Un écart n'est retenu que s'il est <strong>présent deux matins de suite</strong> (Beyond et Mews se "
+            "synchronisent toutes les ~8 h : un écart d'un jour peut être un simple décalage). Trois natures : "
+            "Mews plus strict que Beyond, Mews plus souple, ou <strong>aucune restriction Mews</strong> — ce dernier "
+            "cas est un push Beyond qui n'a pas abouti.",
+            "L'alerte est 🟡 les deux premières semaines (le temps de mesurer le bruit), puis 🔴. Elle ne dit "
+            "<em>rien</em> du niveau lui-même : « le parc passe à 3 nuits le 10/10 » est un choix pricing, visible "
+            "dans le sous-onglet Min-stay, pas une panne.",
+            "Ce qu'elle ne voit pas : le maillon Mews → Rentals United → OTAs. Ce que les OTAs <em>affichent</em> "
+            "se vérifie par le relevé Test_Prix (Mada) et, à terme, l'API RU.",
+        ],
+        exemple=[
+            "Mail du 12/09/2026 : « 📏 Min-stay : Mews est PLUS STRICT que Beyond sur 3 appartement(s) × 14 nuit(s), "
+            "du 10/10 au 23/10 — présent 2 runs de suite. Ex. : P02-DAL40-1D 2026-10-10 (Beyond 2 / Mews 3) … »",
+        ],
+    ),
 ]
 
 NIVEAUX = ("Grille de lecture des niveaux : <strong>N2</strong> = la machine surveille et alerte · "

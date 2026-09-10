@@ -288,6 +288,20 @@ triggers:
       - type: email_digest
         bucket: blacklist
 
+  # ── Distribution — min-stay Beyond ↔ Mews (2026-09-10, étage 1a) ──────────
+  # Écart entre le min-stay demandé par Beyond et celui que Mews porte (= ce que
+  # RU transmet aux OTAs), présent 2 runs de suite. C'est l'incident de l'été
+  # 2026 (3N poussé à RU, ÷100 sur les résas 2N OTA, découvert à la main
+  # mi-août) rendu visible le matin même. WARNING les 2 premières semaines
+  # (seuils mesurés, ADR 03/07) → CRITICAL ensuite. Bucket `beyond` : mêmes
+  # destinataires que le plan (Hatim + Raphael + Mickael), et le bucket `daily`
+  # est coupé depuis le 07/09.
+  minstay_drift:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: beyond
+
   # Test de cartes (2026-09-01, ADR) : ≥2 refus carte pour MOTIF DE FRAUDE
   # (FRAUD / Issuer Suspected Fraud) sur une résa Site direct à venir, dernier
   # refus < 48 h. La seule alerte fraude qui DEMANDE un geste immédiat : la RC
