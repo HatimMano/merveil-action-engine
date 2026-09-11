@@ -197,6 +197,22 @@ digest_buckets:
 # Triggers
 # ============================================================================
 
+  ops_back:
+    # Ops back-office (Abdel, Hassana, Sylvain, Alban) — créé le 11/09 pour la
+    # récidive technique (demande Abdel). Premier bucket adressé à l'ops-back :
+    # jusqu'ici tout partait sur alerte_ventes@ ou Hatim. Le geste est le leur
+    # (escalader à un technicien spécialisé), pas celui de la RC.
+    # ⚠ flush_with OBLIGATOIRE (cf. bucket chargeback) — flushé par le daily 7h.
+    flush_with: daily
+    send_if_empty: false
+    subject_prefix: "[Merveil Ops]"
+    default_recipients:
+      - abdel@archides.fr
+      - hassana@archides.fr
+      - sylvain@archides.fr
+      - alban@archides.fr
+      - hatim@archides.fr
+
 triggers:
 
   # ── Gouvernance données fixes (POC 2026-06-30) ────────────────────────────
@@ -296,6 +312,15 @@ triggers:
   # (seuils mesurés, ADR 03/07) → CRITICAL ensuite. Bucket `beyond` : mêmes
   # destinataires que le plan (Hatim + Raphael + Mickael), et le bucket `daily`
   # est coupé depuis le 07/09.
+  # Récidive technique (UC Abdel, 11/09) : ≥ 2 épisodes du même sujet de grille
+  # sur 30 j sur le même appart, toutes sources (tâches classées Gemini + conv +
+  # avis). 1 alerte par nouvel épisode (property_id = appart|sujet|dernier épisode).
+  issue_recurrence:
+    enabled: true
+    actions:
+      - type: email_digest
+        bucket: ops_back
+
   minstay_drift:
     enabled: true
     actions:
