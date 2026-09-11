@@ -315,14 +315,26 @@ triggers:
   # Récidive technique (UC Abdel, 11/09) : ≥ 2 épisodes du même sujet de grille
   # sur 30 j sur le même appart, toutes sources (tâches classées Gemini + conv +
   # avis). 1 alerte par nouvel épisode (property_id = appart|sujet|dernier épisode).
+  # ⛔ Mail COUPÉ le 11/09 (décision Hatim : « pour le moment pas d'alerte mail »).
+  # Le trigger reste produit par dbt (À traiter, 360 fleet, table triggers) ;
+  # réactiver = enabled: true, le bucket ops_back est prêt.
   issue_recurrence:
-    enabled: true
+    enabled: false
     actions:
       - type: email_digest
         bucket: ops_back
 
+  # ⛔ MAIL COUPÉ le 11/09 (décision Hatim) — dashboard d'abord, comme treasury_low.
+  # Le trigger continue d'alimenter la table `triggers` et le sub-tab Min-stay ;
+  # seul l'envoi est débranché. Motif : les 3 `mews_plus_souple` du 11/09 étaient
+  # des FAUX POSITIFS — `restrictions-daily` tombait en 429 depuis 2 jours (collision
+  # avec `merveil-etl-4h` sur un Cloud Run à containerConcurrency 1), donc on
+  # comparait un Beyond du jour à un Mews figé au 10/09 00h24. Restrictions
+  # rechargées à la main : les 3 écarts n'existaient pas (parité 13 997/14 000).
+  # Un garde-fou de fraîcheur est posé côté dbt (trigger_minstay_drift) ; on
+  # rebranche le mail après 2 semaines de parité sans faux positif.
   minstay_drift:
-    enabled: true
+    enabled: false
     actions:
       - type: email_digest
         bucket: beyond
