@@ -127,12 +127,20 @@ echo "🚀 Déploiement du job beyond-push (fenêtres prix gaps 1N, daily 10h45)
 # Notes :
 #   - Déclaratif : état voulu = dashboard_ventes.dash_beyond_push_targets (dbt),
 #     diff avec Beyond (GET) → PATCH seulement si écart. Log beyond_raw.price_pushes_log.
-#   - Whitelist = seed dbt beyond_push_whitelist (élargir = 1 ligne CSV + dbt seed).
+#   - Whitelist = dwh_inputs.beyond_push_whitelist (éditable dashboard, 100 % du parc en 1N
+#     depuis le 14/09) ; le seed dbt n'est plus que le filet anti-wipe.
+#   - Dérive calendrier (14/09) : re-PATCH si le min publié < plancher, mail si récidive.
 #   - BEYOND_SHADOW_MODE=true pour un dry-run (log "would PATCH" sans écrire).
+#   - ⚠ task-timeout 600 (pas 300 comme les autres jobs) : le job fait 1 GET + parfois
+#     1 PATCH par listing, avec 0,5 s de politesse après CHAQUE appel. À 31 whitelistés
+#     les runs tenaient en 133-171 s ; le passage à 100 % du parc en 1N (14/09) porte les
+#     fenêtres 1N de 63 à 268 sur 105 apparts, soit ~85 listings de plus qui passent de
+#     « GET seul » à « GET + PATCH » → ~+70 s. 300 s ne laissait plus que 20 % de marge,
+#     et un timeout = run partiel + 2 retries sur un job qui écrit chez un tiers.
 gcloud run jobs deploy merveil-action-engine-beyond \
   --image $IMAGE \
   --region $REGION \
-  --memory 512Mi --cpu 1 --task-timeout 300 --max-retries 2 \
+  --memory 512Mi --cpu 1 --task-timeout 600 --max-retries 2 \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest,BEYOND_PAT=beyond-pat-dwh:latest \
   --service-account $SA \
   --project $PROJECT \

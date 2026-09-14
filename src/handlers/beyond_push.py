@@ -25,8 +25,26 @@ Déclaratif : l'état VOULU vit dans dashboard_ventes.dash_beyond_push_targets
      exacte avec l'orpheline du jour (400, incident ROY15-6D 11/08)
   3. Diff état voulu vs nos fenêtres actuelles → PATCH la liste complète
      (règles équipe + fenêtres voulues) SEULEMENT si écart. Le support a
-     confirmé qu'un envoi suffit (l'algo ne ré-écrase pas) → jamais de re-push
-     de maintien.
+     confirmé qu'un envoi suffit (l'algo ne ré-écrase pas) → pas de re-push
+     de maintien aveugle.
+  3b. DÉRIVE CALENDRIER (14/09) : la liste de règles n'est pas la vérité — ce
+     qui protège la nuit, c'est le `min_price_user` que Beyond publie dans son
+     calendrier. Pour chaque fenêtre voulue poussée AVANT le dernier snapshot,
+     si une nuit publie un min SOUS le nôtre → re-PATCH forcé (context
+     `drift …`) ; si elle dérive ENCORE après un re-PATCH → erreur mail
+     « plancher non appliqué par Beyond », à porter à Arnaud. Règle Hatim
+     14/09 : « impérativement ne pas vendre sous coussin » — un plancher qu'on
+     croit posé et qui ne l'est pas est le pire des cas, parce qu'aucune
+     alerte ne sonne.
+     ⚠ Le « 2-4 % de pushes jamais appliqués » mesuré le 14/09 au matin était
+     un ARTEFACT, réfuté l'après-midi (ABO52-2D 29/09 + 07/10 : poussés
+     20h46, résa 61995 annulée 21h25, retirés par NOTRE run de 06h46 — la
+     fenêtre a vécu 10 h entre deux snapshots de 7 h ; ALF6-4F 10/09 : même
+     schéma). Sur toutes les fenêtres vivantes depuis le 20/08 observées par
+     un snapshot postérieur au push : 0 nuit sous plancher. Le détecteur ne
+     regarde donc que le CYCLE DE VIE COURANT d'une fenêtre (pushes postérieurs
+     au dernier `remove`), sinon un gap qui se rouvre hérite d'un vieux `add`
+     et sonne à tort.
   4. Log chaque action dans beyond_raw.price_pushes_log (append-only).
 
 Le déclaratif nettoie tout seul : gap comblé → fenêtre absente de l'état voulu
@@ -95,6 +113,10 @@ WHITELIST_TABLE = os.environ.get(
     "BEYOND_WHITELIST_TABLE", "merveil-data-warehouse.staging.stg_inputs__beyond_push_whitelist")
 LOG_TABLE = os.environ.get(
     "BEYOND_LOG_TABLE", "merveil-data-warehouse.beyond_raw.price_pushes_log")
+# Calendrier Beyond (snapshot quotidien 7h, ETL beyond-etl-daily) : la seule
+# preuve qu'un plancher est réellement appliqué (cf. étape 3b du docstring).
+PRICES_TABLE = os.environ.get(
+    "BEYOND_PRICES_TABLE", "merveil-data-warehouse.beyond_raw.raw_beyond_prices")
 
 BEYOND_BASE_URL = os.environ.get("BEYOND_BASE_URL", "https://developers.beyondpricing.com")
 BEYOND_PAT = (os.environ.get("BEYOND_PAT") or "").strip()
@@ -219,6 +241,81 @@ def _load_owned() -> tuple[dict[int, set[tuple]], dict[int, str]]:
     return owned, apt_by_listing
 
 
+def _load_calendar_drift() -> dict[int, dict[tuple, dict]]:
+    """Fenêtres voulues dont le calendrier Beyond publie, au dernier snapshot, un
+    `min_price_user` SOUS notre min sur au moins une nuit vendable — alors que
+    la fenêtre a été poussée AVANT le jour de ce snapshot (sinon c'est juste le
+    délai normal de propagation, cf. dash_beyond_pushes / price_posted).
+
+    {listing_id: {(start, end): {"night", "min_user", "repatched"}}}
+    `repatched` = un re-PATCH `drift` a déjà été loggé sur cette fenêtre → si
+    elle dérive encore, ce n'est plus un accident de propagation."""
+    rows = _bq().query(f"""
+        WITH snap AS (
+            SELECT MAX(snapshot_date) AS d FROM `{PRICES_TABLE}`
+        ),
+        voulu AS (
+            SELECT beyond_listing_id AS listing_id, window_start AS s, window_end AS e,
+                   min_price
+            FROM `{TARGETS_TABLE}`
+            WHERE window_end >= CURRENT_DATE('Europe/Paris')
+        ),
+        -- Cycle de vie COURANT seulement : un `remove` clôt le cycle, tout ce
+        -- qui le précède est inerte (ABO52-2D 29/09 : add 11/09 20h46, remove
+        -- 12/09 06h46 — sans cette borne, le gap qui se rouvre plus tard
+        -- hériterait du vieux push et passerait pour une dérive Beyond).
+        actes AS (
+            SELECT listing_id, start_date, end_date, action, pushed_at,
+                   COALESCE(context, '') LIKE 'drift%' AS is_drift,
+                   MAX(IF(action = 'remove', pushed_at, NULL)) OVER (
+                       PARTITION BY listing_id, start_date, end_date) AS dernier_remove
+            FROM `{LOG_TABLE}`
+            WHERE status = 'ok' AND action IN ('add', 'update', 'remove')
+        ),
+        dernier_push AS (
+            SELECT listing_id, start_date, end_date,
+                   MAX(pushed_at) AS pushed_at,
+                   LOGICAL_OR(is_drift) AS repatched
+            FROM actes
+            WHERE action IN ('add', 'update')
+              AND (dernier_remove IS NULL OR pushed_at > dernier_remove)
+            GROUP BY 1, 2, 3
+        ),
+        -- BigQuery refuse une sous-requête dans un prédicat de JOIN → snap
+        -- passe par CROSS JOIN.
+        nuits AS (
+            SELECT v.listing_id, v.s, v.e, v.min_price, p.date AS night,
+                   p.min_price_user, snap.d AS snapshot_date
+            FROM voulu v
+            CROSS JOIN snap
+            JOIN `{PRICES_TABLE}` p
+              ON p.listing_id = v.listing_id
+             AND p.date BETWEEN v.s AND v.e
+            WHERE p.snapshot_date = snap.d
+              AND p.availability = 'available'
+              AND p.min_price_user IS NOT NULL
+        )
+        SELECT n.listing_id, CAST(n.s AS STRING) AS s, CAST(n.e AS STRING) AS e,
+               n.min_price, CAST(MIN(n.night) AS STRING) AS night,
+               MIN(n.min_price_user) AS min_user, ANY_VALUE(d.repatched) AS repatched
+        FROM nuits n
+        JOIN dernier_push d
+          ON d.listing_id = n.listing_id AND d.start_date = n.s AND d.end_date = n.e
+        -- poussée la veille du snapshot au plus tard : Beyond a eu une nuit
+        -- pour l'appliquer
+        WHERE d.pushed_at < TIMESTAMP(n.snapshot_date, 'Europe/Paris')
+        GROUP BY 1, 2, 3, 4
+        HAVING MIN(n.min_price_user) < n.min_price - 0.5
+    """).result()
+    drift: dict[int, dict[tuple, dict]] = {}
+    for r in rows:
+        drift.setdefault(r["listing_id"], {})[(r["s"], r["e"])] = {
+            "night": r["night"], "min_user": float(r["min_user"]),
+            "repatched": bool(r["repatched"]),
+        }
+    return drift
+
+
 def _get_current(listing_id: int) -> tuple[Optional[list[dict]], Optional[str]]:
     """Liste seasonal-prices actuelle du listing (dasherized, telle que l'API la rend)."""
     resp = _beyond("GET", f"/api/v1/listings/{listing_id}/customizations/min-max-prices/")
@@ -253,8 +350,10 @@ def _log_rows(rows: list[dict]) -> None:
 
 def _reconcile_listing(listing_id: int, apartment_code: str,
                        desired: dict[tuple, dict], owned_keys: set[tuple],
-                       run_id: str) -> tuple[list[dict], list[str]]:
-    """Retourne (log_rows, erreurs). PATCH seulement si diff."""
+                       run_id: str, drift: Optional[dict[tuple, dict]] = None
+                       ) -> tuple[list[dict], list[str]]:
+    """Retourne (log_rows, erreurs). PATCH si diff — ou si le calendrier dérive."""
+    drift = drift or {}
     now = datetime.now(timezone.utc).isoformat()
     logs: list[dict] = []
     errs: list[str] = []
@@ -361,6 +460,26 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
         float(ours_current[k].get("min-price") or 0) != final_desired[k]["min"]
         or _max_of(ours_current[k]) != final_desired[k]["max"])]
 
+    # Dérive calendrier (étape 3b) : la règle est là, le calendrier dit autre
+    # chose → re-PATCH forcé. Clé effective comme pour `ours_current` (Beyond
+    # tronque le start au jour courant).
+    drift_ctx: dict[tuple, str] = {}
+    for (s, e), d in drift.items():
+        k = (max(s, today), e)
+        if k not in final_desired:
+            continue
+        ctx = (f"drift calendrier {d['night']}: min_user={d['min_user']:.0f} "
+               f"< plancher {final_desired[k]['min']:.0f}")
+        drift_ctx[k] = ctx
+        if k in ours_current and k not in to_update:
+            to_update.append(k)
+        if d["repatched"]:
+            errs.append({"where": f"{apartment_code} {k[0]}",
+                         "what": f"plancher {final_desired[k]['min']:.0f} € NON APPLIQUÉ par "
+                                 f"Beyond malgré un re-PATCH (calendrier : min "
+                                 f"{d['min_user']:.0f} € le {d['night']}) — la nuit peut se "
+                                 f"vendre sous coussin, à voir avec Arnaud"})
+
     if not to_add and not to_remove and not to_update:
         logger.info(f"✓ {apartment_code} ({listing_id}) : {len(final_desired)} fenêtre(s), aucun écart")
         return logs, errs
@@ -377,7 +496,8 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
                     f"(équipe préservée: {len(team_rules)})")
         for k in to_add + to_update:
             v = final_desired[k]
-            log("add" if k in to_add else "update", "shadow", k[0], k[1], v["min"], v["max"])
+            log("add" if k in to_add else "update", "shadow", k[0], k[1], v["min"], v["max"],
+                ctx=drift_ctx.get(k))
         for k in to_remove:
             log("remove", "shadow", k[0], k[1])
         return logs, errs
@@ -396,11 +516,11 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
     for k in to_add:
         v = final_desired[k]
         log("add", "ok" if ok else "error", k[0], k[1], v["min"], v["max"],
-            resp.status_code, None if ok else resp.text[:300])
+            resp.status_code, None if ok else resp.text[:300], ctx=drift_ctx.get(k))
     for k in to_update:
         v = final_desired[k]
         log("update", "ok" if ok else "error", k[0], k[1], v["min"], v["max"],
-            resp.status_code, None if ok else resp.text[:300])
+            resp.status_code, None if ok else resp.text[:300], ctx=drift_ctx.get(k))
     for k in to_remove:
         log("remove", "ok" if ok else "error", k[0], k[1],
             http=resp.status_code, error=None if ok else resp.text[:300])
@@ -408,7 +528,8 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
     if ok:
         logger.info(f"🚀 {apartment_code} ({listing_id}) : PATCH ok — "
                     f"+{len(to_add)} ~{len(to_update)} -{len(to_remove)} "
-                    f"(équipe préservée: {len(team_rules)})")
+                    f"(équipe préservée: {len(team_rules)}"
+                    f"{f', dérive calendrier: {len(drift_ctx)}' if drift_ctx else ''})")
     return logs, errs
 
 
@@ -440,6 +561,7 @@ def _run_inner() -> None:
     whitelist = _load_whitelist()
     targets = _load_targets()
     owned, owned_apt = _load_owned()
+    drift = _load_calendar_drift()
 
     # Listings à visiter = whitelist ∪ listings avec cible ∪ listings possédant
     # encore une fenêtre. Depuis le 06/08 les nuits orphelines couvrent le PARC
@@ -455,14 +577,16 @@ def _run_inner() -> None:
     logger.info("=" * 70)
     logger.info(f"🚀 Beyond gap push (shadow={SHADOW_MODE}, "
                 f"{len(whitelist)} whitelistés, {len(visit)} listings visités, "
-                f"{sum(len(v) for v in targets.values())} fenêtres voulues)")
+                f"{sum(len(v) for v in targets.values())} fenêtres voulues, "
+                f"{sum(len(v) for v in drift.values())} en dérive calendrier)")
     logger.info("=" * 70)
 
     all_logs: list[dict] = []
     all_errs: list[str] = []
     for lid, apt in sorted(visit.items()):
         logs, errs = _reconcile_listing(
-            lid, apt, targets.get(lid, {}), owned.get(lid, set()), run_id)
+            lid, apt, targets.get(lid, {}), owned.get(lid, set()), run_id,
+            drift.get(lid))
         all_logs.extend(logs)
         all_errs.extend(errs)
 
@@ -476,7 +600,8 @@ def _run_inner() -> None:
         "action": "check", "status": "ok", "http_status": None, "error": None,
         "context": f"{len(whitelist)} listings · "
                    f"{sum(len(v) for v in targets.values())} fenêtres voulues · "
-                   f"{len(all_logs)} action(s) · {len(all_errs)} erreur(s)",
+                   f"{len(all_logs)} action(s) · {len(all_errs)} erreur(s) · "
+                   f"{sum(len(v) for v in drift.values())} dérive(s) calendrier",
     })
 
     _log_rows(all_logs)
