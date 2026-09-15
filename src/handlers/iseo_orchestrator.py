@@ -2430,13 +2430,51 @@ def _run_inner() -> None:
             # Avant, `continue` sur `not members` sautait cette libération, et 6.1 affichait
             # « retenu · paiement refusé » jusqu'au pré-checkin — ou jusqu'au check-out.
             if was_held:
-                still = _evaluate_hold(row) if ISEO_HOLD_MODE == "on" else None
-                if still:
+                ci = row.get("checkin_date")
+                co = row.get("checkout_date")
+                today = datetime.now(ZoneInfo("Europe/Paris")).date()
+
+                # ⛔⛔ « Plus aucun critère » et « plus aucune DONNÉE » se ressemblaient,
+                # et c'est ce qui rendait l'auto-libération fausse (mesuré 15/09). Le
+                # LEFT JOIN sur `stays` ne rend plus rien dès que le séjour est terminé
+                # → tous les signaux de la porte arrivent à NULL → `_evaluate_hold` ne
+                # peut répondre que « rien ne tient ». Résultat : les 4 libérations
+                # `auto:criteres_leves` de l'historique sont toutes tombées à 00h02 le
+                # LENDEMAIN du check-out, sur des motifs qui ne peuvent structurellement
+                # pas se lever (« réservé le jour de l'arrivée »), et deux d'entre elles
+                # ont poussé le code à un client déjà reparti (62009, 61635). Sans
+                # `stays`, on ne mesure rien : on ne libère pas.
+                if ci is None:
                     continue
-                _mark_released(key, "auto:criteres_leves")
-                _log_hold_decision(row, row["cache_hold"], "auto_release", "released")
-                logger.info(f"🔓 {key} ({row.get('apartment_code')}) — critères levés "
-                            f"(était : {row['cache_hold']}) → libéré")
+
+                # Séjour terminé : il n'y a plus rien à livrer, `_archive` fait le ménage.
+                if co is not None and co <= today:
+                    continue
+
+                if ci <= today:
+                    # ⭐ SÉJOUR COMMENCÉ = validation de fait (règle Hatim 15/09). Le
+                    # client est DANS l'appartement : la RC l'a forcément laissé entrer,
+                    # en lui dictant le code fixe au téléphone — sans passer par
+                    # [Livrer le code], qui n'a servi qu'une fois depuis sa mise en
+                    # place. La porte retient alors un code pour quelqu'un qui est déjà
+                    # dedans : elle ne protège plus rien et 6.1 affiche « retenu » pour
+                    # le reste du séjour. Même raisonnement que le mail de rétention,
+                    # qui ne part déjà plus sur un séjour commencé.
+                    # ⚠ Ne vaut QUE pendant le séjour (borne haute juste au-dessus) : le
+                    # geste qui coupe un accès déjà sorti est « Révoquer », pas la porte.
+                    _mark_released(key, "auto:sejour_commence")
+                    _log_hold_decision(row, row["cache_hold"], "auto_release",
+                                       "released: séjour commencé")
+                    logger.info(f"🔓 {key} ({row.get('apartment_code')}) — séjour commencé "
+                                f"le {ci} (était retenu : {row['cache_hold']}) → libéré")
+                else:
+                    still = _evaluate_hold(row) if ISEO_HOLD_MODE == "on" else None
+                    if still:
+                        continue
+                    _mark_released(key, "auto:criteres_leves")
+                    _log_hold_decision(row, row["cache_hold"], "auto_release", "released")
+                    logger.info(f"🔓 {key} ({row.get('apartment_code')}) — critères levés "
+                                f"(était : {row['cache_hold']}) → libéré")
 
             if not members:
                 if key.startswith("M"):
