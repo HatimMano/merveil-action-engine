@@ -45,7 +45,7 @@ import logging
 import os
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -2432,7 +2432,8 @@ def _run_inner() -> None:
             if was_held:
                 ci = row.get("checkin_date")
                 co = row.get("checkout_date")
-                today = datetime.now(ZoneInfo("Europe/Paris")).date()
+                now_paris = datetime.now(PARIS_TZ)
+                today = now_paris.date()
 
                 # ⛔⛔ « Plus aucun critère » et « plus aucune DONNÉE » se ressemblaient,
                 # et c'est ce qui rendait l'auto-libération fausse (mesuré 15/09). Le
@@ -2451,17 +2452,29 @@ def _run_inner() -> None:
                 if co is not None and co <= today:
                     continue
 
-                if ci <= today:
-                    # ⭐ SÉJOUR COMMENCÉ = validation de fait (règle Hatim 15/09). Le
-                    # client est DANS l'appartement : la RC l'a forcément laissé entrer,
-                    # en lui dictant le code fixe au téléphone — sans passer par
-                    # [Livrer le code], qui n'a servi qu'une fois depuis sa mise en
-                    # place. La porte retient alors un code pour quelqu'un qui est déjà
-                    # dedans : elle ne protège plus rien et 6.1 affiche « retenu » pour
-                    # le reste du séjour. Même raisonnement que le mail de rétention,
-                    # qui ne part déjà plus sur un séjour commencé.
-                    # ⚠ Ne vaut QUE pendant le séjour (borne haute juste au-dessus) : le
-                    # geste qui coupe un accès déjà sorti est « Révoquer », pas la porte.
+                # ⭐ SÉJOUR COMMENCÉ = validation de fait (règle Hatim 15/09). Le
+                # client est DANS l'appartement : la RC l'a forcément laissé entrer,
+                # en lui dictant le code fixe au téléphone — sans passer par
+                # [Livrer le code], qui n'a servi qu'une fois depuis sa mise en
+                # place. La porte retient alors un code pour quelqu'un qui est déjà
+                # dedans : elle ne protège plus rien et 6.1 affiche « retenu » pour
+                # le reste du séjour. Même raisonnement que le mail de rétention,
+                # qui ne part déjà plus sur un séjour commencé.
+                # ⚠ Ne vaut QUE pendant le séjour (borne haute juste au-dessus) : le
+                # geste qui coupe un accès déjà sorti est « Révoquer », pas la porte.
+                # ⛔⛔ SEUIL = LENDEMAIN DU CHECK-IN À 9 H, pas « ci <= today »
+                # (16/09, après le test Emilia 62395). Une résa réservée LE JOUR de
+                # l'arrivée — le profil exact que les critères visent — naît avec
+                # `ci == today` : `_provision` la retenait à 18:21:33 et CE MÊME RUN la
+                # libérait 24 s plus tard ici (`_resa_duve_retry` relit le cache que
+                # `_provision` vient d'écrire), code poussé à 18:21:59. La porte ne
+                # mordait donc JAMAIS sur le last-minute. « Le client est dedans » n'est
+                # un fait qu'une fois la nuit passée : le jour J, personne n'a encore pu
+                # le constater, et c'est précisément le moment où la porte doit tenir.
+                seuil_sejour_commence = datetime.combine(
+                    ci + timedelta(days=1), dtime(9, 0), tzinfo=PARIS_TZ)
+
+                if now_paris >= seuil_sejour_commence:
                     _mark_released(key, "auto:sejour_commence")
                     _log_hold_decision(row, row["cache_hold"], "auto_release",
                                        "released: séjour commencé")
