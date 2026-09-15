@@ -32,10 +32,15 @@ Déclaratif : l'état VOULU vit dans dashboard_ventes.dash_beyond_push_targets
      règle équipe large sur une de nos nuits = 400 GLOBAL, donc zéro plancher
      poussé sur le listing — DAL40-1D a tenu 3 runs ainsi avec sa nuit du
      23/09 laissée au plancher équipe 290 € au lieu de 441 €. On DÉCOUPE donc
-     la règle équipe autour de nos fenêtres (`_carve_rule`) et on la RECOLLE
-     quand la fenêtre s'en va (`_coalesce_team_rules`, sans quoi le découpage
-     laisserait un trou définitif). Une règle rollover n'étant pas découpable,
-     c'est NOTRE fenêtre qu'on abandonne — jamais le listing entier.
+     la règle équipe DATÉE autour de nos fenêtres (`_carve_rule`) et on la
+     RECOLLE quand la fenêtre s'en va (`_coalesce_team_rules`, sans quoi le
+     découpage laisserait un trou définitif).
+     ⛔ Les règles ROLLOVER traversent INTACTES : le chevauchement interdit est
+     celui de deux règles datées, une saisonnière annuelle coexiste avec nos
+     fenêtres. Une 1re version renonçait à notre fenêtre dès qu'une rollover la
+     couvrait et a RETIRÉ 244 planchers en un run (presque tout le parc porte
+     une saisonnière équipe annuelle). Sur ce job, écarter une fenêtre n'est
+     jamais neutre : le déclaratif la supprime de Beyond.
   3b. DÉRIVE CALENDRIER (14/09) : la liste de règles n'est pas la vérité — ce
      qui protège la nuit, c'est le `min_price_user` que Beyond publie dans son
      calendrier. Pour chaque fenêtre voulue poussée AVANT le dernier snapshot,
@@ -512,27 +517,18 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
     # (Après le garde-fou bornes : une fenêtre écartée ne doit pas amputer la
     # règle équipe.)
     #
-    # ⚠ Une règle ROLLOVER ne peut PAS être découpée : elle se répète chaque
-    # année et un fragment daté lui ferait perdre sa récurrence. On renonce
-    # alors à NOTRE fenêtre — la nuit reste couverte par le plancher équipe
-    # (relevé dans notre min, donc au moins aussi haut), et surtout le reste du
-    # listing part quand même au lieu de tomber avec un 400.
-    # Deux passes, dans cet ordre : un abandon rollover doit être décidé AVANT
-    # qu'une règle datée ne se découpe autour d'une fenêtre qui va disparaître.
-    for rule in team_rules:
-        if not rule.get("rollover"):
-            continue
-        for k in [k for k in final_desired if _overlaps(k[0], k[1], rule)]:
-            v = final_desired[k]
-            errs.append({"where": f"{apartment_code} {k[0]}",
-                         "what": f"règle équipe rollover {rule['start-date']}→"
-                                 f"{rule['end-date']} chevauchante — fenêtre non "
-                                 f"poussée (plancher équipe "
-                                 f"{rule.get('min-price')} € conservé)"})
-            log("skip", "error", k[0], k[1], v["min"], v["max"],
-                error="règle équipe rollover chevauchante")
-            del final_desired[k]
-
+    # ⛔⛔ NE JAMAIS TOUCHER À UNE RÈGLE ROLLOVER, ni la découper, ni renoncer à
+    # notre fenêtre à cause d'elle. Le chevauchement qu'interdit Beyond est
+    # celui de deux règles DATÉES ; une saisonnière annuelle coexiste avec nos
+    # fenêtres datées — mesuré le 14/09 (la yearly 190 € ne prime pas : nos
+    # nuits du 24/09 et du 16/10 publient bien 441 € dans sa plage) et
+    # re-mesuré à la dure le 15/09. Une 1re version renonçait à notre fenêtre
+    # dès qu'une rollover la couvrait : comme presque tout le parc porte une
+    # saisonnière équipe annuelle (ex. 01/09→31/10 @ 330), le run a skippé
+    # **245 fenêtres et RETIRÉ 244 planchers** de Beyond en une passe — le
+    # déclaratif voit une fenêtre absente de l'état voulu et la supprime.
+    # Leçon : sur ce job, écarter une fenêtre n'est jamais neutre, ça la
+    # DÉPROTÈGE. Les rollover traversent donc intactes, comme avant le 15/09.
     carved: list[dict] = []
     for rule in team_rules:
         if rule.get("rollover"):

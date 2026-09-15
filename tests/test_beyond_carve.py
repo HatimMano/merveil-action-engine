@@ -124,40 +124,64 @@ def test_egalite_exacte_inchangee():
 
 
 @case
-def test_rollover_chevauchant_abandonne_notre_fenetre():
-    """Non découpable → on renonce à la fenêtre, le listing part quand même."""
+def test_rollover_traverse_intacte_et_ne_bloque_aucune_fenetre():
+    """⛔ Le cas qui a coûté 244 planchers le 15/09.
+
+    Presque tout le parc porte une saisonnière équipe ANNUELLE (ex. 01/09→31/10
+    @ 330). Une version du découpage renonçait à notre fenêtre dès qu'une
+    rollover la couvrait : le déclaratif a vu 245 fenêtres absentes de l'état
+    voulu et les a RETIRÉES de Beyond. Or Beyond accepte une datée dans la
+    plage d'une rollover (mesuré le 14/09 : la yearly 190 € ne prime pas, nos
+    nuits publient bien 441 €). Les rollover traversent donc intactes, et ne
+    font jamais disparaître une fenêtre.
+    """
     sent, logs, errs = _run(
         [_rule("2026-01-01", "2026-12-31", 190.0, rollover=True),
          _rule("2026-09-15", "2026-10-31", 290.0)],
         {("2026-09-23", "2026-09-23"): {"min": 441.0, "max": None},
          ("2026-09-25", "2026-09-25"): {"min": 400.0, "max": None}})
-    assert len(errs) == 2, errs
-    assert all("rollover" in e["what"] for e in errs), errs
-    assert [l["action"] for l in logs if l["status"] == "error"] == ["skip", "skip"]
-    # aucune fenêtre ne survit → aucun diff → aucun PATCH (les règles équipe
-    # restent intactes chez Beyond, on ne touche à rien pour rien)
-    assert sent is None, _keys(sent)
+    assert not errs, errs
+    assert not [l for l in logs if l["status"] == "error"], logs
+    assert _keys(sent) == [
+        ("2026-01-01", "2026-12-31", 190.0),      # rollover, intacte
+        ("2026-09-15", "2026-09-22", 290.0),
+        ("2026-09-23", "2026-09-23", 441.0),
+        ("2026-09-24", "2026-09-24", 290.0),
+        ("2026-09-25", "2026-09-25", 400.0),
+        ("2026-09-26", "2026-10-31", 290.0),
+    ], _keys(sent)
 
 
 @case
-def test_rollover_partiel_le_reste_du_listing_part_quand_meme():
-    """Une fenêtre sous rollover est abandonnée, l'autre est poussée normalement.
-
-    Vérifie l'ordre des deux passes : la règle datée ne doit PAS se découper
-    autour de la fenêtre abandonnée (elle laisserait un trou sans raison).
-    """
+def test_rollover_seule_aucune_regle_datee_a_decouper():
+    """Le cas le plus fréquent du parc : une rollover, et rien d'autre."""
     sent, _, errs = _run(
-        [_rule("2026-09-20", "2026-09-24", 190.0, rollover=True),
-         _rule("2026-09-15", "2026-10-31", 290.0)],
-        {("2026-09-23", "2026-09-23"): {"min": 441.0, "max": None},
-         ("2026-09-28", "2026-09-28"): {"min": 400.0, "max": None}})
-    assert len(errs) == 1 and "2026-09-23" in errs[0]["where"], errs
+        [_rule("2026-09-01", "2026-10-31", 330.0, rollover=True)],
+        {("2026-09-23", "2026-09-23"): {"min": 441.0, "max": None}})
+    assert not errs, errs
     assert _keys(sent) == [
-        ("2026-09-15", "2026-09-27", 290.0),
-        ("2026-09-20", "2026-09-24", 190.0),
-        ("2026-09-28", "2026-09-28", 400.0),
-        ("2026-09-29", "2026-10-31", 290.0),
+        ("2026-09-01", "2026-10-31", 330.0),
+        ("2026-09-23", "2026-09-23", 441.0),
     ], _keys(sent)
+
+
+@case
+def test_aucune_fenetre_n_est_jamais_ecartee_en_silence():
+    """Garde-fou transverse : sur ce job, écarter une fenêtre la DÉPROTÈGE.
+
+    Toute fenêtre voulue doit finir soit dans le PATCH, soit dans une erreur
+    explicite — jamais évaporée.
+    """
+    desired = {("2026-09-23", "2026-09-23"): {"min": 441.0, "max": None},
+               ("2026-09-28", "2026-09-28"): {"min": 400.0, "max": None}}
+    sent, logs, errs = _run(
+        [_rule("2026-09-01", "2026-10-31", 330.0, rollover=True),
+         _rule("2026-09-15", "2026-10-31", 290.0)],
+        dict(desired))
+    poussees = {(s, e) for s, e, _ in _keys(sent)}
+    signalees = {(l["start_date"], l["end_date"]) for l in logs if l["status"] == "error"}
+    for k in desired:
+        assert k in poussees or k in signalees, (k, _keys(sent), errs)
 
 
 @case
