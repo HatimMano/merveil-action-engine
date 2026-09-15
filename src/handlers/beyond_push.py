@@ -27,6 +27,15 @@ Déclaratif : l'état VOULU vit dans dashboard_ventes.dash_beyond_push_targets
      (règles équipe + fenêtres voulues) SEULEMENT si écart. Le support a
      confirmé qu'un envoi suffit (l'algo ne ré-écrase pas) → pas de re-push
      de maintien aveugle.
+     ⚠ Beyond refuse deux plages qui SE RECOUVRENT, pas seulement deux plages
+     identiques (le code ne gérait que l'égalité exacte jusqu'au 15/09). Une
+     règle équipe large sur une de nos nuits = 400 GLOBAL, donc zéro plancher
+     poussé sur le listing — DAL40-1D a tenu 3 runs ainsi avec sa nuit du
+     23/09 laissée au plancher équipe 290 € au lieu de 441 €. On DÉCOUPE donc
+     la règle équipe autour de nos fenêtres (`_carve_rule`) et on la RECOLLE
+     quand la fenêtre s'en va (`_coalesce_team_rules`, sans quoi le découpage
+     laisserait un trou définitif). Une règle rollover n'étant pas découpable,
+     c'est NOTRE fenêtre qu'on abandonne — jamais le listing entier.
   3b. DÉRIVE CALENDRIER (14/09) : la liste de règles n'est pas la vérité — ce
      qui protège la nuit, c'est le `min_price_user` que Beyond publie dans son
      calendrier. Pour chaque fenêtre voulue poussée AVANT le dernier snapshot,
@@ -90,7 +99,7 @@ Paris, après le run dbt de 10:15 → targets frais).
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -339,6 +348,71 @@ def _overlaps(start: str, end: str, rule: dict) -> bool:
     return not (end < rule["start-date"] or start > rule["end-date"])
 
 
+def _day_shift(d: str, n: int) -> str:
+    return (date.fromisoformat(d) + timedelta(days=n)).isoformat()
+
+
+def _carve_rule(rule: dict, windows: list[tuple]) -> list[dict]:
+    """Découpe une règle équipe DATÉE autour des fenêtres voulues qu'elle couvre.
+
+    Beyond rejette deux plages qui **se recouvrent**, pas seulement deux plages
+    identiques. Une règle équipe large et une de nos fenêtres dans le même PATCH
+    = 400 global, donc AUCUNE protection plancher poussée sur le listing
+    (`P02-DAL40-1D` 14-15/09 : règle 15/09→31/10 @ 290 € contre notre nuit du
+    23/09 @ 441 €, trois runs perdus). On rend donc à Beyond la règle équipe
+    amputée des seules nuits qu'on protège nous-mêmes : partout ailleurs son
+    plancher est inchangé, et sur nos nuits le min-bump a déjà relevé notre min
+    au sien — aucune nuit n'est dé-protégée.
+    """
+    frags = [rule]
+    for ws, we in sorted(windows):
+        out = []
+        for f in frags:
+            if f["end-date"] < ws or f["start-date"] > we:
+                out.append(f)
+                continue
+            if f["start-date"] < ws:
+                out.append({**f, "end-date": _day_shift(ws, -1)})
+            if f["end-date"] > we:
+                out.append({**f, "start-date": _day_shift(we, 1)})
+        frags = out
+    return frags
+
+
+def _coalesce_team_rules(rules: list[dict], windows: list[tuple]) -> list[dict]:
+    """Recolle les fragments qu'un découpage d'un run précédent a laissés.
+
+    ⚠️ Sans ça le découpage serait une PERTE nette de plancher équipe : le trou
+    creusé pour notre fenêtre resterait ouvert après son retrait (gap comblé →
+    fenêtre retirée au run suivant → la nuit retomberait sur le `min-price` de
+    listing, 190 € au lieu des 290 € que l'équipe couvrait avant nous). Le
+    déclaratif doit rendre l'état d'origine, pas un fromage.
+
+    On ne recolle que deux fragments datés de MÊME prix dont l'intervalle ne
+    porte plus aucune fenêtre voulue — donc jamais par-dessus une nuit qu'on
+    protège. Seul faux positif possible : une équipe qui aurait délibérément
+    laissé un trou entre deux règles au même prix ; on le refermerait. Le sens
+    est conservateur (une nuit gagne un plancher, jamais l'inverse).
+    """
+    datees = sorted([r for r in rules if not r.get("rollover")],
+                    key=lambda r: (r["start-date"], r["end-date"]))
+    out: list[dict] = []
+    for r in datees:
+        prev = out[-1] if out else None
+        if (prev
+                and prev["end-date"] < r["start-date"]
+                and prev.get("min-price") == r.get("min-price")
+                and prev.get("max-price") == r.get("max-price")):
+            gs, ge = _day_shift(prev["end-date"], 1), _day_shift(r["start-date"], -1)
+            libre = gs > ge or not any(
+                not (we < gs or ws > ge) for ws, we in windows)
+            if libre:
+                out[-1] = {**prev, "end-date": max(prev["end-date"], r["end-date"])}
+                continue
+        out.append(r)
+    return out + [r for r in rules if r.get("rollover")]
+
+
 def _log_rows(rows: list[dict]) -> None:
     if rows:
         errors = _bq().insert_rows_json(LOG_TABLE.replace("`", ""), rows)
@@ -428,14 +502,45 @@ def _reconcile_listing(listing_id: int, apartment_code: str,
                 error=f"hors bornes [{PRICE_FLOOR}, {PRICE_CEILING}]")
             del final_desired[k]
 
-    # Beyond rejette deux plages identiques dans une même liste : une règle
-    # équipe posée EXACTEMENT sur une fenêtre voulue serait dupliquée dans le
-    # PATCH (400 global → aucune protection poussée sur le listing). On
-    # l'absorbe : la boucle min-bump ci-dessus a déjà relevé notre min au sien,
-    # la retirer de la liste ne baisse aucun plancher. (Après le garde-fou
-    # bornes : une fenêtre voulue écartée ne doit pas emporter la règle équipe.)
-    team_rules = [r for r in team_rules
-                  if (r["start-date"], r["end-date"]) not in final_desired]
+    # Beyond rejette deux plages qui SE RECOUVRENT dans une même liste — pas
+    # seulement deux plages identiques, ce que la V1 de ce bloc croyait. Une
+    # règle équipe large posée sur une de nos fenêtres partait donc en 400
+    # GLOBAL : zéro protection plancher sur tout le listing, et le journal
+    # n'enregistrait que l'erreur (DAL40-1D, 3 runs des 14-15/09). On absorbe
+    # le chevauchement PARTIEL comme l'exact — le min-bump ci-dessus a déjà
+    # relevé notre min au plancher équipe, découper ne baisse rien.
+    # (Après le garde-fou bornes : une fenêtre écartée ne doit pas amputer la
+    # règle équipe.)
+    #
+    # ⚠ Une règle ROLLOVER ne peut PAS être découpée : elle se répète chaque
+    # année et un fragment daté lui ferait perdre sa récurrence. On renonce
+    # alors à NOTRE fenêtre — la nuit reste couverte par le plancher équipe
+    # (relevé dans notre min, donc au moins aussi haut), et surtout le reste du
+    # listing part quand même au lieu de tomber avec un 400.
+    # Deux passes, dans cet ordre : un abandon rollover doit être décidé AVANT
+    # qu'une règle datée ne se découpe autour d'une fenêtre qui va disparaître.
+    for rule in team_rules:
+        if not rule.get("rollover"):
+            continue
+        for k in [k for k in final_desired if _overlaps(k[0], k[1], rule)]:
+            v = final_desired[k]
+            errs.append({"where": f"{apartment_code} {k[0]}",
+                         "what": f"règle équipe rollover {rule['start-date']}→"
+                                 f"{rule['end-date']} chevauchante — fenêtre non "
+                                 f"poussée (plancher équipe "
+                                 f"{rule.get('min-price')} € conservé)"})
+            log("skip", "error", k[0], k[1], v["min"], v["max"],
+                error="règle équipe rollover chevauchante")
+            del final_desired[k]
+
+    carved: list[dict] = []
+    for rule in team_rules:
+        if rule.get("rollover"):
+            carved.append(rule)
+            continue
+        hits = [k for k in final_desired if _overlaps(k[0], k[1], rule)]
+        carved.extend(_carve_rule(rule, hits) if hits else [rule])
+    team_rules = _coalesce_team_rules(carved, list(final_desired))
 
     if len(final_desired) > MAX_WINDOWS_PER_LISTING:
         errs.append({"where": apartment_code,
