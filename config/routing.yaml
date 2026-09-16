@@ -94,10 +94,10 @@ digest_buckets:
     flush_with: daily
     send_if_empty: false
     subject_prefix: "[Merveil Beyond]"
+    # ⛔ 16/09 : Raphaël et Mickael retirés (demande Hatim). Le bucket ne part
+    # plus qu'à Hatim — les gaps comblés restent lisibles sur Ventes 1.4.
     default_recipients:
       - hatim@archides.fr
-      - raphael@archides.fr
-      - mickael@archides.fr
 
   chargeback:
     # ⭐ SPLIT du bucket `fraude` le 2026-09-01 (demande Hatim). Les deux buckets
@@ -184,8 +184,8 @@ digest_buckets:
       - emilia@archides.fr
       - hello@merveil.co
       - hatim@archides.fr
-      - mickael@archides.fr
-      - raphael@archides.fr
+      # ⛔ 16/09 : Mickael et Raphaël retirés (demande Hatim). Le bucket reste
+      # RC + direction au sens Emilia / hello@ / Hatim.
       # ⭐ 09/09 (décision Hatim) : OnePilot aussi — ils prennent l'appel du client
       # blacklisté, et depuis la fusion ils reçoivent déjà la rétention « code
       # retenu · blacklist » à J-3 ; sans ce mail-ci ils découvraient le dossier
