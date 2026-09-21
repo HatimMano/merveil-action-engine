@@ -159,6 +159,23 @@ digest_buckets:
       - hello@merveil.co
       - externe-onepilot@merveil.co
 
+  surbooking:
+    # Deux réservations actives sur le même appartement (2026-09-21). Le trigger
+    # `double_booking` était routé vers `daily` — coupé depuis le 07/09 — et n'a
+    # de toute façon JAMAIS sonné avant sa réparation du 21/09 (il cherchait deux
+    # résas toutes deux assignées, or la résa en trop n'a jamais de ressource).
+    # Le geste est RC : réaffecter ou annuler la résa sans appartement AVANT
+    # l'arrivée — Valérie Martin (GOU71-2D) arrivait le lendemain de la
+    # découverte. Un daily aurait porté l'alerte le matin même de l'arrivée.
+    # ⚠ flush_with OBLIGATOIRE (cf. bucket chargeback).
+    # `hello@merveil.co` = boîte partagée RC, comme blacklist/fraude : aucun
+    # code de porte ne transite ici.
+    flush_with: 2h
+    send_if_empty: false
+    subject_prefix: "[Merveil Surbooking]"
+    default_recipients:
+      - hatim@archides.fr
+      - hello@merveil.co
   blacklist:
     # Réservation d'une personne signalée par la RC (2026-08-29).
     # ⚠ Bucket DISTINCT de `fraude` uniquement pour la liste de diffusion :
@@ -383,7 +400,9 @@ triggers:
     enabled: true
     actions:
       - type: email_digest
-        bucket: daily
+        # `daily` est coupé depuis le 07/09 : un CRITICAL y serait bufferisé puis
+        # jeté. Bucket dédié flushé par le job 2h (21/09).
+        bucket: surbooking
 
   checkin_no_apartment:
     enabled: true
