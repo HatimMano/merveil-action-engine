@@ -168,14 +168,16 @@ digest_buckets:
     # l'arrivée — Valérie Martin (GOU71-2D) arrivait le lendemain de la
     # découverte. Un daily aurait porté l'alerte le matin même de l'arrivée.
     # ⚠ flush_with OBLIGATOIRE (cf. bucket chargeback).
-    # `hello@merveil.co` = boîte partagée RC, comme blacklist/fraude : aucun
-    # code de porte ne transite ici.
+    # ⚠ Hatim SEUL pour le moment (demande 21/09) : le trigger vient d'être
+    # réparé et n'a encore jamais envoyé un seul mail — on regarde ce qui sort
+    # avant d'ouvrir à la RC. `hello@merveil.co` (boîte partagée RC, comme
+    # blacklist/fraude) à ajouter ensuite. Aucun code de porte ne transite ici,
+    # donc rien n'empêche cette adresse le moment venu.
     flush_with: 2h
     send_if_empty: false
     subject_prefix: "[Merveil Surbooking]"
     default_recipients:
       - hatim@archides.fr
-      - hello@merveil.co
   blacklist:
     # Réservation d'une personne signalée par la RC (2026-08-29).
     # ⚠ Bucket DISTINCT de `fraude` uniquement pour la liste de diffusion :
