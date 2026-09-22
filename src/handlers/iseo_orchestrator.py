@@ -379,6 +379,16 @@ _LOCKS_CTE = f"""
       LEFT JOIN `{GATEWAYS_TABLE}` g ON g.gateway_id = l.gateway_id
       LEFT JOIN `{GATEWAY_PUSH_HEALTH_TABLE}` ph ON ph.gateway_id = l.gateway_id
       WHERE JSON_VALUE(t, '$.name') != 'ADMIN'
+        -- ⛔⛔ PARC VIVANT SEULEMENT (22/09/2026). Le staging retient le dernier état
+        -- connu par `lock_id` : une serrure supprimée côté Sofia y reste, figée avec sa
+        -- passerelle d'alors. Ce n'est pas théorique — `15872` (MNG118-1D, vue pour la
+        -- dernière fois le 17/07) porte le MÊME tag GUID `9efe7b3b-…` que la serrure
+        -- VIVANTE `17252` du même appartement : sans ce filtre, `locks` rend DEUX lignes
+        -- pour ce `duve_property_id`, la jointure de `_resa_to_provision` se dédouble et
+        -- le provisioning peut viser une serrure morte (donc un code qui n'ouvrira
+        -- jamais, exactement le scénario que `gateway_dead` cherche à empêcher).
+        -- Aucun dégât à ce jour : MNG118-1D n'est pas whitelisté. Il est candidat.
+        AND l.is_present_in_latest_snapshot
     )"""
 
 # Ce que le client doit vs ce qu'il a réellement payé — reconstitué, parce que l'API
