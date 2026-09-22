@@ -114,6 +114,11 @@ echo "🚀 Déploiement du job iseo-orchestrator (pipeline V3 100% DWH — natif
 #     appart intégré avaient un code qui n'ouvrait pas à l'heure payée.
 #     ⚠ ISEO_LATE_CO_HOUR n'est PAS lu dans la donnée : Duve ne transmet pas l'heure
 #     prolongée. 18:00 = la promesse produit (arbitrage Hatim 21/08).
+#   - ⭐ QUOTA LUCKEY (chantier du 22/09/2026, 3 leviers, tous en env) :
+#     ISEO_LOOKAHEAD_DAYS=2 (code créé à J-2, plus J-3 : ≈ 42 éléments rendus en médiane,
+#     mesuré) · ISEO_ARCHIVE_GRACE_HOURS=2 (archivage 2 h après l'heure de check-out
+#     réelle, plus le lendemain 02:00) · ISEO_INVITATION_SKIP_ABOVE=580 (au-dessus,
+#     code clavier seul, pas d'invitation = 1 élément au lieu de 2).
 gcloud run jobs deploy merveil-action-engine-iseo \
   --image $IMAGE \
   --region $REGION \
@@ -121,7 +126,7 @@ gcloud run jobs deploy merveil-action-engine-iseo \
   --set-secrets BREEZEWAY_CLIENT_ID=breezeway-client-id:latest,BREEZEWAY_CLIENT_SECRET=breezeway-client-secret:latest,ISEO_MANAGER_USERNAME=iseo-manager-username:latest,ISEO_MANAGER_PASSWORD=iseo-manager-password:latest,DUVE_CONNECT_TOKEN=duve-connect-token:latest \
   --service-account $SA \
   --project $PROJECT \
-  --set-env-vars "^;^GCP_PROJECT_ID=$PROJECT;FREQ=iseo_orchestrator;ISEO_SHADOW_MODE=false;DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18;GMAIL_SENDER=noreply@archides.fr;ISEO_ALERT_TO=hatim@archides.fr;ISEO_HOLD_MODE=${ISEO_HOLD_MODE:-on};ISEO_HOLD_LEAD_HOURS=${ISEO_HOLD_LEAD_HOURS:-72};ISEO_HOLD_ALERT_TO=${ISEO_HOLD_ALERT_TO:-hello@merveil.co,hatim@archides.fr,externe-onepilot@merveil.co};ISEO_LATE_CO_HOUR=${ISEO_LATE_CO_HOUR:-18:00};ISEO_ALLOWED_PROPERTY_IDS=e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,ed0d0ccd-d5a0-4cbf-9f6f-b1d20103b89f,70edbca0-6abb-4bae-bd89-b16f0079821c,aa37778e-7257-40ad-9b5c-b16f0079821c,3cc98d6e-294c-43df-848b-b16f0079821c,880c9419-8e25-4740-b8c3-b1c200b95203"
+  --set-env-vars "^;^GCP_PROJECT_ID=$PROJECT;FREQ=iseo_orchestrator;ISEO_SHADOW_MODE=false;DUVE_CONNECT_PID=6a357cbd2e45c374a9a9fd18;GMAIL_SENDER=noreply@archides.fr;ISEO_ALERT_TO=hatim@archides.fr;ISEO_HOLD_MODE=${ISEO_HOLD_MODE:-on};ISEO_HOLD_LEAD_HOURS=${ISEO_HOLD_LEAD_HOURS:-72};ISEO_HOLD_ALERT_TO=${ISEO_HOLD_ALERT_TO:-hello@merveil.co,hatim@archides.fr,externe-onepilot@merveil.co};ISEO_LATE_CO_HOUR=${ISEO_LATE_CO_HOUR:-18:00};ISEO_LOOKAHEAD_DAYS=${ISEO_LOOKAHEAD_DAYS:-2};ISEO_ARCHIVE_GRACE_HOURS=${ISEO_ARCHIVE_GRACE_HOURS:-2};ISEO_INVITATION_SKIP_ABOVE=${ISEO_INVITATION_SKIP_ABOVE:-580};ISEO_ALLOWED_PROPERTY_IDS=e8474d43-8f8f-4b87-9e20-b16f0079821c,847cac7d-4030-4c3d-84fa-b1d201078a1f,ed0d0ccd-d5a0-4cbf-9f6f-b1d20103b89f,70edbca0-6abb-4bae-bd89-b16f0079821c,aa37778e-7257-40ad-9b5c-b16f0079821c,3cc98d6e-294c-43df-848b-b16f0079821c,880c9419-8e25-4740-b8c3-b1c200b95203"
 
 echo "🚀 Déploiement du job beyond-push (fenêtres prix gaps 1N, daily 10h45)..."
 # Notes :
@@ -164,4 +169,4 @@ gcloud run jobs deploy confluence-rules-sync \
   --set-env-vars GCP_PROJECT_ID="$PROJECT",GMAIL_SENDER="noreply@archides.fr",CONFLUENCE_ALERT_TO="hatim@archides.fr"
 
 echo ""
-echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-3) + beyond (10h45) + confluence-rules-sync (7h40)"
+echo "✅ Jobs déployés : 4h + daily + 2h (serrures) + cancellations-brief (11h) + iseo (J-2) + beyond (10h45) + confluence-rules-sync (7h40)"

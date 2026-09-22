@@ -5,7 +5,8 @@ Cf. [[project_iseo_integration_2026]] + to_do "MAJ 20/06 — pipeline complet va
 
 Depuis le 20/06 le natif Duve↔Sofia est désactivé dans les 2 sens. Le DWH est
 seul maître du cycle PIN. Pour chaque résa Mews non annulée, payée, dont le CI est
-dans les LOOKAHEAD_DAYS prochains jours (et pas encore provisionnée) :
+dans les LOOKAHEAD_DAYS prochains jours (J-2 depuis le 22/09/2026, et pas encore
+provisionnée) :
 
   A. génère un code PIN 4 chiffres (unique account-wide, retry sur collision)
   B. crée (get-or-create par extId) un user Sofia DÉDIÉ à la résa, au VRAI nom du
@@ -21,8 +22,11 @@ dans les LOOKAHEAD_DAYS prochains jours (et pas encore provisionnée) :
      auto Duve lisent le champ. Lien gated sur la window, OK pendant le séjour.)
   E. INSERT état dans iseo_raw.merveil_pin_cache.
 
-Archive (CO passé OU résa annulée) : DELETE Sofia device + DELETE invitation +
-DELETE le user dédié de la résa (par extId) + flag archived_at.
+Archive (ISEO_ARCHIVE_GRACE_HOURS après l'heure de check-out, OU stay disparu :
+annulation, CO passé) : DELETE Sofia device + DELETE invitation + DELETE le user
+dédié de la résa (par extId) + flag archived_at. Au-dessus de
+ISEO_INVITATION_SKIP_ABOVE éléments Luckey, l'étape C est sautée (code seul,
+`invitation_skipped_at` en cache) — chantier quota du 22/09/2026.
 
 ⚠️ enabled : un user créé via l'API est enabled=False SAUF si on fournit un
 `password` à la création (le schéma create n'a pas de champ `enabled`). Un user
@@ -117,7 +121,16 @@ ALLOWED_PROPERTY_IDS = {
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "noreply@archides.fr")
 ISEO_ALERT_TO = os.getenv("ISEO_ALERT_TO", "hatim@archides.fr")
 
-LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "3"))
+# ⭐ J-2 depuis le 22/09/2026 (J-3 du 13/07 au 22/09, J-7 avant). Levier quota mesuré
+# le 22/09 sur 14 j : lignes de cache actives 158 → 137 en moyenne, pic 198 → 171,
+# delta ponctuel médian 21 (min 11, max 34) — chaque ligne = 1 user + 1 invitation
+# (+ 1 PIN) → ≈ 42 éléments Luckey rendus en médiane. Ce que J-3 faisait gagner :
+# sur 255 séjours provisionnés le jour CI-3 (08→22/09), 0 jamais écrit, 3 écrits
+# APRÈS l'ouverture (déjà ratés), **1 seul** sauvé par le jour de marge (SEN18-2G,
+# CI 10/09, 75 h de latence), 251 indifférents (marge ≥ 24 h). Latence d'écriture
+# médiane 9 min, p99 4 j. ⛔ Mesure à faire sur CI ≥ 08/09 : `lock_written_at`
+# naît le 07/09 08:05 avec 112 lignes horodatées d'un coup (artefact).
+LOOKAHEAD_DAYS = int(os.environ.get("ISEO_LOOKAHEAD_DAYS", "2"))
 
 # ── Porte de validation (hold) ────────────────────────────────────────────────
 # Le code est CRÉÉ côté Sofia (visible au dashboard, révocable) mais N'EST PAS
@@ -199,6 +212,20 @@ ISEO_VERIFY_MAX_PER_RUN = int(os.environ.get("ISEO_VERIFY_MAX_PER_RUN", "200"))
 # intégrés compris) : au-dessus de ce seuil d'éléments utilisés on ne crée plus pour
 # les séjours SANS formulaire (= statu quo pour eux, jamais pire).
 ISEO_QUOTA_MAX_USED_NO_FORM = int(os.environ.get("ISEO_QUOTA_MAX_USED_NO_FORM", "590"))
+# ⭐ Chantier quota B (22/09/2026) : au-dessus de ce nombre d'éléments utilisés, le
+# séjour est provisionné SANS invitation (code clavier seul, pas de lien remote-open)
+# → 1 élément au lieu de 2. L'invitation est le 2ᵉ élément de chaque séjour ; le
+# code, lui, est indispensable. Marqueur `invitation_skipped_at` en cache, sinon
+# `_resa_to_resync` (`iseo_invitation_id IS NULL`) la recréerait au run suivant.
+# Pas de rétro-création quand le wallet redescend : complexité pour un confort.
+ISEO_INVITATION_SKIP_ABOVE = int(os.environ.get("ISEO_INVITATION_SKIP_ABOVE", "580"))
+# ⭐ Chantier quota A (22/09/2026) : archivage `ISEO_ARCHIVE_GRACE_HOURS` après
+# l'heure de check-out (fenêtre réelle du code : politique / late CO acheté), au lieu
+# du lendemain 02:00 Paris (`member_resas` lit `CURRENT_DATE()` en UTC). Le PIN ne
+# fonctionne déjà plus à `dateInterval.to` : on supprime un accès EXPIRÉ, on libère
+# un siège. Mesuré avant : 0 prolongation contiguë créée après l'heure de CO sur
+# 90 j (6 prolongations en tout), 0 ligne archivée puis prolongée sur 767 en 60 j.
+ISEO_ARCHIVE_GRACE_HOURS = float(os.environ.get("ISEO_ARCHIVE_GRACE_HOURS", "2"))
 WALLET_TABLE = os.environ.get(
     "ISEO_WALLET_TABLE", "merveil-data-warehouse.staging.stg_iseo__wallet")
 # Chantier D (07/09) : 3 critères de porte de plus, lus sur les modèles dbt qui
@@ -762,12 +789,50 @@ def _resa_to_archive() -> list[dict]:
       SELECT CONCAT('M', mews_reservation_number) FROM stays
       WHERE mews_reservation_number IS NOT NULL
     )
-    SELECT c.duve_reservation_id, c.iseo_invitation_id, c.shadow_mode
+    SELECT c.duve_reservation_id, c.iseo_invitation_id, c.shadow_mode,
+           'stay_gone' AS reason,
+           CAST(NULL AS DATE) AS stay_ci, CAST(NULL AS DATE) AS stay_co,
+           CAST(NULL AS STRING) AS earliest_checkin_hour, CAST(NULL AS STRING) AS latest_checkout_hour,
+           CAST(NULL AS STRING) AS purchased_early_checkin_hour, FALSE AS has_purchased_late_checkout,
+           CAST(NULL AS STRING) AS apartment_code
     FROM `{PIN_CACHE_TABLE}` c
     LEFT JOIN stay_members sm ON sm.duve_reservation_id = c.duve_reservation_id
     WHERE c.archived_at IS NULL AND sm.duve_reservation_id IS NULL
+    UNION ALL
+    -- ⭐ Chantier quota A (22/09) : le stay est encore « vivant » pour `member_resas`
+    -- (CO ≥ today UTC) mais son check-out est AUJOURD'HUI (Paris) — on rend le siège
+    -- `ISEO_ARCHIVE_GRACE_HOURS` après l'heure de sortie réelle, décidée en Python
+    -- avec `_stay_hours` + `_build_window_ms` (la même fenêtre que celle posée chez
+    -- Sofia, late check-out compris). `stay_co` = MAX de l'îlot : une prolongation
+    -- contiguë ou un CO déplacé rendent le stay plus long → il n'est plus candidat.
+    -- ⛔ NE PAS toucher `member_resas` pour ça : `_STAYS_CTE` nourrit aussi le
+    -- provision et le resync — une borne agressive là-bas dé-provisionnerait des
+    -- séjours en cours.
+    SELECT c.duve_reservation_id, c.iseo_invitation_id, c.shadow_mode,
+           'co_grace' AS reason,
+           s.stay_ci, s.stay_co,
+           s.earliest_checkin_hour, s.latest_checkout_hour,
+           s.purchased_early_checkin_hour, s.has_purchased_late_checkout,
+           s.apartment_code
+    FROM `{PIN_CACHE_TABLE}` c
+    JOIN stays s ON s.canonical_duve = c.duve_reservation_id
+                 OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
+    WHERE c.archived_at IS NULL
+      AND s.stay_co <= CURRENT_DATE('Europe/Paris')
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY c.duve_reservation_id ORDER BY s.stay_co DESC) = 1
     """
-    return [dict(r.items()) for r in _bq().query(q).result()]
+    rows = [dict(r.items()) for r in _bq().query(q).result()]
+    now_ms = int(time.time() * 1000)
+    grace_ms = int(ISEO_ARCHIVE_GRACE_HOURS * 3600 * 1000)
+    out = []
+    for r in rows:
+        if r.get("reason") == "co_grace":
+            _, co_hour = _stay_hours(r)
+            _, co_ms = _build_window_ms(str(r["stay_ci"]), str(r["stay_co"]), DEFAULT_CI_HOUR, co_hour)
+            if now_ms < co_ms + grace_ms:
+                continue  # le client peut encore sortir : on attend la fin de la grâce
+        out.append(r)
+    return out
 
 
 def _resa_to_resync() -> list[dict]:
@@ -781,7 +846,7 @@ def _resa_to_resync() -> list[dict]:
       SELECT duve_reservation_id, pin_value, iseo_device_id, iseo_invitation_id,
              iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id,
              mews_reservation_number, apartment_code, hold_reason, released_at,
-             duve_pushed_at,
+             duve_pushed_at, invitation_skipped_at,
              checkin_date AS cache_ci, checkout_date AS cache_co
       FROM `{PIN_CACHE_TABLE}`
       WHERE archived_at IS NULL AND provisioned_at IS NOT NULL
@@ -803,6 +868,7 @@ def _resa_to_resync() -> list[dict]:
       c.iseo_guest_tag_id, c.iseo_lock_id, c.iseo_lock_tag_id,
       c.cache_ci, c.cache_co, c.hold_reason AS cache_hold, c.released_at AS cache_released,
       (c.duve_pushed_at IS NOT NULL) AS cache_pushed,
+      (c.invitation_skipped_at IS NOT NULL) AS cache_inv_skipped,
       c.mews_reservation_number, c.apartment_code,
       s.duve_property_id, s.customer_name,
       s.stay_ci AS live_ci, s.stay_co AS live_co,
@@ -824,7 +890,10 @@ def _resa_to_resync() -> list[dict]:
     JOIN stays s ON s.canonical_duve = c.duve_reservation_id
                  OR c.duve_reservation_id = CONCAT('M', s.mews_reservation_number)
     LEFT JOIN cred cr ON cr.duve_reservation_id = c.duve_reservation_id
-    WHERE s.stay_ci != c.cache_ci OR s.stay_co != c.cache_co OR c.iseo_invitation_id IS NULL
+    -- ⛔ `iseo_invitation_id IS NULL` seul recréerait EN BOUCLE l'invitation qu'on a
+    -- volontairement sautée au-dessus du seuil quota (chantier B) → marqueur.
+    WHERE s.stay_ci != c.cache_ci OR s.stay_co != c.cache_co
+       OR (c.iseo_invitation_id IS NULL AND c.invitation_skipped_at IS NULL)
        -- ⭐ Drift d'HEURES : un service d'arrivée/départ acheté APRÈS le
        -- provisioning (J-3) ne déplace AUCUNE date — les 3 conditions ci-dessus
        -- sont aveugles à ce cas, qui est précisément le plus fréquent (l'achat
@@ -848,18 +917,20 @@ def _save_provisioned(row: dict, pin_value: str, device_id: int,
                       inv_id: Optional[int], inv_code: Optional[str],
                       link: Optional[str], duve_ok: bool,
                       member_csv: Optional[str] = None,
-                      hold_reason: Optional[str] = None) -> None:
+                      hold_reason: Optional[str] = None,
+                      inv_skipped: bool = False) -> None:
     q = f"""
     INSERT INTO `{PIN_CACHE_TABLE}` (
       duve_reservation_id, mews_reservation_number, apartment_code, pin_value,
       iseo_guest_tag_id, iseo_lock_id, iseo_lock_tag_id, iseo_device_id,
       iseo_invitation_id, invitation_code, invitation_link,
       checkin_date, checkout_date, cached_at, provisioned_at, duve_pushed_at,
-      shadow_mode, stay_member_duve_ids, hold_reason, held_at)
+      shadow_mode, stay_member_duve_ids, hold_reason, held_at, invitation_skipped_at)
     VALUES (@duve, @num, @apt, @pin, @gtag, @lock, @ltag, @dev,
             @inv, @code, @link, @ci, @co, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(),
             {'CURRENT_TIMESTAMP()' if duve_ok else 'NULL'}, FALSE, @members, @hold,
-            {'CURRENT_TIMESTAMP()' if hold_reason else 'NULL'})
+            {'CURRENT_TIMESTAMP()' if hold_reason else 'NULL'},
+            {'CURRENT_TIMESTAMP()' if inv_skipped else 'NULL'})
     """
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ScalarQueryParameter("duve", "STRING", row["duve_reservation_id"]),
@@ -1546,8 +1617,16 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     if pin_value is None:
         return False, f"device creation failed: {device_id}"  # device_id porte l'erreur
 
-    # C. invitation (get-or-create)
-    inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
+    # C. invitation (get-or-create) — SAUF au-dessus du seuil quota (chantier B, 22/09) :
+    #    le code clavier part seul, sans lien remote-open. 1 élément Luckey au lieu de 2.
+    wallet = row.get("wallet_used")
+    row["invitation_skipped"] = wallet is not None and wallet >= ISEO_INVITATION_SKIP_ABOVE
+    if row["invitation_skipped"]:
+        inv_id, inv_code = None, None
+        logger.warning(f"🎟️ QUOTA {wallet}/600 ≥ {ISEO_INVITATION_SKIP_ABOVE} — {duve_resa_id} "
+                       f"({row.get('apartment_code')}) provisionné SANS invitation (code seul)")
+    else:
+        inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
     link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
 
     # D. Duve push (code clavier + lien) — à TOUS les duve du stay (back-to-back),
@@ -1573,7 +1652,8 @@ def _provision(row: dict) -> tuple[bool, Optional[str]]:
     # E. état
     _save_provisioned(row, pin_value, device_id, inv_id, inv_code, link, duve_ok,
                       member_csv=",".join(members),
-                      hold_reason=hold if ISEO_HOLD_MODE == "on" else None)
+                      hold_reason=hold if ISEO_HOLD_MODE == "on" else None,
+                      inv_skipped=row["invitation_skipped"])
 
     # E bis. Le code natif de CETTE résa devient un doublon à l'instant précis où le
     # nôtre existe et part chez le client. On le retire ici, et pas en purge groupée :
@@ -1852,9 +1932,15 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
     # Invitation : même logique. ⭐ Le PUT conserve le CODE, donc le lien
     # remote-open déjà parti dans un message Duve (figé) reste valide — le
     # delete+recreate le tuait à chaque resync.
-    gi = _sofia("GET", f"/api/v2/invitations/extId/{inv_ext}")
-    inv = gi.json() if gi.status_code == 200 else None
     inv_id = inv_code = None
+    inv = None
+    if row.get("cache_inv_skipped"):
+        # Chantier B : invitation sautée à la création (quota) → on n'en fabrique pas
+        # une au resync non plus, sinon le seuil ne servirait à rien.
+        gi = None
+    else:
+        gi = _sofia("GET", f"/api/v2/invitations/extId/{inv_ext}")
+        inv = gi.json() if gi.status_code == 200 else None
     if inv is not None:
         inv_win = inv.get("dateInterval") or {}
         if int(inv_win.get("from") or 0) != ci_ms or int(inv_win.get("to") or 0) != co_ms:
@@ -1867,7 +1953,7 @@ def _resync(row: dict) -> tuple[bool, Optional[str]]:
                 inv = None
         if inv is not None:
             inv_id, inv_code = inv.get("id"), inv.get("code")
-    if inv_id is None:
+    if inv_id is None and not row.get("cache_inv_skipped"):
         inv_id, inv_code = _get_or_create_invitation(row, inv_ext, win)
     link = f"https://{REMOTE_OPEN_HOST}/remoteOpen?code={inv_code}" if inv_code else None
 
@@ -2311,7 +2397,9 @@ def _run_inner() -> None:
     logger.info(f"📋 {len(to_provision)} résa(s) à provisionner (CI dans 0-{LOOKAHEAD_DAYS}j, pas encore couvertes)")
     ok = skip = held = 0
     n_no_form = sum(1 for r in to_provision if r.get("no_duve"))
-    wallet_used = _wallet_used() if n_no_form else None
+    # Lu dès qu'il y a quelque chose à créer : la garde « sans formulaire » (590) et
+    # le seuil « sans invitation » (chantier B) s'en servent tous les deux.
+    wallet_used = _wallet_used() if to_provision else None
     if n_no_form:
         logger.info(f"📝 {n_no_form} séjour(s) sans pré-checkin à créer (chantier E) — "
                     f"wallet {wallet_used}/600, garde à {ISEO_QUOTA_MAX_USED_NO_FORM}")
@@ -2348,6 +2436,7 @@ def _run_inner() -> None:
         # positif coûteux avant de passer en `on`. La RC est alertée dans les deux
         # modes (le mail est envoyé par `_provision`, cf. `_notify_hold`).
         row["hold_reason"] = _evaluate_hold(row)
+        row["wallet_used"] = wallet_used
         if row["hold_reason"]:
             held += 1
             if ISEO_HOLD_MODE == "observe":
@@ -2375,7 +2464,9 @@ def _run_inner() -> None:
         if success:
             ok += 1
             if wallet_used is not None:
-                wallet_used += 2  # user + device (+ invitation) par séjour créé
+                # user + invitation par séjour créé (le PIN ne compte pas tant que
+                # users > PIN, formule du 17/09) ; 1 seul si l'invitation est sautée.
+                wallet_used += 1 if row.get("invitation_skipped") else 2
         elif str(err).startswith("skipped"):
             skip += 1
         else:
@@ -2550,9 +2641,14 @@ def _run_inner() -> None:
 
     # 3. Archive (CO passé / annulée)
     to_archive = _resa_to_archive()
-    logger.info(f"🗑️ {len(to_archive)} résa(s) à archiver (CO passé ou annulée)")
+    n_grace = sum(1 for r in to_archive if r.get("reason") == "co_grace")
+    logger.info(f"🗑️ {len(to_archive)} résa(s) à archiver (CO passé ou annulée"
+                f"{f', dont {n_grace} à CO + {ISEO_ARCHIVE_GRACE_HOURS:g} h' if n_grace else ''})")
     archived = 0
     for row in to_archive:
+        if row.get("reason") == "co_grace":
+            logger.info(f"⏳ archive CO+{ISEO_ARCHIVE_GRACE_HOURS:g}h {row['duve_reservation_id']} "
+                        f"({row.get('apartment_code')}, CO {row.get('stay_co')})")
         try:
             success, err = _archive(row)
         except Exception as e:
