@@ -252,12 +252,51 @@ class TriggerDispatcher:
 
         ⚠ Forward-only : les lignes historiques ont un `_dbt_loaded_at` trop vieux,
         elles ne partiront pas rétroactivement (elles restent lisibles au dashboard).
+
+        ⭐ 3ᵉ borne (22/09/2026) : `expires_at`, MAIS seulement pour un RENVOI.
+        Un fait corrigé continuait de sonner tant qu'il restait dans la fenêtre de
+        24 h : le TTL du bucket rouvre la clé de dédup (4 h pour `2h`), la ligne est
+        rechargée, elle repart. Mesuré sur `iseo_reconciliation` /
+        `MISSING_IN_SOFIA:6a9ff26b…` (BRA4-2G) : chargée UNE fois le 21/09 à 14:11
+        avec `expires_at = 2026-09-21 00:00` — déjà périmé à l'émission — et envoyée
+        **4 fois** (14:51, 20:50, 00:51, 06:39) alors que le cache était archivé
+        depuis 00:04 et que la vue du trigger ne renvoyait plus rien. Récidive du
+        cas GRA41 (12/09). Les triggers déclarent tous leur péremption, personne ne
+        la lisait.
+
+        ⛔ POURQUOI PAS UN SIMPLE `expires_at > CURRENT_TIMESTAMP()` : ça coupe des
+        PREMIERS envois. `last_minute_checkin` expire à minuit de CI+1 et son bucket
+        `daily` ne flushe qu'à 07:01 → son unique envoi tombe 7 h APRÈS sa
+        péremption. Rejoué sur 30 j : la clause nue aurait supprimé **8 alertes
+        jamais envoyées**. La péremption borne la RÉPÉTITION d'un fait déjà annoncé,
+        pas son annonce. D'où le `NOT EXISTS` : une ligne périmée passe encore si
+        elle n'a jamais été dispatchée.
+
+        Blast rejoué sur 30 j de `dispatched_actions` (en rattachant chaque envoi à
+        la ligne `triggers` réellement chargeable à cet instant, pas au `MIN` sur la
+        clé — les triggers à `property_id` fixe, `dispo_matin` / `gap_critical_7j` /
+        `gateway_id`, réémettent une ligne par jour avec une péremption fraîche) :
+        **3 envois coupés, les 3 rejeux du fantôme BRA4-2G**, et les 8 premiers
+        envois de `last_minute_checkin` préservés.
         """
         query = f"""
-            SELECT * FROM `{TRIGGERS_TABLE}`
-            WHERE _dbt_loaded_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-              AND detected_at    >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
-            ORDER BY detected_at
+            SELECT t.* FROM `{TRIGGERS_TABLE}` t
+            WHERE t._dbt_loaded_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+              AND t.detected_at    >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+              AND (
+                    t.expires_at IS NULL
+                 OR t.expires_at > CURRENT_TIMESTAMP()
+                 OR NOT EXISTS (
+                        SELECT 1 FROM `{DISPATCHED_TABLE}` d
+                        WHERE d.trigger_name = t.trigger_name
+                          AND d.property_id  = t.property_id
+                          -- Élagage de partition (le job tourne toutes les 10 min) :
+                          -- une ligne encore chargeable a été chargée il y a < 24 h,
+                          -- donc un envoi la concernant ne peut pas être plus vieux.
+                          AND d.dispatched_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+                    )
+              )
+            ORDER BY t.detected_at
         """
         rows = list(self.bq.query(query).result())
         logger.info(f"{len(rows)} trigger(s) chargé(s) (arrivés en base < 24h) "
