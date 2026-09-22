@@ -29,6 +29,29 @@ run (~1000 alertes). Fix : `_load_triggers` filtre `detected_at >= now - 24h`. U
 persistant génère une ligne fraîche par jour donc reste capté ; borne ≤ TTL daily (24h)
 → pas de double envoi inter-jour. Uniforme pour tous les buckets (daily, 2h serrures, manuel).
 
+### 3ᵉ borne — `expires_at`, mais seulement sur le RENVOI (2026-09-22)
+Les buckets courts ont un TTL **inférieur** à la fenêtre de chargement (`2h` → 4 h,
+`4h` → 4 h, vs 24 h) : la clé de dédup se rouvre alors que la ligne est encore
+chargeable, donc **un fait corrigé continue de sonner jusqu'à 24 h**. Mesuré sur
+`iseo_reconciliation` / `MISSING_IN_SOFIA:6a9ff26b…` (BRA4-2G) : **une** ligne
+chargée le 21/09 à 14:11, `expires_at = 2026-09-21 00:00` (= le CO, donc **déjà
+périmé à l'émission**), **4 envois** — 14:51, 20:50, 00:51, 06:39 — alors que le
+cache était archivé depuis 00:04 et que `dash_ops_pin_reconciliation` rendait
+0 ligne. Récidive de GRA41 (12/09) : les triggers déclarent tous leur péremption,
+personne ne la lisait.
+⛔ **Ne PAS écrire `expires_at > CURRENT_TIMESTAMP()` tout court** — ça tue des
+PREMIERS envois. `last_minute_checkin` expire à minuit de CI+1 et son bucket
+`daily` flushe à 07:01 : son unique envoi part **7 h après sa péremption**. Rejoué
+sur 30 j, la clause nue supprimait **8 alertes jamais envoyées**. La péremption
+borne la **répétition** d'un fait déjà annoncé, pas son annonce → `NOT EXISTS` sur
+`dispatched_actions` (borné 7 j pour l'élagage de partition, le job tourne toutes
+les 10 min). Blast rejoué sur 30 j : **3 envois coupés, les 3 rejeux du fantôme**.
+⚠ Pour mesurer l'impact d'une borne sur `expires_at`, rattacher chaque envoi à la
+ligne `triggers` **réellement chargeable à cet instant** — un `MIN(expires_at)` par
+clé donne des chiffres faux (36 `iseo_gateway_offline`, 27 `gap_pricing_summary`…) :
+ces triggers ont un `property_id` FIXE et réémettent une ligne par jour avec une
+péremption fraîche, leur rappel quotidien n'est pas touché.
+
 ### Beyond push — dérive calendrier + 100 % du parc en 1N (2026-09-14)
 
 - **Whitelist live = 124 apparts** (74 × `1N` + 50 × `BOTH`) depuis le 14/09 : les 75 apparts absents ont été insérés en `1N` (`added_by = 'hatim (100 % du parc en 1N, 14/09)'`), les 22 `2N` passés `BOTH`. Seed `dbt/seeds/beyond_push_whitelist.csv` rafraîchi (124 lignes, filet anti-wipe). `P03-TUR64-1D` est dans la table mais sans listing Beyond → exclu par la vue. Prochaine étape (call Arnaud) : Arnaud retire les surcotes 1N, puis après 3-4 jours propres, tout le parc en `BOTH`.
