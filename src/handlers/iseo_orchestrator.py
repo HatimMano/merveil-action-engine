@@ -372,9 +372,17 @@ _LOCKS_CTE = f"""
              -- ⚠ COALESCE à FALSE et pas à TRUE : tant que le flux ETL n'a pas tourné,
              -- l'absence de mesure ne doit pas bloquer le parc entier — l'ancien
              -- comportement reste le repli sûr.
+             -- ⭐ 24/09/2026 (réponse R&D ISEO) : `push_contradicted` — la serrure a
+             -- écrit un code APRÈS le push contesté, donc la passerelle l'a traité et
+             -- le statut est une confirmation PERDUE côté plateforme ISEO (reconnu
+             -- par eux le 24/09), pas une panne. ⚠ Mesuré à la pose (14 j de photos) :
+             -- 0 blocage démenti — c'est une garde contre un mode de panne DÉCLARÉ
+             -- par ISEO, pas encore observé chez nous. On ne desserre que sur preuve
+             -- d'écriture ; sans accusé postérieur, le statut garde le dernier mot.
              (g.gateway_id IS NULL
               OR COALESCE(g.hours_since_last_connection, 1e9) >= 24
-              OR COALESCE(ph.push_stuck, FALSE)) AS gateway_dead
+              OR (COALESCE(ph.push_stuck, FALSE)
+                  AND NOT COALESCE(ph.push_contradicted, FALSE))) AS gateway_dead
       FROM `{SMART_LOCKS_TABLE}` l, UNNEST(JSON_QUERY_ARRAY(l.tags)) AS t
       LEFT JOIN `{GATEWAYS_TABLE}` g ON g.gateway_id = l.gateway_id
       LEFT JOIN `{GATEWAY_PUSH_HEALTH_TABLE}` ph ON ph.gateway_id = l.gateway_id
